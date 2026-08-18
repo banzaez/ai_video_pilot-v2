@@ -105,9 +105,12 @@ def _bbox_iou(a: Sequence[float], b: Sequence[float]) -> float:
 def _face_center_in_bbox(face_bbox: tuple[float, float, float, float], person_bbox: list[float]) -> bool:
     fx1, fy1, fx2, fy2 = face_bbox
     px1, py1, px2, py2 = person_bbox[:4]
+    pw = max(1.0, px2 - px1)
+    ph = max(1.0, py2 - py1)
     cx = (fx1 + fx2) / 2.0
     cy = (fy1 + fy2) / 2.0
-    return px1 <= cx <= px2 and py1 <= cy <= py2
+    # Лицо должно быть по горизонтали внутри тела (с запасом 15%) и строго в верхней половине (0..55% высоты)
+    return (px1 - 0.15 * pw <= cx <= px2 + 0.15 * pw) and (py1 - 0.10 * ph <= cy <= py1 + 0.55 * ph)
 
 
 @dataclass
@@ -156,8 +159,7 @@ def _pick_face_for_person(
             offset_x + float(fc.bbox[2]),
             offset_y + float(fc.bbox[3]),
         )
-        iou = _bbox_iou(fb, person_bbox)
-        if iou < _FACE_IOU_MIN and not _face_center_in_bbox(fb, person_bbox):
+        if not _face_center_in_bbox(fb, person_bbox):
             continue
         area = max(0.0, (fb[2] - fb[0]) * (fb[3] - fb[1]))
         norm_area = min(1.0, area / person_area)
@@ -168,17 +170,7 @@ def _pick_face_for_person(
         _, best_face, fb = max(scored, key=lambda row: row[0])
         return best_face, fb
 
-    valid = [fc for fc in faces if fc.embedding is not None and float(fc.det_score) >= min_det]
-    if not valid:
-        return None
-    best_face = max(valid, key=lambda fc: float(fc.det_score))
-    fb = (
-        offset_x + float(best_face.bbox[0]),
-        offset_y + float(best_face.bbox[1]),
-        offset_x + float(best_face.bbox[2]),
-        offset_y + float(best_face.bbox[3]),
-    )
-    return best_face, fb
+    return None
 
 
 def _detect_best_face(
@@ -460,9 +452,12 @@ def extract_faces_for_groups(
     track_embeddings_by_model: dict[str, dict[str, list[np.ndarray]]] = {m: {} for m in models}
 
     for (is_solo, gid, model_name), slots in face_buffers.items():
+        if not slots:
+            continue
         slots.sort(key=lambda s: -s.quality)
         slots = slots[:top_k]
-        key_str = str(gid)
+        key_id = slots[0].track_id if is_solo else gid
+        key_str = str(key_id)
         prefix = "t" if is_solo else "g"
         suffix = f"_{model_name}" if multi_model else ""
         faces_store = track_faces_by_model if is_solo else group_faces_by_model
@@ -471,7 +466,7 @@ def extract_faces_for_groups(
         entries: list[dict[str, Any]] = []
         embs: list[np.ndarray] = []
         for rank_idx, slot in enumerate(slots):
-            crop_filename = f"face_{prefix}{gid:04d}_k{rank_idx}_f{slot.frame_index}{suffix}.jpg"
+            crop_filename = f"face_{prefix}{key_id:04d}_k{rank_idx}_f{slot.frame_index}{suffix}.jpg"
             crop_out_path = os.path.join(crops_dir, crop_filename)
             if save_crops and slot.jpeg_bytes:
                 with open(crop_out_path, "wb") as f:

@@ -188,9 +188,8 @@ camera_link:
   enabled: true
   # Параллельно извлекаем лица всеми моделями; оценки сравнения — отдельно в face_scores.
   face_models: [buffalo_l, antelopev2]
-  face_top_k: 5
+  face_top_k: 3
   min_face_score: 0.60
-  face_crops_dir: face_crops
   max_gap_sec: 120.0
   max_speed_mps: 3.5
   motion_sigma_m: 3.0
@@ -199,6 +198,7 @@ camera_link:
   w_motion: 0.20
   min_combo_score: 0.85
   solver: hungarian
+  face_crops_dir: face_crops
   save_face_crops: true
 
 nvr:

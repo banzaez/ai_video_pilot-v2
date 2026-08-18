@@ -203,6 +203,8 @@ def run_camera_link(settings: Settings) -> None:
             solo_global_ids=solo_global_ids,
             video_source_path=video_path,
             fps=fps,
+            use_tracklet_ids=bool(track_to_group),
+            tracklet_to_global=track_to_group,
         )
         face_json_out = camera_face_json_path(settings)
         attach_artifact_meta(face_meta, stage="camera_face", path=face_json_out)

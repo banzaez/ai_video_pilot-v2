@@ -699,8 +699,8 @@ class TrackBestFramesPicker:
             return []
 
         # Фильтруем кадры, где лицо имеет достаточную уверенность
-        valid = [s for s in scored if s.face_conf >= min_face_conf and s.face_crop is not None]
-        pool = valid if valid else [s for s in scored if s.face_crop is not None]
+        valid = [s for s in scored if s.face_conf >= min_face_conf]
+        pool = valid if valid else list(scored)
         if not pool:
             return []
         if len(pool) <= top_k:
