@@ -1,11 +1,14 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import type { TrackingData } from "../types";
 import {
   buildTrackKeyframes,
   colorForTrackId,
   detectionsAtFrame,
   formatDuration,
+  passBadgeColors,
   resolveDetectEveryN,
+  resolveLinkPass,
   type CropShot,
   type FaceShot,
   type MergeTimeline,
@@ -30,6 +33,10 @@ type Props = {
   cropUrls: Record<string, CropShot[]>;
   faceUrls?: Record<string, FaceShot[]>;
   faceUrlsByModel?: Record<string, Record<string, FaceShot[]>>;
+  groupFaceUrls?: Record<string, FaceShot[]>;
+  trackFaceUrls?: Record<string, FaceShot[]>;
+  groupFaceUrlsByModel?: Record<string, Record<string, FaceShot[]>>;
+  trackFaceUrlsByModel?: Record<string, Record<string, FaceShot[]>>;
   faceModels?: string[];
   cameraLink?: {
     face_models?: string[];
@@ -124,7 +131,7 @@ function pairsForGroup(
   const set = new Set(trackIds);
   const trackMap = new Map(tracks.map((t) => [t.track_id, t]));
   const intra = pairs.filter((p) => set.has(p.a) && set.has(p.b));
-  const used = intra.filter((p) => pairPass(p) != null);
+  const used = intra.filter((p) => resolveLinkPass(p) != null);
   const filtered = used.length ? used : intra;
   return filtered.sort((p1, p2) => {
     const t1 = trackMap.get(p1.a)?.t0 ?? 0;
@@ -134,101 +141,383 @@ function pairsForGroup(
 }
 
 function pairPass(p: { pass?: number | null; pass2?: boolean | null }): number | null {
-  if (typeof p.pass === "number" && p.pass >= 1) return p.pass;
-  if (p.pass2) return 2;
-  return null;
-}
-
-function stripPassPrefix(reason: string): string {
-  return reason.replace(/^Pass \d+:\s*/i, "");
+  return resolveLinkPass(p);
 }
 
 function PassBadge({ pass }: { pass: number | null }) {
-  if (typeof pass !== "number" || pass < 1) return null;
-  if (pass === 10) {
-    return <span className="badge-pass badge-pass10" title="Pass 10 (Camera Link / Face + Feet)">Pass 10 · Face + Feet</span>;
-  }
-  return <span className="badge-pass">Pass {pass}</span>;
+  if (typeof pass !== "number" || pass < 0) return <span>—</span>;
+  const { bg, fg, border } = passBadgeColors(pass);
+  return (
+    <span
+      className="badge-pass"
+      style={{ background: bg, color: fg, border: `1px solid ${border}` }}
+    >
+      Pass {pass}
+    </span>
+  );
 }
 
-function GroupFaceThumb({
-  faces,
-  facesByModel,
-  faceModels,
-  groupKey,
-}: {
-  faces?: FaceShot[];
-  facesByModel?: Record<string, Record<string, FaceShot[]>>;
-  faceModels?: string[];
-  groupKey: string;
-}) {
+function pairKey(a: number, b: number): string {
+  return a < b ? `${a}:${b}` : `${b}:${a}`;
+}
+
+function pairsForGroupId(pairs: MergeTimelinePair[], groupId: number): MergeTimelinePair[] {
+  return pairs.filter((p) => p.a === groupId || p.b === groupId);
+}
+
+function pairPassFromReason(reason: string | null | undefined): number | null {
+  if (!reason) return null;
+  const m = reason.match(/^Pass\s+(\d+)/i);
+  return m ? Number(m[1]) : null;
+}
+
+function entityRefLabel(kind: "track" | "group", id: number): string {
+  return kind === "group" ? `g${id}` : `t${id}`;
+}
+
+function trackIdsForEntity(
+  kind: "track" | "group",
+  id: number,
+  mergeTimeline: MergeTimeline | null,
+): number[] {
+  if (kind === "track") return [id];
+  return (mergeTimeline?.tracks ?? [])
+    .filter((t) => t.group_id === id)
+    .map((t) => t.track_id)
+    .sort((a, b) => a - b);
+}
+
+function spanForEntity(
+  kind: "track" | "group",
+  id: number,
+  mergeTimeline: MergeTimeline | null,
+): string | null {
+  if (kind === "track") {
+    const tr = mergeTimeline?.tracks.find((t) => t.track_id === id);
+    return tr ? `${formatDuration(tr.t0)}–${formatDuration(tr.t1)}` : null;
+  }
+  const tracks = mergeTimeline?.tracks.filter((t) => t.group_id === id) ?? [];
+  if (!tracks.length) return null;
+  const t0 = Math.min(...tracks.map((t) => t.t0));
+  const t1 = Math.max(...tracks.map((t) => t.t1));
+  return `${formatDuration(t0)}–${formatDuration(t1)} · ${tracks.length} фрагм.`;
+}
+
+function filterFaceShotsForTrack(shots: FaceShot[], trackId: number, tr?: MergeTimelineTrack | null): FaceShot[] {
+  const exact = shots.filter((s) => s.track_id === trackId);
+  if (exact.length) return exact;
+  if (!tr) return [];
+  const inSpan = shots.filter((s) => {
+    if (s.t == null || !Number.isFinite(s.t)) return false;
+    return s.t >= tr.t0 && s.t <= tr.t1;
+  });
+  return inSpan;
+}
+
+function shotsFromBucket(
+  bucket: "group" | "track",
+  key: string,
+  groupFaceUrls?: Record<string, FaceShot[]>,
+  trackFaceUrls?: Record<string, FaceShot[]>,
+  groupFaceUrlsByModel?: Record<string, Record<string, FaceShot[]>>,
+  trackFaceUrlsByModel?: Record<string, Record<string, FaceShot[]>>,
+  model?: string,
+): FaceShot[] {
+  const primary = bucket === "group" ? groupFaceUrls : trackFaceUrls;
+  const byModel = bucket === "group" ? groupFaceUrlsByModel : trackFaceUrlsByModel;
+  if (model) return byModel?.[model]?.[key] ?? primary?.[key] ?? [];
+  return primary?.[key] ?? [];
+}
+
+function faceShotsForEntity(
+  kind: "track" | "group",
+  id: number,
+  mergeTimeline: MergeTimeline | null,
+  groupFaceUrls?: Record<string, FaceShot[]>,
+  trackFaceUrls?: Record<string, FaceShot[]>,
+  groupFaceUrlsByModel?: Record<string, Record<string, FaceShot[]>>,
+  trackFaceUrlsByModel?: Record<string, Record<string, FaceShot[]>>,
+  model?: string,
+): FaceShot[] {
+  const from = (bucket: "group" | "track", key: string) =>
+    shotsFromBucket(
+      bucket,
+      key,
+      groupFaceUrls,
+      trackFaceUrls,
+      groupFaceUrlsByModel,
+      trackFaceUrlsByModel,
+      model,
+    );
+
+  if (kind === "group") return from("group", String(id));
+
+  const tr = mergeTimeline?.tracks.find((t) => t.track_id === id) ?? null;
+  const groupId = tr?.group_id ?? null;
+  const globalId = tr?.global_id ?? null;
+
+  if (groupId != null) {
+    return filterFaceShotsForTrack(from("group", String(groupId)), id, tr);
+  }
+
+  for (const key of [globalId, id]) {
+    if (key == null) continue;
+    const shots = from("track", String(key));
+    if (shots.length) return shots;
+  }
+  if (globalId != null) {
+    const shots = from("group", String(globalId));
+    if (shots.length) return shots;
+  }
+  return [];
+}
+
+function facesForEntity(
+  kind: "track" | "group",
+  id: number,
+  mergeTimeline: MergeTimeline | null,
+  groupFaceUrls?: Record<string, FaceShot[]>,
+  trackFaceUrls?: Record<string, FaceShot[]>,
+  groupFaceUrlsByModel?: Record<string, Record<string, FaceShot[]>>,
+  trackFaceUrlsByModel?: Record<string, Record<string, FaceShot[]>>,
+  faceModels?: string[],
+): { model: string; shots: FaceShot[] }[] {
   const models = faceModels?.length ? faceModels : ["buffalo_l"];
-  const [modelIdx, setModelIdx] = useState(0);
+  return models
+    .map((model) => ({
+      model,
+      shots: faceShotsForEntity(
+        kind,
+        id,
+        mergeTimeline,
+        groupFaceUrls,
+        trackFaceUrls,
+        groupFaceUrlsByModel,
+        trackFaceUrlsByModel,
+        model,
+      ).slice(0, 6),
+    }))
+    .filter((row) => row.shots.length > 0);
+}
+
+function cropsForEntity(
+  kind: "track" | "group",
+  id: number,
+  mergeTimeline: MergeTimeline | null,
+  cropUrls: Record<string, CropShot[]>,
+): CropShot[] {
+  const trackIds = trackIdsForEntity(kind, id, mergeTimeline);
+  const out: CropShot[] = [];
+  for (const tid of trackIds) {
+    out.push(...cropPreview(cropUrls[String(tid)] ?? []));
+  }
+  return out.slice(0, 8);
+}
+
+function MergeEntityRef({
+  kind,
+  id,
+  label,
+  mergeTimeline,
+  cropUrls,
+  groupFaceUrls,
+  trackFaceUrls,
+  groupFaceUrlsByModel,
+  trackFaceUrlsByModel,
+  faceModels,
+  onPickTrack,
+  onPickGroup,
+  variant = "default",
+}: {
+  kind: "track" | "group";
+  id: number;
+  label?: string;
+  mergeTimeline: MergeTimeline | null;
+  cropUrls: Record<string, CropShot[]>;
+  groupFaceUrls?: Record<string, FaceShot[]>;
+  trackFaceUrls?: Record<string, FaceShot[]>;
+  groupFaceUrlsByModel?: Record<string, Record<string, FaceShot[]>>;
+  trackFaceUrlsByModel?: Record<string, Record<string, FaceShot[]>>;
+  faceModels?: string[];
+  onPickTrack: (trackId: number, sec: number) => void;
+  onPickGroup: (groupId: number) => void;
+  variant?: "default" | "timeline";
+}) {
+  const btnRef = useRef<HTMLButtonElement>(null);
+  const popRef = useRef<HTMLDivElement>(null);
+  const [open, setOpen] = useState(false);
+  const [geom, setGeom] = useState({ left: 0, top: 0 });
+  const [ready, setReady] = useState(0);
+
+  const display = label ?? entityRefLabel(kind, id);
+  const trackIds = trackIdsForEntity(kind, id, mergeTimeline);
+  const colorId = kind === "track" ? id : (trackIds[0] ?? id);
+  const color = colorForTrackId(colorId);
+  const span = spanForEntity(kind, id, mergeTimeline);
+  const crops = cropsForEntity(kind, id, mergeTimeline, cropUrls);
+  const faceRows = facesForEntity(
+    kind,
+    id,
+    mergeTimeline,
+    groupFaceUrls,
+    trackFaceUrls,
+    groupFaceUrlsByModel,
+    trackFaceUrlsByModel,
+    faceModels,
+  );
+
+  useLayoutEffect(() => {
+    if (!open || !btnRef.current) return;
+    const br = btnRef.current.getBoundingClientRect();
+    const w = popRef.current?.offsetWidth ?? 280;
+    const h = popRef.current?.offsetHeight ?? 420;
+    let left = br.left;
+    let top = br.bottom + 8;
+    left = Math.min(Math.max(8, left), Math.max(8, window.innerWidth - w - 8));
+    if (top + h > window.innerHeight - 8) {
+      top = Math.max(8, br.top - h - 8);
+    }
+    setGeom({ left, top });
+  }, [open, crops.length, faceRows.length, ready]);
+
+  function handlePick() {
+    if (kind === "group") {
+      onPickGroup(id);
+      return;
+    }
+    const tr = mergeTimeline?.tracks.find((t) => t.track_id === id);
+    onPickTrack(id, tr?.t0 ?? 0);
+  }
+
+  return (
+    <>
+      <button
+        ref={btnRef}
+        type="button"
+        className={`merge-ref-chip${variant === "timeline" ? " merge-ref-chip-timeline" : ""}${open ? " on" : ""}`}
+        style={
+          variant === "timeline"
+            ? { backgroundColor: color, borderColor: color }
+            : { borderColor: color, color }
+        }
+        onMouseEnter={() => {
+          const br = btnRef.current?.getBoundingClientRect();
+          if (br) setGeom({ left: br.left, top: br.bottom + 8 });
+          setOpen(true);
+        }}
+        onMouseLeave={() => setOpen(false)}
+        onClick={(e) => {
+          e.stopPropagation();
+          handlePick();
+        }}
+      >
+        {display}
+      </button>
+      {open &&
+        createPortal(
+          <div
+            ref={popRef}
+            className="similar-pop merge-entity-pop"
+            style={{ left: geom.left, top: geom.top }}
+          >
+            <div className="similar-pop-head">
+              <span className="track-id" style={{ backgroundColor: color }}>
+                {display}
+              </span>
+              {span ? <span className="pop-span">{span}</span> : null}
+            </div>
+            {faceRows.length > 0 && (
+              <div className="merge-entity-pop-faces">
+                {faceRows.map(({ model, shots }) => (
+                  <div key={model} className="merge-entity-pop-face-row">
+                    <span className="merge-entity-pop-label">{model}</span>
+                    <div className="pop-crops">
+                      {shots.map((s, i) => (
+                        <div key={`${model}-${i}`} className="pop-crop">
+                          <img src={s.url} alt="" loading="lazy" onLoad={() => setReady((n) => n + 1)} />
+                          {s.track_id != null && <span>t{s.track_id}</span>}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+            {crops.length > 0 ? (
+              <div className="pop-crops">
+                {crops.map((s, i) => (
+                  <div key={`${s.rank}-${s.frame ?? i}`} className="pop-crop">
+                    <img
+                      src={s.url}
+                      alt=""
+                      loading="lazy"
+                      onLoad={() => setReady((n) => n + 1)}
+                    />
+                    <span>k{s.rank}</span>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              !faceRows.length && <p className="similar-pop-empty">Нет кропов и лиц</p>
+            )}
+          </div>,
+          document.body,
+        )}
+    </>
+  );
+}
+
+function GroupFaceThumb({ faces }: { faces?: FaceShot[] }) {
   const [idx, setIdx] = useState(0);
-  const activeModel = models[Math.min(modelIdx, models.length - 1)] ?? models[0];
-  const modelFaces = facesByModel?.[activeModel]?.[groupKey] ?? faces ?? [];
+  const modelFaces = faces ?? [];
   if (!modelFaces.length) return null;
   const safeIdx = Math.min(Math.max(0, idx), modelFaces.length - 1);
   const currentFace = modelFaces[safeIdx];
 
   return (
-    <div
-      className="merge-inspect-face-box"
-      title={`${activeModel}: лицо ${safeIdx + 1}/${modelFaces.length} (det ${currentFace.score?.toFixed(2) ?? "—"}, f${currentFace.frame})`}
-      onClick={(e) => {
-        if (modelFaces.length > 1) {
-          e.stopPropagation();
-          setIdx((prev) => (prev + 1) % modelFaces.length);
-        }
-      }}
-    >
-      {models.length > 1 && (
-        <div className="merge-inspect-face-models" onClick={(e) => e.stopPropagation()}>
-          {models.map((model, i) => (
+    <div className="merge-inspect-face-wrap" onClick={(e) => e.stopPropagation()}>
+      <div
+        className="merge-inspect-face-box"
+        title={`лицо ${safeIdx + 1}/${modelFaces.length} (t${currentFace.track_id ?? "—"}, det ${currentFace.score?.toFixed(2) ?? "—"}, pose ${currentFace.pose_score?.toFixed(2) ?? "—"}, q ${currentFace.quality?.toFixed(2) ?? "—"}, f${currentFace.frame})`}
+        onClick={(e) => {
+          if (modelFaces.length > 1) {
+            e.stopPropagation();
+            setIdx((prev) => (prev + 1) % modelFaces.length);
+          }
+        }}
+      >
+        <img src={currentFace.url} alt="" loading="lazy" />
+        {currentFace.track_id != null && (
+          <span className="merge-inspect-face-tid">t{currentFace.track_id}</span>
+        )}
+        {modelFaces.length > 1 && (
+          <div className="merge-inspect-face-nav">
             <button
-              key={model}
               type="button"
-              className={i === modelIdx ? "on" : ""}
-              title={`Кропы ${model}`}
+              className="merge-inspect-face-btn"
+              title="Пред. лицо"
               onClick={(e) => {
                 e.stopPropagation();
-                setModelIdx(i);
-                setIdx(0);
+                setIdx((prev) => (prev <= 0 ? modelFaces.length - 1 : prev - 1));
               }}
             >
-              {model}
+              ‹
             </button>
-          ))}
-        </div>
-      )}
-      <img src={currentFace.url} alt="" loading="lazy" />
-      {modelFaces.length > 1 && (
-        <div className="merge-inspect-face-nav" onClick={(e) => e.stopPropagation()}>
-          <button
-            type="button"
-            className="merge-inspect-face-btn"
-            title="Пред. лицо"
-            onClick={(e) => {
-              e.stopPropagation();
-              setIdx((prev) => (prev <= 0 ? modelFaces.length - 1 : prev - 1));
-            }}
-          >
-            ‹
-          </button>
-          <span className="merge-inspect-face-idx">{safeIdx + 1}/{modelFaces.length}</span>
-          <button
-            type="button"
-            className="merge-inspect-face-btn"
-            title="След. лицо"
-            onClick={(e) => {
-              e.stopPropagation();
-              setIdx((prev) => (prev + 1) % modelFaces.length);
-            }}
-          >
-            ›
-          </button>
-        </div>
-      )}
+            <span className="merge-inspect-face-idx">{safeIdx + 1}/{modelFaces.length}</span>
+            <button
+              type="button"
+              className="merge-inspect-face-btn"
+              title="След. лицо"
+              onClick={(e) => {
+                e.stopPropagation();
+                setIdx((prev) => (prev + 1) % modelFaces.length);
+              }}
+            >
+              ›
+            </button>
+          </div>
+        )}
+      </div>
     </div>
   );
 }
@@ -297,8 +586,10 @@ export function MergeInspectPanel({
   activeVideo,
   mergeTimeline,
   cropUrls,
-  faceUrls,
-  faceUrlsByModel,
+  groupFaceUrls,
+  trackFaceUrls,
+  groupFaceUrlsByModel,
+  trackFaceUrlsByModel,
   faceModels = [],
   cameraLink,
   similarByTrack,
@@ -347,11 +638,13 @@ export function MergeInspectPanel({
   const filteredRows = useMemo(() => {
     let list = rows;
     const q = query.trim().toLowerCase();
-    const cleanQ = q.replace(/^#/, "");
+    const cleanQ = q.replace(/^#/, "").replace(/^[gt]/i, "");
     if (q) {
       list = list.filter((row) => {
         if (row.kind === "solo") {
+          const tq = `t${row.track.track_id}`;
           return (
+            tq.includes(q) ||
             String(row.track.track_id).includes(cleanQ) ||
             String(videoTrackId(row.track)).includes(cleanQ) ||
             q === "solo"
@@ -542,11 +835,6 @@ export function MergeInspectPanel({
     }
   }
 
-  function trackT0(trackId: number): number {
-    const tr = mergeTimeline?.tracks.find((t) => t.track_id === trackId);
-    return tr?.t0 ?? 0;
-  }
-
   function pickTrack(trackId: number, sec: number) {
     const tr = mergeTimeline?.tracks.find((t) => t.track_id === trackId);
     if (tr) {
@@ -558,6 +846,16 @@ export function MergeInspectPanel({
       onSelectTrackId(trackId);
     }
     onSeekToSec(sec);
+  }
+
+  function pickGroup(groupId: number) {
+    const row = rows.find((r) => r.kind === "group" && r.group.group_id === groupId);
+    if (row) {
+      pickRow(row);
+      return;
+    }
+    const tr = mergeTimeline?.tracks.find((t) => t.group_id === groupId);
+    if (tr) pickTrack(tr.track_id, tr.t0);
   }
 
   const duration = Math.max(mergeTimeline?.duration_sec ?? 1, 0.001);
@@ -604,7 +902,7 @@ export function MergeInspectPanel({
     });
     return keys.map((key) => ({
       key,
-      label: key === "solo" ? "без склейки" : `трек #${key}`,
+      label: key === "solo" ? "без склейки" : `g${key}`,
       groupId: key === "solo" ? null : key,
       reason:
         key === "solo"
@@ -625,7 +923,7 @@ export function MergeInspectPanel({
       return [
         {
           key: gid,
-          label: `трек #${gid}`,
+          label: `g${gid}`,
           groupId: gid,
           reason: mergeTimeline?.groups.find((g) => g.group_id === gid)?.reason ?? null,
           score: mergeTimeline?.groups.find((g) => g.group_id === gid)?.score ?? null,
@@ -665,13 +963,17 @@ export function MergeInspectPanel({
     () => faceModelLabels(cameraLink?.face_models?.length ? cameraLink.face_models : faceModels),
     [cameraLink?.face_models, faceModels],
   );
-  const cameraLinkPairs = useMemo(() => {
-    const rows = cameraLink?.candidate_edges?.length
-      ? cameraLink.candidate_edges
-      : cameraLink?.edges ?? [];
+  const cameraLinkMergedPairs = useMemo(() => {
+    const rows = cameraLink?.edges ?? [];
     if (!selectedRow || selectedRow.kind !== "group") return rows;
-    const gid = selectedRow.group.group_id;
-    return rows.filter((p) => p.a === gid || p.b === gid);
+    return pairsForGroupId(rows, selectedRow.group.group_id);
+  }, [cameraLink, selectedRow]);
+
+  const cameraLinkSimilarPairs = useMemo(() => {
+    const mergedKeys = new Set((cameraLink?.edges ?? []).map((p) => pairKey(p.a, p.b)));
+    const rows = (cameraLink?.candidate_edges ?? []).filter((p) => !mergedKeys.has(pairKey(p.a, p.b)));
+    if (!selectedRow || selectedRow.kind !== "group") return rows;
+    return pairsForGroupId(rows, selectedRow.group.group_id);
   }, [cameraLink, selectedRow]);
   const rejectedSimilar: RejectedHit[] =
     selectedRow?.kind === "group"
@@ -684,7 +986,17 @@ export function MergeInspectPanel({
         : [];
 
   const staleMerge = pipeline?.stale?.includes("tracklet_link");
-  const fromTracklets = summary.method === "tracklet_link";
+  const entityRefCommon = {
+    mergeTimeline,
+    cropUrls,
+    groupFaceUrls,
+    trackFaceUrls,
+    groupFaceUrlsByModel,
+    trackFaceUrlsByModel,
+    faceModels,
+    onPickTrack: pickTrack,
+    onPickGroup: pickGroup,
+  };
 
   if (!activeVideo) {
     return <p className="merge-inspect-empty">Выберите видео в шапке</p>;
@@ -726,7 +1038,7 @@ export function MergeInspectPanel({
           <input
             type="search"
             className="merge-inspect-search"
-            placeholder="g3, #15, reason…"
+            placeholder="g3, t15…"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
           />
@@ -756,26 +1068,31 @@ export function MergeInspectPanel({
                   ? sanityForGroup(row.group, row.tracks, minScore).length > 0 ||
                     row.tracks.some((t) => dupTracks.has(t.track_id))
                   : false;
-              const groupKey =
-                row.kind === "group" ? String(row.group.group_id) : String(row.track.track_id);
-              const faces =
-                row.kind === "group"
-                  ? faceUrls?.[groupKey] ?? faceUrls?.[String(row.tracks[0]?.track_id)]
-                  : faceUrls?.[groupKey];
+              const primaryFaceModel =
+                compareFaceModels[0] ?? faceModels[0] ?? "buffalo_l";
+              const listFaces = faceShotsForEntity(
+                row.kind === "group" ? "group" : "track",
+                row.kind === "group" ? row.group.group_id : row.track.track_id,
+                mergeTimeline,
+                groupFaceUrls,
+                trackFaceUrls,
+                groupFaceUrlsByModel,
+                trackFaceUrlsByModel,
+                primaryFaceModel,
+              );
               return (
                 <li key={key}>
                   <button
                     type="button"
                     className={`merge-inspect-row${isSelected ? " on" : ""}`}
                     onClick={() => pickRow(row)}
-                    title={row.kind === "group" ? row.group.reason ?? undefined : undefined}
                   >
                     <div className="merge-inspect-row-content">
                       {row.kind === "group" ? (
                         <>
                           <div className="merge-inspect-row-head">
                             <span className="merge-inspect-row-title">
-                              <strong>{fromTracklets ? `трек #${row.group.group_id}` : `группа ${row.group.group_id}`}</strong>
+                              <strong>{entityRefLabel("group", row.group.group_id)}</strong>
                               {hasWarn && <span className="merge-inspect-warn-dot" title="Overlap или дубликат" />}
                             </span>
                             {row.group.score != null && (
@@ -787,18 +1104,22 @@ export function MergeInspectPanel({
                             <span>·</span>
                             <span>{formatDuration(row.span)}</span>
                           </div>
-                          <div className="merge-inspect-ids" title={row.tracks.map((t) => `#${t.track_id}`).join(" ")}>
-                            {row.tracks.map((t) => `#${t.track_id}`).join(" ")}
+                          <div className="merge-inspect-ids">
+                            {row.tracks.map((t) => (
+                              <MergeEntityRef key={t.track_id} kind="track" id={t.track_id} {...entityRefCommon} />
+                            ))}
                           </div>
                         </>
                       ) : (
                         <>
                           <div className="merge-inspect-row-head">
                             <span className="merge-inspect-row-title">
-                              <strong>без склейки #{row.track.track_id}</strong>
+                              <strong>{entityRefLabel("track", row.track.track_id)}</strong>
                             </span>
                           </div>
                           <div className="merge-inspect-row-meta">
+                            <span>без склейки</span>
+                            <span>·</span>
                             <span>{formatDuration(row.track.t0)}–{formatDuration(row.track.t1)}</span>
                             <span>·</span>
                             <span>{formatDuration(row.track.t1 - row.track.t0)}</span>
@@ -806,14 +1127,7 @@ export function MergeInspectPanel({
                         </>
                       )}
                     </div>
-                    {(faces?.length || faceUrlsByModel) && (
-                      <GroupFaceThumb
-                        faces={faces}
-                        facesByModel={faceUrlsByModel}
-                        faceModels={faceModels}
-                        groupKey={groupKey}
-                      />
-                    )}
+                    {listFaces?.length ? <GroupFaceThumb faces={listFaces} /> : null}
                   </button>
                 </li>
               );
@@ -867,7 +1181,7 @@ export function MergeInspectPanel({
           {selectedRow?.kind === "group" && (
             <div className="merge-mini-scale">
               <span className="merge-mini-label">
-                {fromTracklets ? `фрагменты трека #${selectedRow.group.group_id}` : `шкала группы ${selectedRow.group.group_id}`}
+                {entityRefLabel("group", selectedRow.group.group_id)} · {chronTracks.length} фрагм.
               </span>
               <div className="merge-mini-lane">
                 {chronTracks.map((t, idx) => {
@@ -879,7 +1193,7 @@ export function MergeInspectPanel({
                       type="button"
                       className={`merge-mini-bar${selectedFragmentId === t.track_id ? " on" : ""}`}
                       style={{ left: `${left}%`, width: `${width}%`, backgroundColor: colorForTrackId(t.track_id) }}
-                      title={`[${idx + 1}/${chronTracks.length}] #${t.track_id} ${t.t0.toFixed(1)}–${t.t1.toFixed(1)}s → tracking #${videoTrackId(t)}`}
+                      title={`[${idx + 1}/${chronTracks.length}] ${entityRefLabel("track", t.track_id)} ${t.t0.toFixed(1)}–${t.t1.toFixed(1)}s → tracking t${videoTrackId(t)}`}
                       onClick={() => pickTrack(t.track_id, t.t0)}
                     />
                   );
@@ -923,7 +1237,6 @@ export function MergeInspectPanel({
                         {section.score != null && <span>{formatScore(section.score)}</span>}
                         <span>{section.tracks.length} фрагм.</span>
                       </button>
-                      {section.reason ? <em title={section.reason}>{section.reason}</em> : null}
                     </div>
                     {section.tracks.map((t) => {
                       const left = (t.t0 / duration) * 100;
@@ -937,14 +1250,12 @@ export function MergeInspectPanel({
                           key={t.track_id}
                           className={`merge-inspect-track-row${selected ? " on" : ""}${live ? " is-live" : ""}`}
                         >
-                          <button
-                            type="button"
-                            className="merge-inspect-track-id"
-                            style={{ backgroundColor: color }}
-                            onClick={() => pickTrack(t.track_id, t.t0)}
-                          >
-                            #{t.track_id}
-                          </button>
+                          <MergeEntityRef
+                            kind="track"
+                            id={t.track_id}
+                            variant="timeline"
+                            {...entityRefCommon}
+                          />
                           <div className="merge-inspect-lane">
                             <div className="merge-inspect-playhead" style={{ left: `${playhead}%` }} />
                             <button
@@ -952,7 +1263,7 @@ export function MergeInspectPanel({
                               type="button"
                               className="merge-inspect-bar"
                               style={{ left: `${left}%`, width: `${width}%`, backgroundColor: color }}
-                              title={`#${t.track_id}  ${t.t0.toFixed(1)}–${t.t1.toFixed(1)}s${gid != null ? `  g${gid}` : ""}`}
+                              title={`${entityRefLabel("track", t.track_id)}  ${t.t0.toFixed(1)}–${t.t1.toFixed(1)}s${gid != null ? `  ${entityRefLabel("group", gid)}` : ""}`}
                               onClick={() => pickTrack(t.track_id, t.t0)}
                             />
                           </div>
@@ -969,14 +1280,9 @@ export function MergeInspectPanel({
             <div className="merge-inspect-dossier">
               <h3>
                 {selectedRow.kind === "group"
-                  ? fromTracklets
-                    ? `Трек #${selectedRow.group.group_id} · ${selectedRow.tracks.length} фрагментов (${chronTracks.map((t) => `#${t.track_id}`).join(", ")})`
-                    : `Группа ${selectedRow.group.group_id} · ${selectedRow.tracks.length} треков`
-                  : `Без склейки #${selectedRow.track.track_id}`}
+                  ? `${entityRefLabel("group", selectedRow.group.group_id)} · ${selectedRow.tracks.length} фрагм. (${chronTracks.map((t) => entityRefLabel("track", t.track_id)).join(", ")})`
+                  : `${entityRefLabel("track", selectedRow.track.track_id)} · без склейки`}
               </h3>
-              {selectedRow.kind === "group" && selectedRow.group.reason && (
-                <p className="merge-inspect-reason">{selectedRow.group.reason}</p>
-              )}
               <div className="merge-crop-compare">
                 {(selectedRow.kind === "group" ? chronTracks : [selectedRow.track]).map((t, idx) => {
                   const crops = cropPreview(cropUrls[String(t.track_id)] ?? []);
@@ -990,7 +1296,7 @@ export function MergeInspectPanel({
                     >
                       <header>
                         <button type="button" onClick={() => pickTrack(t.track_id, t.t0)}>
-                          {selectedRow.kind === "group" ? `[${idx + 1}/${chronTracks.length}] ` : ""}#{t.track_id}
+                          {selectedRow.kind === "group" ? `[${idx + 1}/${chronTracks.length}] ` : ""}{entityRefLabel("track", t.track_id)}
                         </button>
                         <span>
                           {formatDuration(t.t0)}–{formatDuration(t.t1)}
@@ -1030,20 +1336,6 @@ export function MergeInspectPanel({
             <p className="merge-inspect-empty">Выберите группу или solo-трек</p>
           ) : (
             <>
-              {selectedRow.kind === "group" && selectedRow.group.reason && (
-                <blockquote className="merge-why-quote">
-                  <button
-                    type="button"
-                    className="merge-copy"
-                    title="Копировать reason"
-                    onClick={() => copyText(selectedRow.group.reason!)}
-                  >
-                    ⎘
-                  </button>
-                  {selectedRow.group.reason}
-                </blockquote>
-              )}
-
               {selectedGroupPairs.length > 0 && (
                 <>
                   <h4>Рёбра в склейке (Метрики и оценки)</h4>
@@ -1056,7 +1348,7 @@ export function MergeInspectPanel({
                         <th title="Оценка непрерывности движения и расстояние">Motion / Дист.</th>
                         <th title="Похожесть размера bbox">Size</th>
                         <th title="Временной разрыв между фрагментами">Δt</th>
-                        <th title="Тип склейки и обоснование">Обоснование</th>
+                        <th>Pass</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -1066,28 +1358,17 @@ export function MergeInspectPanel({
                         const live = (ta != null && fragmentLive(ta, currentSec)) || (tb != null && fragmentLive(tb, currentSec));
                         return (
                         <tr key={`${p.a}-${p.b}`} className={live ? "is-live" : undefined}>
-                          <td>
-                            <button type="button" onClick={() => pickTrack(p.a, trackT0(p.a))}>
-                              #{p.a}
-                            </button>
-                            ↔
-                            <button type="button" onClick={() => pickTrack(p.b, trackT0(p.b))}>
-                              #{p.b}
-                            </button>
+                          <td className="merge-pair-ids">
+                            <MergeEntityRef kind="track" id={p.a} {...entityRefCommon} />
+                            <span className="merge-pair-sep">↔</span>
+                            <MergeEntityRef kind="track" id={p.b} {...entityRefCommon} />
                           </td>
                           <td><strong>{formatScore(p.score)}</strong></td>
                           <td>{formatScore(p.reid)}</td>
                           <td>{motionLabel(p)}</td>
                           <td>{formatScore(p.size)}</td>
                           <td>{gapLabel(p.gap)}</td>
-                          <td className="merge-pair-why" title={p.reason ?? undefined}>
-                            <PassBadge pass={pairPass(p)} />
-                            {p.reason ? (
-                              <span className="merge-pair-reason">{stripPassPrefix(p.reason)}</span>
-                            ) : pairPass(p) == null ? (
-                              <span>—</span>
-                            ) : null}
-                          </td>
+                          <td><PassBadge pass={pairPass(p)} /></td>
                         </tr>
                         );
                       })}
@@ -1108,7 +1389,7 @@ export function MergeInspectPanel({
                         <th title="Оценка непрерывности движения и расстояние">Motion / Дист.</th>
                         <th title="Похожесть размера bbox">Size</th>
                         <th title="Временной разрыв между фрагментами">Δt</th>
-                        <th title="Почему не взяли в склейку">Обоснование</th>
+                        <th>Pass</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -1116,23 +1397,17 @@ export function MergeInspectPanel({
                         const live = inFrameIds.has(h.track_id) || inFrameIds.has(h.from_id);
                         return (
                           <tr key={`${h.from_id}-${h.track_id}`} className={live ? "is-live" : undefined}>
-                            <td>
-                              <button type="button" onClick={() => pickTrack(h.from_id, trackT0(h.from_id))}>
-                                #{h.from_id}
-                              </button>
-                              ↔
-                              <button type="button" onClick={() => pickTrack(h.track_id, h.t0 ?? 0)}>
-                                #{h.track_id}
-                              </button>
+                            <td className="merge-pair-ids">
+                              <MergeEntityRef kind="track" id={h.from_id} {...entityRefCommon} />
+                              <span className="merge-pair-sep">↔</span>
+                              <MergeEntityRef kind="track" id={h.track_id} {...entityRefCommon} />
                             </td>
                             <td><strong>{formatScore(h.score)}</strong></td>
                             <td>{formatScore(h.reid)}</td>
                             <td>{motionLabel(h)}</td>
                             <td>{formatScore(h.size)}</td>
                             <td>{gapLabel(h.gap)}</td>
-                            <td className="merge-pair-why" title={h.reason ?? undefined}>
-                              {h.reason ? <span className="merge-pair-reason">{h.reason}</span> : <span>—</span>}
-                            </td>
+                            <td><PassBadge pass={h.pass ?? pairPassFromReason(h.reason)} /></td>
                           </tr>
                         );
                       })}
@@ -1141,44 +1416,87 @@ export function MergeInspectPanel({
                 </>
               )}
 
-              {cameraLinkPairs.length > 0 && (
+              {cameraLinkSimilarPairs.length > 0 && (
                 <>
-                  <h4>Pass 10 · Camera Link (лица по моделям)</h4>
-                  <table className="merge-pairs-table">
+                  <h4>Pass 10 · похожие, не склеены</h4>
+                  <table className="merge-pairs-table merge-pairs-table-face">
                     <thead>
                       <tr>
-                        <th>Группа A↔B</th>
+                        <th>A↔B</th>
+                        <th title="Комбинированный общий скор">Combo</th>
+                        {compareFaceModels.map((model) => (
+                          <th key={`sim-${model}`} title={`Сходство лиц (${model})`}>
+                            Face {model}
+                          </th>
+                        ))}
+                        <th title="Уверенность лица из позы (одна на ребро)">Pose</th>
+                        <th title="ReID тела">ReID</th>
+                        <th title="Motion / дистанция ног">Motion</th>
+                        <th title="Временной разрыв">Δt</th>
+                        <th>Pass</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {cameraLinkSimilarPairs.map((p) => (
+                        <tr key={`cls-${p.a}-${p.b}`}>
+                          <td className="merge-pair-ids">
+                            <MergeEntityRef kind="group" id={p.a} {...entityRefCommon} />
+                            <span className="merge-pair-sep">↔</span>
+                            <MergeEntityRef kind="group" id={p.b} {...entityRefCommon} />
+                          </td>
+                          <td><strong>{formatScore(p.score)}</strong></td>
+                          {compareFaceModels.map((model) => (
+                            <td key={`${p.a}-${p.b}-sim-${model}`}>{faceScoreForModel(p, model)}</td>
+                          ))}
+                          <td>{formatScore(p.pose_face)}</td>
+                          <td>{formatScore(p.reid)}</td>
+                          <td>{motionLabel(p)}</td>
+                          <td>{gapLabel(p.gap)}</td>
+                          <td><PassBadge pass={pairPass(p)} /></td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </>
+              )}
+
+              {cameraLinkMergedPairs.length > 0 && (
+                <>
+                  <h4>Pass 10 · Camera Link (склеено)</h4>
+                  <table className="merge-pairs-table merge-pairs-table-face">
+                    <thead>
+                      <tr>
+                        <th>A↔B</th>
                         <th title="Комбинированный общий скор">Combo</th>
                         {compareFaceModels.map((model) => (
                           <th key={model} title={`Сходство лиц (${model})`}>
                             Face {model}
                           </th>
                         ))}
+                        <th title="Уверенность лица из позы (одна на ребро)">Pose</th>
                         <th title="ReID тела">ReID</th>
                         <th title="Motion / дистанция ног">Motion</th>
                         <th title="Временной разрыв">Δt</th>
-                        <th>Обоснование</th>
+                        <th>Pass</th>
                       </tr>
                     </thead>
                     <tbody>
-                      {cameraLinkPairs.map((p) => (
+                      {cameraLinkMergedPairs.map((p) => (
                         <tr key={`cl-${p.a}-${p.b}`}>
-                          <td>
-                            g{p.a} ↔ g{p.b}
+                          <td className="merge-pair-ids">
+                            <MergeEntityRef kind="group" id={p.a} {...entityRefCommon} />
+                            <span className="merge-pair-sep">↔</span>
+                            <MergeEntityRef kind="group" id={p.b} {...entityRefCommon} />
                           </td>
                           <td><strong>{formatScore(p.score)}</strong></td>
                           {compareFaceModels.map((model) => (
                             <td key={`${p.a}-${p.b}-${model}`}>{faceScoreForModel(p, model)}</td>
                           ))}
+                          <td>{formatScore(p.pose_face)}</td>
                           <td>{formatScore(p.reid)}</td>
                           <td>{motionLabel(p)}</td>
                           <td>{gapLabel(p.gap)}</td>
-                          <td className="merge-pair-why" title={p.reason ?? undefined}>
-                            <PassBadge pass={pairPass(p)} />
-                            {p.reason ? (
-                              <span className="merge-pair-reason">{stripPassPrefix(p.reason)}</span>
-                            ) : null}
-                          </td>
+                          <td><PassBadge pass={pairPass(p)} /></td>
                         </tr>
                       ))}
                     </tbody>

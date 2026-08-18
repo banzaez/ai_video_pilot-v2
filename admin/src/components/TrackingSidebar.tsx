@@ -406,7 +406,6 @@ function SimilarHitChip({
                   </span>
                   <span className="crop-pop-title">{formatScore(hit.score)}</span>
                 </div>
-                {hit.reason ? <p className="merge-pop-reason">{hit.reason}</p> : null}
                 <div className="merge-pop-body">
                   <div className="merge-pop-side">
                     <PopMetrics hit={hit} hideOverall />

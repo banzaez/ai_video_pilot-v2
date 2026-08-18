@@ -1,4 +1,4 @@
-"""Глобальная склейка треклетов: Hungarian/greedy + Pass 2/3 + Pass 4 (handover)."""
+"""Глобальная склейка треклетов: Pass 0–4 + Hungarian/greedy."""
 
 from __future__ import annotations
 
@@ -681,6 +681,74 @@ def _tracklets_use_map(tracklets: list[dict[str, Any]]) -> bool:
     return any(isinstance(t.get("map_p0"), (list, tuple)) for t in tracklets)
 
 
+def _pass0_merge_groups(
+    groups: list[list[int]],
+    edges: list[dict[str, Any]],
+    *,
+    spans: dict[int, tuple[float, float]],
+    min_reid: float,
+    tracklets: list[dict[str, Any]] | None = None,
+) -> tuple[list[list[int]], set[tuple[int, int]]]:
+    """Pass 0: склеить готовые цепочки только по ReID ≥ min_reid (выход A → вход B), 1-1, без overlap."""
+    if min_reid <= 0 or len(groups) < 2:
+        return groups, set()
+
+    ends = _ends_from_tracklets(tracklets)
+    by_pair: dict[tuple[int, int], dict[str, Any]] = {}
+    for e in edges:
+        a, b = int(e["from"]), int(e["to"])
+        reid = float(e.get("reid") or 0)
+        if reid < min_reid:
+            continue
+        prev = by_pair.get((a, b))
+        if prev is None or reid > float(prev.get("reid") or 0):
+            by_pair[(a, b)] = e
+
+    best: dict[tuple[int, int], tuple[float, int, int]] = {}
+    for ga, group_a in enumerate(groups):
+        if not group_a:
+            continue
+        for gb, group_b in enumerate(groups):
+            if ga == gb or not group_b:
+                continue
+            if _group_has_overlap(set(group_a) | set(group_b), spans):
+                continue
+            sa = _group_span(group_a, spans)
+            sb = _group_span(group_b, spans)
+            if sb[0] < sa[1]:
+                continue
+            exit_id = _exit_tid(group_a, spans, ends)
+            entry_id = _entry_tid(group_b, spans, ends)
+            rec = by_pair.get((exit_id, entry_id))
+            if rec is None:
+                continue
+            reid = float(rec.get("reid") or 0)
+            best[(ga, gb)] = (reid, exit_id, entry_id)
+
+    if not best:
+        return groups, set()
+
+    group_ids = list(range(len(groups)))
+    t0_g = {gi: _group_span(groups[gi], spans)[0] for gi in group_ids if groups[gi]}
+    fake_edges = [(ga, gb, reid) for (ga, gb), (reid, _, _) in best.items()]
+    chains = link_hungarian_chains(group_ids, fake_edges, min_score=min_reid, t0=t0_g)
+
+    used: set[tuple[int, int]] = set()
+    new_groups: list[list[int]] = []
+    for chain in chains:
+        merged: list[int] = []
+        for i, gi in enumerate(chain):
+            merged.extend(groups[gi])
+            if i + 1 < len(chain):
+                rec = best.get((gi, chain[i + 1]))
+                if rec:
+                    used.add((rec[1], rec[2]))
+        new_groups.append(sorted(set(merged), key=lambda tid: (spans[tid][0], tid)))
+
+    new_groups = _split_overlap_groups(new_groups, spans)
+    return _unique_groups(new_groups), used
+
+
 def _pass2_merge_groups(
     groups: list[list[int]],
     edges: list[dict[str, Any]],
@@ -1019,6 +1087,7 @@ def link_tracklets(
     w_motion: float = 0.25,
     w_size: float = 0.10,
     w_gap: float = 0.10,
+    pass0_min_reid: float = 0.0,
     pass2_min_score: float = 0.0,
     pass4_max_overlap_sec: float = 0.0,
     pass4_min_reid: float = 0.95,
@@ -1117,9 +1186,18 @@ def link_tracklets(
         if tid not in assigned:
             groups.append([tid])
 
+    pass0_used: set[tuple[int, int]] = set()
     pass2_used: set[tuple[int, int]] = set()
     pass3_used: set[tuple[int, int]] = set()
     pass4_used: set[tuple[int, int]] = set()
+    if pass0_min_reid > 0:
+        groups, pass0_used = _pass0_merge_groups(
+            groups,
+            all_edges,
+            spans=spans,
+            min_reid=pass0_min_reid,
+            tracklets=tracklets,
+        )
     if pass2_min_score > 0:
         groups, pass2_used = _pass2_merge_groups(
             groups,
@@ -1180,12 +1258,16 @@ def link_tracklets(
         elif pair in pass1_used:
             e["pass"] = 1
             e["reason"] = f"Pass 1: {reason}" if reason else "Pass 1"
+        elif pair in pass0_used:
+            e["pass"] = 0
+            e["reason"] = f"Pass 0: {reason}" if reason else "Pass 0"
 
     return {
         "solver": solver,
         "groups": groups,
         "edges": all_edges,
         "tracklet_to_global": tracklet_to_global,
+        "pass0_merged": len(pass0_used),
         "pass2_merged": len(pass2_used),
         "pass3_spliced": len(pass3_used),
         "pass4_merged": len(pass4_used),

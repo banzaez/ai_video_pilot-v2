@@ -293,6 +293,10 @@ export function mediaLibraryPlugin(): Plugin {
                 crops: cropUrlsFor(base),
                 faces: fg.faces,
                 facesByModel: fg.facesByModel,
+                groupFaces: fg.groupFaces,
+                trackFaces: fg.trackFaces,
+                groupFacesByModel: fg.groupFacesByModel,
+                trackFacesByModel: fg.trackFacesByModel,
                 faceModels: fg.faceModels,
                 cameraLink: cameraLinkFor(base),
                 similar: similarFromTrackletLinks(base) ?? hitsByTrack(base, "link.json"),
@@ -450,15 +454,15 @@ export function mediaLibraryPlugin(): Plugin {
             res.end("Bad base/filename");
             return;
           }
-          const fcPath = path.join(resultsDir, fcBase, "face_crops", fcFile);
-          if (fs.existsSync(fcPath) && fs.statSync(fcPath).isFile()) {
-            res.setHeader("Content-Type", "image/jpeg");
-            res.setHeader("Cache-Control", "public, max-age=86400");
-            fs.createReadStream(fcPath).pipe(res);
-          } else {
+          const fcPath = path.resolve(resultsDir, fcBase, "face_crops", fcFile);
+          if (!isInside(resultsDir, fcPath) || !fs.existsSync(fcPath) || !fs.statSync(fcPath).isFile()) {
             res.statusCode = 404;
             res.end("Face crop not found");
+            return;
           }
+          res.setHeader("Content-Type", "image/jpeg");
+          res.setHeader("Cache-Control", "public, max-age=86400");
+          fs.createReadStream(fcPath).pipe(res);
           return;
         }
 

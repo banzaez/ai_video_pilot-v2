@@ -72,7 +72,63 @@ def _max_face_similarity(embs_a: np.ndarray | None, embs_b: np.ndarray | None) -
     return float(np.max(np.dot(embs_a, embs_b.T)))
 
 
-def _face_embs_for_group(face_npz: dict[str, np.ndarray], gid: int, model: str, *, multi: bool) -> np.ndarray | None:
+def _max_face_similarity_weighted(
+    embs_a: np.ndarray | None,
+    weights_a: np.ndarray | None,
+    embs_b: np.ndarray | None,
+    weights_b: np.ndarray | None,
+) -> tuple[float, float]:
+    """Выбор пары по cos*w_a*w_b; возвращает (raw_cos, min(w_a,w_b))."""
+    if embs_a is None or embs_b is None or len(embs_a) == 0 or len(embs_b) == 0:
+        return 0.0, 0.0
+    sim_raw = np.dot(embs_a, embs_b.T)
+    sim_weighted = sim_raw.copy()
+    if weights_a is not None and len(weights_a) == len(embs_a):
+        sim_weighted = sim_weighted * weights_a[:, None]
+    if weights_b is not None and len(weights_b) == len(embs_b):
+        sim_weighted = sim_weighted * weights_b[None, :]
+    flat_idx = int(np.argmax(sim_weighted))
+    i, j = divmod(flat_idx, sim_weighted.shape[1])
+    w_a = float(weights_a[i]) if weights_a is not None and len(weights_a) == len(embs_a) else 1.0
+    w_b = float(weights_b[j]) if weights_b is not None and len(weights_b) == len(embs_b) else 1.0
+    return float(sim_raw[i, j]), min(w_a, w_b)
+
+
+def _face_pose_weights(
+    face_meta: dict[str, Any],
+    gid: int,
+    model: str,
+    *,
+    solo_global_ids: set[int],
+) -> np.ndarray | None:
+    if gid in solo_global_ids:
+        by_model = face_meta.get("tracks_by_model") or {}
+        bucket = by_model.get(model) or face_meta.get("tracks") or {}
+    else:
+        by_model = face_meta.get("groups_by_model") or {}
+        bucket = by_model.get(model) or face_meta.get("groups") or {}
+    entries = bucket.get(str(gid), [])
+    if not entries:
+        return None
+    weights = np.array(
+        [max(0.0, min(1.0, float(e.get("pose_face_score", 1.0)))) for e in entries],
+        dtype=np.float32,
+    )
+    return weights if len(weights) else None
+
+
+def _face_embs_for_group(
+    face_npz: dict[str, np.ndarray],
+    gid: int,
+    model: str,
+    *,
+    multi: bool,
+    solo_global_ids: set[int],
+) -> np.ndarray | None:
+    if gid in solo_global_ids:
+        if multi:
+            return face_npz.get(f"track_{gid}_{model}")
+        return face_npz.get(f"track_{gid}")
     if multi:
         return face_npz.get(f"group_{gid}_{model}")
     return face_npz.get(f"group_{gid}")
@@ -123,21 +179,30 @@ def run_camera_link(settings: Settings) -> None:
         base_groups = [[tid] for tid in sorted(all_track_ids)]
         track_to_group = {tid: tid for tid in all_track_ids}
 
+    solo_global_ids: set[int] = set()
+    for gi, group in enumerate(base_groups, start=1):
+        if len(group) == 1:
+            solo_global_ids.add(gi)
+
     # 2. Загружаем координаты ног
     feet_path = feet_json_path(settings)
     feet_trajs = _load_feet_trajectories(feet_path)
 
     # 3. Извлечение лиц через InsightFace
+    from app.tracklet.common import session_manifest
+
+    manifest = session_manifest(settings)
     video_path = _resolve_video_path(settings, tracking_doc)
     face_meta: dict[str, Any] = {}
     face_npz: dict[str, np.ndarray] = {}
 
-    if video_path and os.path.isfile(video_path):
+    if manifest or (video_path and os.path.isfile(video_path)):
         face_meta, face_npz = extract_faces_for_groups(
             settings,
             frames_data=frames_data,
-            track_to_group=track_to_group,
+            solo_global_ids=solo_global_ids,
             video_source_path=video_path,
+            fps=fps,
         )
         face_json_out = camera_face_json_path(settings)
         attach_artifact_meta(face_meta, stage="camera_face", path=face_json_out)
@@ -163,13 +228,11 @@ def run_camera_link(settings: Settings) -> None:
     group_info: dict[int, dict[str, Any]] = {}
     for gid_idx, g in enumerate(base_groups, start=1):
         gid = gid_idx
-        t0 = min((track_spans[tid][0] for tid in g if tid in track_spans), default=0.0)
-        t1 = max((track_spans[tid][1] for tid in g if tid in track_spans), default=0.0)
+        t0 = min((track_spans[tid][0] for tid in (gid,) if tid in track_spans), default=0.0)
+        t1 = max((track_spans[tid][1] for tid in (gid,) if tid in track_spans), default=0.0)
 
-        # Сбор точек ног для группы
-        all_feet: list[dict[str, Any]] = []
-        for tid in g:
-            all_feet.extend(feet_trajs.get(tid, []))
+        # Сбор точек ног для группы (feet.json использует global track_id)
+        all_feet: list[dict[str, Any]] = list(feet_trajs.get(gid, []))
         all_feet.sort(key=lambda pt: pt["frame_index"])
 
         p0 = all_feet[0]["map"] if all_feet else None
@@ -178,9 +241,16 @@ def run_camera_link(settings: Settings) -> None:
         f1_idx = all_feet[-1]["frame_index"] if all_feet else int(t1 * fps)
 
         face_embs_by_model = {
-            model: _face_embs_for_group(face_npz, gid, model, multi=multi_face)
+            model: _face_embs_for_group(face_npz, gid, model, multi=multi_face, solo_global_ids=solo_global_ids)
             for model in face_models
         }
+        face_pose_weights_by_model = {
+            model: _face_pose_weights(face_meta, gid, model, solo_global_ids=solo_global_ids)
+            for model in face_models
+        }
+        has_any_face = any(
+            embs is not None and len(embs) > 0 for embs in face_embs_by_model.values()
+        )
         group_info[gid] = {
             "group_id": gid,
             "tracks": g,
@@ -190,26 +260,31 @@ def run_camera_link(settings: Settings) -> None:
             "f1": f1_idx,
             "p0": p0,
             "p1": p1,
+            "has_any_face": has_any_face,
             "face_embs_by_model": face_embs_by_model,
+            "face_pose_weights_by_model": face_pose_weights_by_model,
         }
 
     # 6. Попарный скоринг и поиск кандидатов (Pass 10)
     gids = sorted(group_info.keys())
+    scored_gids = [gid for gid in gids if group_info[gid]["has_any_face"]]
+    n_skipped_no_face = len(gids) - len(scored_gids)
     candidate_edges: list[dict[str, Any]] = []
     max_gap_sec = float(settings.camera_link_max_gap_sec)
     max_speed = float(settings.camera_link_max_speed_mps)
     motion_sigma = float(settings.camera_link_motion_sigma_m)
     min_face_score = float(settings.camera_link_min_face_score)
+    min_pose_face_score = float(settings.camera_link_min_pose_face_score)
     w_face = float(settings.camera_link_w_face)
     w_reid = float(settings.camera_link_w_reid)
     w_motion = float(settings.camera_link_w_motion)
 
-    for i in range(len(gids)):
-        gA = group_info[gids[i]]
-        for j in range(len(gids)):
+    for i in range(len(scored_gids)):
+        gA = group_info[scored_gids[i]]
+        for j in range(len(scored_gids)):
             if i == j:
                 continue
-            gB = group_info[gids[j]]
+            gB = group_info[scored_gids[j]]
 
             # Временной порядок: A завершился до старта B
             gap_sec = gB["t0"] - gA["t1"]
@@ -232,17 +307,28 @@ def run_camera_link(settings: Settings) -> None:
                     continue
                 s_motion = float(math.exp(- (dist_m ** 2) / (2.0 * (motion_sigma ** 2))))
 
-            # Сходство лиц (отдельно по каждой модели InsightFace)
+            # Сходство лиц (сырой косинус; пара выбирается с учётом pose_face_score)
             face_scores: dict[str, float] = {}
+            best_raw = 0.0
+            pose_face = 0.0
             for model in face_models:
-                s_model = _max_face_similarity(
+                raw_cos, pose_w = _max_face_similarity_weighted(
                     gA["face_embs_by_model"].get(model),
+                    gA["face_pose_weights_by_model"].get(model),
                     gB["face_embs_by_model"].get(model),
+                    gB["face_pose_weights_by_model"].get(model),
                 )
-                if s_model > 0:
-                    face_scores[model] = round(s_model, 4)
+                if raw_cos > 0:
+                    face_scores[model] = round(raw_cos, 4)
+                if raw_cos > best_raw:
+                    best_raw = raw_cos
+                    pose_face = pose_w
             s_face = max(face_scores.values()) if face_scores else 0.0
             has_face = bool(face_scores)
+            if not has_face:
+                continue
+
+            s_face_eff = s_face * pose_face
 
             # Сходство ReID тела (по всем трекам группы)
             s_reid = 0.0
@@ -262,16 +348,10 @@ def run_camera_link(settings: Settings) -> None:
                 has_reid = True
                 s_reid = max(reid_pairs)
 
-            # Вычисление комбинированного скора
-            if has_face:
-                combo = w_face * s_face + w_reid * s_reid + w_motion * s_motion
-                # Высокая уверенность по лицу при валидной скорости ног
-                if s_face >= min_face_score:
-                    combo = max(combo, s_face)
-            elif has_reid:
-                combo = (w_reid / (w_reid + w_motion)) * s_reid + (w_motion / (w_reid + w_motion)) * s_motion
-            else:
-                combo = s_motion
+            # Вычисление комбинированного скора (только при наличии лица)
+            combo = w_face * s_face_eff + w_reid * s_reid + w_motion * s_motion
+            if s_face >= min_face_score and pose_face >= min_pose_face_score:
+                combo = max(combo, s_face_eff)
 
             min_combo_score = float(settings.camera_link_min_combo_score)
             if combo < min_combo_score:
@@ -281,7 +361,8 @@ def run_camera_link(settings: Settings) -> None:
             face_reason = f"Face[{', '.join(face_parts)}]" if face_parts else "Face=—"
             reason_str = (
                 f"Pass 10 (Camera Link / Face + Feet): "
-                f"{face_reason}, ReID={s_reid:.2f}, Motion={s_motion:.2f} "
+                f"{face_reason}, PoseFace={pose_face:.2f}, "
+                f"ReID={s_reid:.2f}, Motion={s_motion:.2f} "
                 f"(Δd={dist_m:.1f}м, v={v:.1f}м/с, Δt={gap_sec:.1f}с)"
             )
 
@@ -289,8 +370,9 @@ def run_camera_link(settings: Settings) -> None:
                 "from": gA["group_id"],
                 "to": gB["group_id"],
                 "score": round(combo, 4),
-                "face": round(s_face, 4) if has_face else None,
+                "face": round(s_face, 4),
                 "face_scores": face_scores or None,
+                "pose_face": round(pose_face, 4) if pose_face > 0 else None,
                 "reid": round(s_reid, 4) if has_reid else None,
                 "motion": round(s_motion, 4),
                 "dist_m": round(dist_m, 2),
@@ -361,8 +443,9 @@ def run_camera_link(settings: Settings) -> None:
 
     n_pass10_merges = sum(1 for e in best_edges if e.get("pass") == 10)
     logger.info(
-        "STAGE camera_link (Pass 10): групп=%s (склеек Pass 10: %s), рёбер=%s",
+        "STAGE camera_link (Pass 10): групп=%s (склеек Pass 10: %s), рёбер=%s, без лиц (пропуск скоринга)=%s",
         len(final_groups),
         n_pass10_merges,
         len(best_edges),
+        n_skipped_no_face,
     )

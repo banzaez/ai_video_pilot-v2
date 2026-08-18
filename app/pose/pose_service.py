@@ -9,7 +9,7 @@ import numpy as np
 
 from app.config import Settings
 from app.model_cache import get_model_cache, predict_batch_size, resolve_pt_path
-from app.pose.types import PoseResult
+from app.pose.types import PoseResult, select_pose_by_completeness
 
 logger = logging.getLogger(__name__)
 
@@ -101,8 +101,8 @@ class PoseService:
         }
         if self.device:
             kw["device"] = self.device
-        if self.quantize == 16:
-            kw["half"] = True
+        if self.quantize is not None:
+            kw["quantize"] = self.quantize
         return kw
 
     def predict_single(
@@ -144,24 +144,35 @@ class PoseService:
             out.extend(parsed)
         return out
 
-    def is_facing_camera(
+    def pose_faces_for_bboxes(
         self,
-        image_or_crop: np.ndarray | None,
+        frame_img: np.ndarray,
+        bboxes: Sequence[Sequence[float]],
         *,
-        min_conf: float = 0.25,
-    ) -> bool:
-        """
-        Быстрая проверка: обращен ли человек лицом/в профиль к камере.
-        """
-        if image_or_crop is None or image_or_crop.size == 0:
-            return True
-        results = self.predict_single(image_or_crop, conf=min_conf)
-        if not results:
-            # Человек не задетектирован на кропе
-            return True
-        # Берем наиболее крупную/уверенную детекцию
-        best_inst = max(results, key=lambda r: (r.bbox[2] - r.bbox[0]) * (r.bbox[3] - r.bbox[1]))
-        return best_inst.is_facing_camera(min_conf=min_conf)
+        kpt_min: float = 0.25,
+    ) -> list[tuple[PoseResult | None, float]]:
+        """Самая полная поза на bbox, затем face_confidence (conf детектора = self.conf)."""
+        if frame_img is None or frame_img.size == 0 or not bboxes:
+            return [(None, 0.0)] * len(bboxes)
+        poses = self.predict_crops_from_frame(frame_img, bboxes, kpt_min=kpt_min)
+        out: list[tuple[PoseResult | None, float]] = []
+        for pose in poses:
+            if pose is None:
+                out.append((None, 0.0))
+            else:
+                out.append((pose, pose.face_confidence(min_conf=kpt_min)))
+        return out
+
+    def pose_face_for_bbox(
+        self,
+        frame_img: np.ndarray,
+        bbox: Sequence[float],
+        *,
+        kpt_min: float = 0.25,
+    ) -> tuple[PoseResult | None, float]:
+        """Поза и оценка пригодности лица для одного tracking bbox."""
+        rows = self.pose_faces_for_bboxes(frame_img, [bbox], kpt_min=kpt_min)
+        return rows[0] if rows else (None, 0.0)
 
     def predict_crops_from_frame(
         self,
@@ -171,6 +182,7 @@ class PoseService:
         conf: float | None = None,
         padding: float = 0.05,
         batch_size: int | None = None,
+        kpt_min: float = 0.25,
     ) -> list[PoseResult | None]:
         """
         Вырезает кропы для списка BBox с кадра, прогоняет через модель и
@@ -216,7 +228,7 @@ class PoseService:
         batch_results = self.predict_batch(valid_crops, conf=conf, batch_size=batch_size)
 
         out: list[PoseResult | None] = []
-        for mapped_idx in bbox_map:
+        for bbox_idx, mapped_idx in enumerate(bbox_map):
             if mapped_idx is None:
                 out.append(None)
                 continue
@@ -227,8 +239,15 @@ class PoseService:
             if not items:
                 out.append(None)
                 continue
-            best = max(items, key=lambda r: (r.bbox[2] - r.bbox[0]) * (r.bbox[3] - r.bbox[1]))
+            orig_bbox = [float(v) for v in bboxes[bbox_idx][:4]]
             ox, oy = crop_offsets[mapped_idx]
+            local_orig = [orig_bbox[0] - ox, orig_bbox[1] - oy, orig_bbox[2] - ox, orig_bbox[3] - oy]
+            best = select_pose_by_completeness(
+                items, local_orig, kpt_min=kpt_min, require_min_iou=False
+            )
+            if best is None:
+                out.append(None)
+                continue
             out.append(best.with_offset(ox, oy))
 
         return out

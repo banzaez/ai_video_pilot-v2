@@ -77,6 +77,7 @@ def run_tracklet_link(settings: Settings) -> None:
         w_motion=settings.tracklet_link_w_motion,
         w_size=settings.tracklet_link_w_size,
         w_gap=settings.tracklet_link_w_gap,
+        pass0_min_reid=settings.tracklet_link_pass0_min_reid,
         pass2_min_score=settings.tracklet_link_pass2_min_score,
         pass4_max_overlap_sec=settings.tracklet_link_pass4_max_overlap_sec,
         pass4_min_reid=settings.tracklet_link_pass4_min_reid,
@@ -101,6 +102,7 @@ def run_tracklet_link(settings: Settings) -> None:
     payload = {
         "stage": "tracklet_link",
         "solver": result["solver"],
+        "pass0_min_reid": settings.tracklet_link_pass0_min_reid,
         "pass1_min_score": settings.tracklet_link_pass1_min_score,
         "pass2_min_score": settings.tracklet_link_pass2_min_score,
         "pass4_max_overlap_sec": settings.tracklet_link_pass4_max_overlap_sec,
@@ -110,6 +112,7 @@ def run_tracklet_link(settings: Settings) -> None:
         "groups": groups,
         "edges": edges,
         "tracklet_to_global": mapping,
+        "pass0_merged": int(result.get("pass0_merged") or 0),
         "pass2_merged": int(result.get("pass2_merged") or 0),
         "pass3_spliced": int(result.get("pass3_spliced") or 0),
         "pass4_merged": int(result.get("pass4_merged") or 0),
@@ -117,12 +120,13 @@ def run_tracklet_link(settings: Settings) -> None:
     attach_artifact_meta(payload, stage="tracklet_link", path=out_path)
     save_debug_json(out_path, payload)
     logger.info(
-        "STAGE 2c: групп=%s (склеено %s, median_chain=%.1f), рёбер=%s, reid>=0.95 не взяты=%s, pass2=%s, pass3=%s, pass4=%s",
+        "STAGE 2c: групп=%s (склеено %s, median_chain=%.1f), рёбер=%s, reid>=0.95 не взяты=%s, pass0=%s, pass2=%s, pass3=%s, pass4=%s",
         payload["n_groups"],
         n_multi,
         float(median_chain),
         len(edges),
         len(missed_high),
+        int(result.get("pass0_merged") or 0),
         int(result.get("pass2_merged") or 0),
         int(result.get("pass3_spliced") or 0),
         int(result.get("pass4_merged") or 0),

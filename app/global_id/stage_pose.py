@@ -10,8 +10,9 @@ import numpy as np
 
 from app.artifact_meta import attach_artifact_meta
 from app.config import Settings, cameras_dir, info_json_path, poses_json_path, tracking_json_path
-from app.io.json_util import load_tracking_json, save_debug_json
 from app.global_id.camera_pose import dual_plane_from_bbox, load_camera_doc, parse_camera_pose
+from app.io.json_util import load_tracking_json, save_debug_json
+from app.pose.types import select_pose_index_by_completeness
 from app.model_cache import get_model_cache, predict_batch_size, resolve_pt_path
 from app.parallel_tracker import FrameReaderThread, open_video_capture, reader_queue_size
 from app.pose import get_pose_service
@@ -19,21 +20,6 @@ from app.progress import make_pbar
 from app.tracklet.map_coords import camera_key_for_settings
 
 logger = logging.getLogger(__name__)
-
-_MIN_IOU = 0.3
-
-
-def _bbox_iou(a: list[float], b: list[float]) -> float:
-    ax1, ay1, ax2, ay2 = a
-    bx1, by1, bx2, by2 = b
-    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
-    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
-    iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
-    inter = iw * ih
-    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
-    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
-    union = area_a + area_b - inter
-    return inter / union if union > 0 else 0.0
 
 
 def _session_manifest(settings: Settings) -> dict[str, Any] | None:
@@ -110,9 +96,19 @@ def _match_to_tracks(
     track_dets: list[dict[str, Any]],
     frame_index: int,
     timestamp_sec: float,
+    *,
+    kpt_min: float = 0.25,
 ) -> list[dict[str, Any]]:
     used: set[int] = set()
     matched: list[dict[str, Any]] = []
+    rows = [
+        (
+            inst.get("bbox") or [],
+            inst.get("kcf") or [],
+            float(inst.get("confidence") or 0.0),
+        )
+        for inst in pose_inst
+    ]
     for det in track_dets:
         try:
             tid = int(det["track_id"])
@@ -122,16 +118,8 @@ def _match_to_tracks(
         if not isinstance(tb, (list, tuple)) or len(tb) < 4:
             continue
         tb4 = [float(tb[0]), float(tb[1]), float(tb[2]), float(tb[3])]
-        best_i = -1
-        best_iou = _MIN_IOU
-        for i, inst in enumerate(pose_inst):
-            if i in used:
-                continue
-            iou = _bbox_iou(tb4, inst["bbox"])
-            if iou > best_iou:
-                best_iou = iou
-                best_i = i
-        if best_i < 0:
+        best_i = select_pose_index_by_completeness(rows, tb4, kpt_min=kpt_min, skip=used)
+        if best_i is None:
             continue
         used.add(best_i)
         inst = pose_inst[best_i]
@@ -251,6 +239,7 @@ def run_pose(settings: Settings) -> None:
                     dets,
                     int(meta["frame_index"]),
                     float(meta.get("timestamp_sec") or 0.0),
+                    kpt_min=float(settings.pose_kpt_min),
                 )
                 n_with_pose += sum(1 for m in matched if m.get("kxy"))
                 observations.extend(matched)

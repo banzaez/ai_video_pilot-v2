@@ -10,6 +10,7 @@ export type SimilarHit = {
   dist?: number | null;
   space?: string | null;
   reason?: string | null;
+  pass?: number | null;
   group_id?: number | null;
   t0?: number | null;
   t1?: number | null;
@@ -64,6 +65,9 @@ export type MergeTimelinePair = {
   score: number;
   reason: string | null;
   reid: number | null;
+  face?: number | null;
+  face_scores?: Record<string, number> | null;
+  pose_face?: number | null;
   motion?: number | null;
   size?: number | null;
   gap?: number | null;
@@ -133,8 +137,15 @@ export function numOrNull(v: unknown): number | null {
   return typeof v === "number" && Number.isFinite(v) ? v : null;
 }
 
+function linkPass(e: { pass?: number | null; pass2?: boolean | null }): number | null {
+  if (typeof e.pass === "number" && e.pass >= 0) return e.pass;
+  if (e.pass2) return 2;
+  return null;
+}
+
 export function edgeMetrics(e: LinkEdge): Omit<SimilarHit, "track_id" | "group_id" | "t0" | "t1"> {
   const reason = typeof e.reason === "string" && e.reason.trim() ? e.reason : "skip";
+  const pass = linkPass(e);
   return {
     score: typeof e.score === "number" ? e.score : typeof e.reid === "number" ? e.reid : 0,
     reid: numOrNull(e.reid),
@@ -144,6 +155,7 @@ export function edgeMetrics(e: LinkEdge): Omit<SimilarHit, "track_id" | "group_i
     dist: numOrNull(e.dist),
     space: typeof e.space === "string" ? e.space : null,
     reason,
+    pass,
   };
 }
 
@@ -383,9 +395,7 @@ export function mergeTimelineFromTracklets(base: string): MergeTimeline | null {
     const intra = edges.filter(
       (e) => typeof e.from === "number" && typeof e.to === "number" && idSet.has(e.from) && idSet.has(e.to),
     );
-    const used = intra.filter(
-      (e) => (typeof e.pass === "number" && e.pass >= 1) || e.pass2 === true,
-    );
+    const used = intra.filter((e) => linkPass(e) != null);
     const source = used.length ? used : intra;
     const scores = source
       .map((e) => (typeof e.reid === "number" ? e.reid : typeof e.score === "number" ? e.score : null))
@@ -399,9 +409,7 @@ export function mergeTimelineFromTracklets(base: string): MergeTimeline | null {
       track_ids: ids,
       score: scores.length ? Math.max(...scores) : null,
       reason: metrics || "Hungarian / MCF",
-      passes: [...new Set(used.map((e) => (typeof e.pass === "number" && e.pass >= 1 ? e.pass : 2)))].sort(
-        (a, b) => a - b,
-      ),
+      passes: [...new Set(used.map((e) => linkPass(e) ?? 2))].sort((a, b) => a - b),
     });
   }
 
@@ -414,7 +422,7 @@ export function mergeTimelineFromTracklets(base: string): MergeTimeline | null {
     if (seenPairs.has(key)) continue;
     seenPairs.add(key);
     const same = mapping[String(e.from)] === mapping[String(e.to)];
-    const pass = typeof e.pass === "number" && e.pass >= 1 ? e.pass : e.pass2 ? 2 : null;
+    const pass = linkPass(e);
     pairs.push({
       a: e.from,
       b: e.to,

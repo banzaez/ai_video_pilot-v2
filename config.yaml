@@ -108,45 +108,47 @@ tracklet_pipeline:
     crops_dir: tracklet_crops
   # Stage 2c tracklet_link → tracklet_links.json (вкладка «Склейки»)
   # Pose на f0/f1 уточняет ноги (p0/p1 → map_p0/map_p1); motion экстраполирует конец A к t0(B).
-  # Четыре прохода: Pass 1 — цепочки; Pass 2 — стык; Pass 3 — вставка в дырку; Pass 4 — handover.
+  # Пять проходов: Pass 0 — ReID; Pass 1 — combo в окнах; Pass 2 — стык; Pass 3 — дырка; Pass 4 — handover.
   link:
-    # --- кандидаты A→B (кто вообще может стать соседом) ---
-    # Макс. пауза между концом A и началом B, сек. Дальше ребро не строится.
-    max_gap_sec: 6.0
-    # Мин. ReID (max pairwise по кропам). Ниже — пара отбрасывается ещё до combo.
-    # Склейка только если ReID ≥ этого И combo ≥ pass1_min_score.
-    min_reid_score: 0.90
-    # Макс. «промах» предсказанной точки: куда A должен был дойти к t0(B) vs p0(B), px.
-    # 0 = не фильтровать по motion на этапе кандидатов.
-    max_spatial_px: 700
-    max_spatial_m: 4.0
-    # Ширина гаусса для motion-score: exp(-residual / sigma). Больше = мягче к скачку bbox.
-    motion_sigma_px: 250
-    motion_sigma_m: 1.5
-    # Насколько похож масштаб bbox (log-шкала по росту). Обрезка по высоте при той же ширине не штрафуется.
-    size_log_scale: 0.45
+    # Кандидаты A→B и фильтры до combo (используются всеми pass).
+    candidates:
+      # Макс. пауза между концом A и началом B, сек. Дальше ребро не строится.
+      max_gap_sec: 6.0
+      # Мин. ReID (max pairwise по кропам). Ниже — пара отбрасывается ещё до combo.
+      min_reid_score: 0.90
+      # Макс. «промах» предсказанной точки: куда A должен был дойти к t0(B) vs p0(B).
+      # 0 = не фильтровать по motion на этапе кандидатов.
+      max_spatial_px: 700
+      max_spatial_m: 4.0
+      # Ширина гаусса для motion-score: exp(-residual / sigma). Больше = мягче к скачку bbox.
+      motion_sigma_px: 250
+      motion_sigma_m: 1.5
+      # Насколько похож масштаб bbox (log-шкала по росту).
+      size_log_scale: 0.45
     # Веса combo = w_reid·reid + w_motion·motion + w_size·size + w_gap·gap (сумма ≈ 1).
-    w_reid: 0.50
-    w_motion: 0.25
-    w_size: 0.10
-    w_gap: 0.15
+    combo:
+      w_reid: 0.65
+      w_motion: 0.30
+      w_size: 0.0
+      w_gap: 0.15
 
-    # --- Pass 1: цепочки во времени ---
-    # Мин. combo для склейки (окно и стык окон). ReID ≥ min_reid_score недостаточно.
-    pass1_min_score: 0.90
-    # --- Pass 2: досклейка готовых цепочек (выход A → вход B) ---
-    # Combo ниже Pass 1, но всё ещё высокий. 0 = выкл. Также включает Pass 3 (вставка в дырку цепочки).
-    pass2_min_score: 0.85
-    # Pass 4: ID-switch. B стартует в хвосте A. max_overlap 0 = выкл.
-    pass4_max_overlap_sec: 2.0
-    pass4_min_reid: 0.90
-    pass4_min_score: 0.85
-    # Длина временного окна, сек. Длинные видео режутся на окна; внутри — Hungarian/greedy.
-    window_sec: 60
-    # Перекрытие соседних окон, сек (чтобы цепочки на стыке не обрывались).
-    window_overlap_sec: 15
-    # hungarian — глобальный 1-1 assignment в окне; greedy — жадный fallback.
-    solver: hungarian
+    # Pass 0: досклейка только по ReID (без combo). min_reid 0 = выкл.
+    pass0:
+      min_reid: 0.96
+    # Pass 1: цепочки во времени (combo ≥ min_score в окнах).
+    pass1:
+      min_score: 0.90
+      window_sec: 60
+      window_overlap_sec: 15
+      solver: hungarian
+    # Pass 2: стык готовых цепочек; Pass 3 (вставка в дырку) — тот же min_score.
+    pass2:
+      min_score: 0.85
+    # Pass 4: ID-switch — B стартует в хвосте A. max_overlap_sec 0 = выкл.
+    pass4:
+      max_overlap_sec: 2.0
+      min_reid: 0.90
+      min_score: 0.85
 
     # Высота плоскости пересечения луча, м (0 = пол; совпадает с калибровкой пар)
     torso_height_m: 0.0
@@ -165,7 +167,7 @@ tracker_filters:
 # --- Stage pose: YOLO-pose → poses.json ---
 pose:
   model: yolo26s-pose.pt
-  conf: 0.25
+  conf: 0.55
   kpt_min: 0.25
   every_n: 4
 
@@ -182,16 +184,19 @@ camera_link:
   # Параллельно извлекаем лица всеми моделями; оценки сравнения — отдельно в face_scores.
   face_models: [buffalo_l, antelopev2]
   face_top_k: 5
-  face_max_attempts: 15
+  face_max_attempts: 7
+  face_min_gap_sec: 0.5
+  face_dup_cos: 0.97
   min_face_score: 0.60
+  min_pose_face_score: 0.35
   face_crops_dir: face_crops
   max_gap_sec: 120.0
   max_speed_mps: 3.5
-  motion_sigma_m: 2.0
+  motion_sigma_m: 3.0
   w_face: 0.50
   w_reid: 0.30
   w_motion: 0.20
-  min_combo_score: 0.55
+  min_combo_score: 0.85
   solver: hungarian
   save_face_crops: true
 

@@ -101,10 +101,14 @@ export type FaceShot = {
   url: string;
   rank: number;
   score: number | null;
+  pose_score?: number | null;
+  quality?: number | null;
   frame: number;
   t: number | null;
   bbox: number[] | null;
   model?: string | null;
+  track_id?: number | null;
+  solo?: boolean;
 };
 
 export type FaceGallery = {
@@ -123,6 +127,7 @@ export type SimilarHit = {
   dist?: number | null;
   space?: string | null;
   reason?: string | null;
+  pass?: number | null;
   group_id?: number | null;
   t0?: number | null;
   t1?: number | null;
@@ -154,6 +159,7 @@ export type MergeTimelinePair = {
   reid: number | null;
   face?: number | null;
   face_scores?: Record<string, number> | null;
+  pose_face?: number | null;
   motion?: number | null;
   size?: number | null;
   gap?: number | null;
@@ -543,6 +549,10 @@ export async function fetchMediaMeta(
   crops: Record<string, CropShot[]>;
   faces: Record<string, FaceShot[]>;
   facesByModel: Record<string, Record<string, FaceShot[]>>;
+  groupFaces: Record<string, FaceShot[]>;
+  trackFaces: Record<string, FaceShot[]>;
+  groupFacesByModel: Record<string, Record<string, FaceShot[]>>;
+  trackFacesByModel: Record<string, Record<string, FaceShot[]>>;
   faceModels: string[];
   cameraLink: {
     face_models?: string[];
@@ -565,6 +575,10 @@ export async function fetchMediaMeta(
       crops: {},
       faces: {},
       facesByModel: {},
+      groupFaces: {},
+      trackFaces: {},
+      groupFacesByModel: {},
+      trackFacesByModel: {},
       faceModels: [],
       cameraLink: null,
       similar: {},
@@ -578,6 +592,10 @@ export async function fetchMediaMeta(
     crops?: Record<string, CropShot[]>;
     faces?: Record<string, FaceShot[]>;
     facesByModel?: Record<string, Record<string, FaceShot[]>>;
+    groupFaces?: Record<string, FaceShot[]>;
+    trackFaces?: Record<string, FaceShot[]>;
+    groupFacesByModel?: Record<string, Record<string, FaceShot[]>>;
+    trackFacesByModel?: Record<string, Record<string, FaceShot[]>>;
     faceModels?: string[];
     cameraLink?: {
       face_models?: string[];
@@ -595,6 +613,10 @@ export async function fetchMediaMeta(
     crops: data.crops ?? {},
     faces: data.faces ?? {},
     facesByModel: data.facesByModel ?? {},
+    groupFaces: data.groupFaces ?? {},
+    trackFaces: data.trackFaces ?? {},
+    groupFacesByModel: data.groupFacesByModel ?? {},
+    trackFacesByModel: data.trackFacesByModel ?? {},
     faceModels: data.faceModels ?? [],
     cameraLink: data.cameraLink ?? null,
     similar: data.similar ?? {},
@@ -827,4 +849,40 @@ export function loadPrefs(): ViewerPrefs {
 
 export function savePrefs(prefs: ViewerPrefs): void {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(prefs));
+}
+
+/** Верхняя граница шкалы Pass N → цвет (Pass 10 = красный). */
+export const PASS_BADGE_MAX = 10;
+
+export function resolveLinkPass(p: { pass?: number | null; pass2?: boolean | null }): number | null {
+  if (typeof p.pass === "number" && p.pass >= 0) return p.pass;
+  if (p.pass2) return 2;
+  return null;
+}
+
+/** Градация зелёный → жёлтый → красный по уровню pass. */
+export function passBadgeColors(
+  pass: number,
+  maxPass = PASS_BADGE_MAX,
+): { bg: string; fg: string; border: string } {
+  const t = Math.min(1, Math.max(0, pass / maxPass));
+  let r: number;
+  let g: number;
+  let b: number;
+  if (t <= 0.5) {
+    const u = t / 0.5;
+    r = Math.round(15 + (202 - 15) * u);
+    g = Math.round(110 + (138 - 110) * u);
+    b = Math.round(86 + (4 - 86) * u);
+  } else {
+    const u = (t - 0.5) / 0.5;
+    r = Math.round(202 + (220 - 202) * u);
+    g = Math.round(138 + (38 - 138) * u);
+    b = Math.round(4 + (38 - 4) * u);
+  }
+  return {
+    bg: `rgba(${r}, ${g}, ${b}, 0.14)`,
+    fg: `rgb(${r}, ${g}, ${b})`,
+    border: `rgba(${r}, ${g}, ${b}, 0.32)`,
+  };
 }

@@ -42,6 +42,7 @@ def remap_tracklet_frames(
             rank = (conf_f, t0)
             rec = {
                 "track_id": global_id,
+                "tracklet_id": tl_id,
                 "confidence": det.get("confidence"),
                 "bbox": det["bbox"],
             }

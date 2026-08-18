@@ -98,6 +98,7 @@ class Settings:
     tracklet_link_max_gap_sec: float = 20.0
     tracklet_link_min_reid_score: float = 0.55
     tracklet_link_pass1_min_score: float = 0.70
+    tracklet_link_pass0_min_reid: float = 0.0
     tracklet_link_max_spatial_px: float = 700.0
     tracklet_link_max_spatial_m: float = 4.0
     tracklet_link_motion_sigma_px: float = 180.0
@@ -128,8 +129,11 @@ class Settings:
     camera_link_model: str = "buffalo_l"
     camera_link_face_models: tuple[str, ...] = ("buffalo_l", "antelopev2")
     camera_link_face_top_k: int = 5
-    camera_link_face_max_attempts: int = 15
+    camera_link_face_max_attempts: int = 7
+    camera_link_face_min_gap_sec: float = 0.5
+    camera_link_face_dup_cos: float = 0.97
     camera_link_min_face_score: float = 0.60
+    camera_link_min_pose_face_score: float = 0.35
     camera_link_save_face_crops: bool = True
     camera_link_face_crops_dir: str = "face_crops"
     camera_link_max_gap_sec: float = 120.0

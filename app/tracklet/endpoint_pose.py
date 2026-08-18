@@ -11,10 +11,10 @@ from app.config import Settings, info_json_path
 from app.global_id.camera_pose import image_feet_from_kpts
 from app.io.json_util import load_tracking_json
 from app.model_cache import get_model_cache, predict_batch_size, resolve_pt_path
+from app.pose.types import select_pose_index_by_completeness
 from app.progress import make_pbar
 from app.tracklet.common import session_manifest
 from app.tracklet.stage_reid import _advance_capture, _resolve_video_path
-from app.util.bbox import bbox_iou
 
 logger = logging.getLogger(__name__)
 
@@ -47,21 +47,24 @@ def match_pose_to_bbox(
     used: set[int],
     *,
     min_iou: float = _MIN_IOU,
+    kpt_min: float = 0.25,
 ) -> dict[str, Any] | None:
-    best_i = -1
-    best_iou = float(min_iou)
-    tb = [float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])]
-    for i, inst in enumerate(instances):
-        if i in used:
-            continue
-        ib = inst.get("bbox")
-        if not isinstance(ib, (list, tuple)) or len(ib) < 4:
-            continue
-        iou = bbox_iou(tb, [float(v) for v in ib[:4]])
-        if iou > best_iou:
-            best_iou = iou
-            best_i = i
-    if best_i < 0:
+    rows = [
+        (
+            inst.get("bbox") or [],
+            inst.get("kcf") or [],
+            float(inst.get("confidence") or 0.0),
+        )
+        for inst in instances
+    ]
+    best_i = select_pose_index_by_completeness(
+        rows,
+        bbox,
+        min_iou=min_iou,
+        kpt_min=kpt_min,
+        skip=used,
+    )
+    if best_i is None:
         return None
     used.add(best_i)
     return instances[best_i]
@@ -148,7 +151,7 @@ def enrich_tracklet_endpoint_pose(tracklets: list[dict[str, Any]], settings: Set
             ]
             used: set[int] = set()
             for tracklet, end, bbox in by_frame[fi]:
-                hit = match_pose_to_bbox(bbox, inst, used)
+                hit = match_pose_to_bbox(bbox, inst, used, kpt_min=kpt_min)
                 if hit is None:
                     continue
                 apply_endpoint_kpts(tracklet, end, hit["kxy"], hit["kcf"], kpt_min=kpt_min)

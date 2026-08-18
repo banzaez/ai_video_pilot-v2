@@ -27,6 +27,69 @@ def _solider_image_size(raw: Any) -> tuple[int, int]:
     return (384, 128)
 
 
+def _link_section(cfg: dict[str, Any], name: str) -> dict[str, Any]:
+    raw = cfg.get(name)
+    return raw if isinstance(raw, dict) else {}
+
+
+def _link_value(
+    cfg: dict[str, Any],
+    section: dict[str, Any],
+    key: str,
+    *flat_keys: str,
+    default: Any,
+) -> Any:
+    if key in section:
+        return section[key]
+    for flat_key in flat_keys:
+        if flat_key in cfg:
+            return cfg[flat_key]
+    return default
+
+
+def _parse_tracklet_link_cfg(link_cfg: dict[str, Any]) -> dict[str, Any]:
+    """Nested link.candidates / combo / passN + fallback на плоские ключи."""
+    cand = _link_section(link_cfg, "candidates")
+    combo = _link_section(link_cfg, "combo")
+    p0 = _link_section(link_cfg, "pass0")
+    p1 = _link_section(link_cfg, "pass1")
+    p2 = _link_section(link_cfg, "pass2")
+    p4 = _link_section(link_cfg, "pass4")
+
+    def g(section: dict[str, Any], key: str, *flat: str, default: Any) -> Any:
+        return _link_value(link_cfg, section, key, *flat, default=default)
+
+    pass2_min = float(g(p2, "min_score", "pass2_min_score", default=0.0))
+
+    return {
+        "max_gap_sec": float(g(cand, "max_gap_sec", "max_gap_sec", default=20.0)),
+        "min_reid_score": float(g(cand, "min_reid_score", "min_reid_score", default=0.55)),
+        "max_spatial_px": float(g(cand, "max_spatial_px", "max_spatial_px", default=700)),
+        "max_spatial_m": float(g(cand, "max_spatial_m", "max_spatial_m", default=4.0)),
+        "motion_sigma_px": float(g(cand, "motion_sigma_px", "motion_sigma_px", default=180)),
+        "motion_sigma_m": float(g(cand, "motion_sigma_m", "motion_sigma_m", default=1.5)),
+        "size_log_scale": float(g(cand, "size_log_scale", "size_log_scale", default=0.45)),
+        "w_reid": float(g(combo, "w_reid", "w_reid", default=0.55)),
+        "w_motion": float(g(combo, "w_motion", "w_motion", default=0.25)),
+        "w_size": float(g(combo, "w_size", "w_size", default=0.10)),
+        "w_gap": float(g(combo, "w_gap", "w_gap", default=0.10)),
+        "pass0_min_reid": float(g(p0, "min_reid", "pass0_min_reid", default=0.0)),
+        "pass1_min_score": float(
+            g(p1, "min_score", "pass1_min_score", "auto_min_score", default=0.70)
+        ),
+        "pass2_min_score": pass2_min,
+        "pass4_max_overlap_sec": float(
+            g(p4, "max_overlap_sec", "pass4_max_overlap_sec", default=2.0)
+        ),
+        "pass4_min_reid": float(g(p4, "min_reid", "pass4_min_reid", default=0.95)),
+        "pass4_min_score": float(g(p4, "min_score", "pass4_min_score", default=0.85)),
+        "window_sec": float(g(p1, "window_sec", "window_sec", default=120)),
+        "window_overlap_sec": float(g(p1, "window_overlap_sec", "window_overlap_sec", default=15)),
+        "solver": str(g(p1, "solver", "solver", default="hungarian") or "hungarian").lower(),
+        "torso_height_m": float(link_cfg.get("torso_height_m", 0.0)),
+    }
+
+
 def _tracker_inline_params(raw: dict[str, Any]) -> dict[str, Any]:
     inline: dict[str, Any] = {}
     for key, value in raw.items():
@@ -268,6 +331,7 @@ def settings_from_sources(args: argparse.Namespace | None = None) -> Settings:
     tracklet_tracker_cfg = tracklet_cfg.get("tracker") or tracklet_cfg.get("local") or {}
     tracklet_reid_cfg = tracklet_cfg.get("reid") or {}
     tracklet_link_cfg = tracklet_cfg.get("link") or {}
+    link = _parse_tracklet_link_cfg(tracklet_link_cfg)
     reid_models_dir = str(cfg.get("reid_models_dir") or REID_MODELS_DIR).strip() or REID_MODELS_DIR
     tracklet_reid = _resolve_reid_settings(
         cfg.get("reid") or {},
@@ -377,28 +441,27 @@ def settings_from_sources(args: argparse.Namespace | None = None) -> Settings:
         tracklet_reid_solider_transformer=tracklet_reid["solider_transformer"],
         tracklet_reid_pad=float(tracklet_reid_cfg.get("pad", 0.04)),
         tracklet_crops_dir=str(tracklet_reid_cfg.get("crops_dir") or "tracklet_crops"),
-        tracklet_link_max_gap_sec=float(tracklet_link_cfg.get("max_gap_sec", 20.0)),
-        tracklet_link_min_reid_score=float(tracklet_link_cfg.get("min_reid_score", 0.55)),
-        tracklet_link_pass1_min_score=float(
-            tracklet_link_cfg.get("pass1_min_score", tracklet_link_cfg.get("auto_min_score", 0.70))
-        ),
-        tracklet_link_max_spatial_px=float(tracklet_link_cfg.get("max_spatial_px", 700)),
-        tracklet_link_max_spatial_m=float(tracklet_link_cfg.get("max_spatial_m", 4.0)),
-        tracklet_link_motion_sigma_px=float(tracklet_link_cfg.get("motion_sigma_px", 180)),
-        tracklet_link_motion_sigma_m=float(tracklet_link_cfg.get("motion_sigma_m", 1.5)),
-        tracklet_link_size_log_scale=float(tracklet_link_cfg.get("size_log_scale", 0.45)),
-        tracklet_link_w_reid=float(tracklet_link_cfg.get("w_reid", 0.55)),
-        tracklet_link_w_motion=float(tracklet_link_cfg.get("w_motion", 0.25)),
-        tracklet_link_w_size=float(tracklet_link_cfg.get("w_size", 0.10)),
-        tracklet_link_w_gap=float(tracklet_link_cfg.get("w_gap", 0.10)),
-        tracklet_link_pass2_min_score=float(tracklet_link_cfg.get("pass2_min_score", 0.0)),
-        tracklet_link_pass4_max_overlap_sec=float(tracklet_link_cfg.get("pass4_max_overlap_sec", 2.0)),
-        tracklet_link_pass4_min_reid=float(tracklet_link_cfg.get("pass4_min_reid", 0.95)),
-        tracklet_link_pass4_min_score=float(tracklet_link_cfg.get("pass4_min_score", 0.85)),
-        tracklet_link_window_sec=float(tracklet_link_cfg.get("window_sec", 120)),
-        tracklet_link_window_overlap_sec=float(tracklet_link_cfg.get("window_overlap_sec", 15)),
-        tracklet_link_solver=str(tracklet_link_cfg.get("solver") or "hungarian").lower(),
-        tracklet_link_torso_height_m=float(tracklet_link_cfg.get("torso_height_m", 0.0)),
+        tracklet_link_max_gap_sec=float(link["max_gap_sec"]),
+        tracklet_link_min_reid_score=float(link["min_reid_score"]),
+        tracklet_link_pass1_min_score=float(link["pass1_min_score"]),
+        tracklet_link_pass0_min_reid=float(link["pass0_min_reid"]),
+        tracklet_link_max_spatial_px=float(link["max_spatial_px"]),
+        tracklet_link_max_spatial_m=float(link["max_spatial_m"]),
+        tracklet_link_motion_sigma_px=float(link["motion_sigma_px"]),
+        tracklet_link_motion_sigma_m=float(link["motion_sigma_m"]),
+        tracklet_link_size_log_scale=float(link["size_log_scale"]),
+        tracklet_link_w_reid=float(link["w_reid"]),
+        tracklet_link_w_motion=float(link["w_motion"]),
+        tracklet_link_w_size=float(link["w_size"]),
+        tracklet_link_w_gap=float(link["w_gap"]),
+        tracklet_link_pass2_min_score=float(link["pass2_min_score"]),
+        tracklet_link_pass4_max_overlap_sec=float(link["pass4_max_overlap_sec"]),
+        tracklet_link_pass4_min_reid=float(link["pass4_min_reid"]),
+        tracklet_link_pass4_min_score=float(link["pass4_min_score"]),
+        tracklet_link_window_sec=float(link["window_sec"]),
+        tracklet_link_window_overlap_sec=float(link["window_overlap_sec"]),
+        tracklet_link_solver=str(link["solver"]),
+        tracklet_link_torso_height_m=float(link["torso_height_m"]),
         feet_torso_height_m=float((cfg.get("feet") or {}).get("torso_height_m", 0.0)),
         feet_person_height_m=float((cfg.get("feet") or {}).get("person_height_m", 1.70)),
         feet_smooth_window=max(1, int((cfg.get("feet") or {}).get("smooth_window", 5))),
@@ -421,8 +484,11 @@ def settings_from_sources(args: argparse.Namespace | None = None) -> Settings:
             if str(m).strip()
         ),
         camera_link_face_top_k=max(1, int((cfg.get("camera_link") or {}).get("face_top_k", 5))),
-        camera_link_face_max_attempts=max(1, int((cfg.get("camera_link") or {}).get("face_max_attempts", 15))),
+        camera_link_face_max_attempts=max(1, int((cfg.get("camera_link") or {}).get("face_max_attempts", 7))),
+        camera_link_face_min_gap_sec=max(0.0, float((cfg.get("camera_link") or {}).get("face_min_gap_sec", 0.5))),
+        camera_link_face_dup_cos=float((cfg.get("camera_link") or {}).get("face_dup_cos", 0.97)),
         camera_link_min_face_score=float((cfg.get("camera_link") or {}).get("min_face_score", 0.60)),
+        camera_link_min_pose_face_score=float((cfg.get("camera_link") or {}).get("min_pose_face_score", 0.35)),
         camera_link_save_face_crops=bool((cfg.get("camera_link") or {}).get("save_face_crops", True)),
         camera_link_face_crops_dir=str((cfg.get("camera_link") or {}).get("face_crops_dir", "face_crops")),
         camera_link_max_gap_sec=float((cfg.get("camera_link") or {}).get("max_gap_sec", 120.0)),
