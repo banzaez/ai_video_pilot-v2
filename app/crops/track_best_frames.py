@@ -12,17 +12,21 @@ import cv2
 import numpy as np
 
 from app.crops.geometry import crop_person
+from app.entity_id import tracklet as tracklet_eid
 from app.pose.pose_service import PoseService
 from app.pose.types import PoseResult, select_pose_index_by_completeness
 from app.util.bbox import bbox_iou, bbox_wh
 
 logger = logging.getLogger(__name__)
 
+POSE_CACHE_VERSION = 2
+
 
 def _make_candidate_cache_key(cand: TrackFrameCandidate) -> str:
     tb = cand.target_det.get("bbox") or [0, 0, 0, 0]
     tid = cand.tracklet_id if cand.tracklet_id is not None else 0
-    return f"{cand.frame_index}:{tid}:{round(float(tb[0]), 1)}_{round(float(tb[1]), 1)}_{round(float(tb[2]), 1)}_{round(float(tb[3]), 1)}"
+    eid = tracklet_eid(tid).format() if tid > 0 else "t0"
+    return f"{cand.frame_index}:{eid}:{round(float(tb[0]), 1)}_{round(float(tb[1]), 1)}_{round(float(tb[2]), 1)}_{round(float(tb[3]), 1)}"
 
 
 def _pose_to_dict(pose: PoseResult | None) -> dict | None:
@@ -47,29 +51,56 @@ def _pose_from_dict(d: dict | None) -> PoseResult | None:
     )
 
 
-def load_pose_cache(cache_path: str) -> dict[str, dict[str, Any]]:
-    """Загружает кэш поз и оценок детекций с диска."""
+def load_pose_cache(
+    cache_path: str,
+    *,
+    pose_model: str | None = None,
+    kpt_min: float | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Загружает кэш поз. Несовпадение fingerprint → пустой dict."""
     if not os.path.isfile(cache_path):
         return {}
     try:
         with open(cache_path, "r", encoding="utf-8") as f:
             data = json.load(f)
-            if isinstance(data, dict):
-                return data.get("entries", data)
+        if not isinstance(data, dict):
+            return {}
+        version = int(data.get("cache_version") or data.get("version") or 0)
+        if version != POSE_CACHE_VERSION:
+            return {}
+        if pose_model is not None and str(data.get("pose_model") or "") != str(pose_model):
+            return {}
+        if kpt_min is not None:
+            stored = data.get("kpt_min")
+            if stored is None or abs(float(stored) - float(kpt_min)) > 1e-6:
+                return {}
+        entries = data.get("entries", data)
+        return entries if isinstance(entries, dict) else {}
     except Exception as e:
         logger.warning("Не удалось прочитать кэш поз %s: %s", cache_path, e)
     return {}
 
 
-def save_pose_cache(cache_path: str, entries: dict[str, dict[str, Any]]) -> None:
-    """Атомарно сохраняет кэш поз на диск."""
+def save_pose_cache(
+    cache_path: str,
+    entries: dict[str, dict[str, Any]],
+    *,
+    pose_model: str = "",
+    kpt_min: float = 0.0,
+    keep_keys: set[str] | None = None,
+) -> None:
+    """Атомарно сохраняет кэш поз. keep_keys — prune до ключей текущего прогона."""
     try:
         os.makedirs(os.path.dirname(os.path.abspath(cache_path)), exist_ok=True)
         tmp_path = f"{cache_path}.tmp.{os.getpid()}"
+        stored = entries if keep_keys is None else {k: v for k, v in entries.items() if k in keep_keys}
         payload = {
-            "version": 1,
-            "count": len(entries),
-            "entries": entries,
+            "version": POSE_CACHE_VERSION,
+            "cache_version": POSE_CACHE_VERSION,
+            "pose_model": pose_model,
+            "kpt_min": kpt_min,
+            "count": len(stored),
+            "entries": stored,
         }
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False)
@@ -353,6 +384,7 @@ class TrackBestFramesPicker:
         show_pbar: bool = False,
         pbar_desc: str = "[STAGE 2b: Pose scoring]",
         cache_path: str | None = None,
+        prune_cache: bool = False,
     ) -> list[ScoredTrackFrame]:
         """
         Батчевый скоринг списка кандидатов с поддержкой дискового кэша поз.
@@ -362,9 +394,11 @@ class TrackBestFramesPicker:
         if not candidates:
             return []
 
-        # 1. Загрузка кэша (если задан)
+        pose_model = self.pose_service.model_name if self.pose_service is not None else ""
         cache_entries: dict[str, dict[str, Any]] = (
-            load_pose_cache(cache_path) if cache_path else {}
+            load_pose_cache(cache_path, pose_model=pose_model, kpt_min=self.kpt_min)
+            if cache_path
+            else {}
         )
         cache_updated = False
 
@@ -409,30 +443,31 @@ class TrackBestFramesPicker:
                     int(tb[2]),
                     int(tb[3]),
                 )
+                has_pixels = True
             elif cand.image is not None and cand.image.size > 0:
                 crop_arr, roi = crop_person(cand.image, tb, pad=self.crop_pad)
                 crop_arr = np.ascontiguousarray(crop_arr)
+                has_pixels = crop_arr.size > 0
             else:
                 crop_arr = np.zeros((10, 10, 3), dtype=np.uint8)
                 roi = (0, 0, 10, 10)
+                has_pixels = False
 
             crops.append(crop_arr)
             crop_rois.append(roi)
 
-            # Если в кэше нет — нужно посчитать через модель
-            if k not in cache_entries:
+            if k not in cache_entries and has_pixels:
                 uncached_indices.append(i)
                 uncached_crops.append(crop_arr)
 
         if cache_path:
             cached_count = len(candidates) - len(uncached_indices)
-            if cached_count > 0:
-                logger.info(
-                    "TrackBestFramesPicker: %s/%s кандидатов загружено из кэша (%s новых)",
-                    cached_count,
-                    len(candidates),
-                    len(uncached_indices),
-                )
+            logger.info(
+                "TrackBestFramesPicker: кэш %s/%s, инференс позы %s",
+                cached_count,
+                len(candidates),
+                len(uncached_indices),
+            )
 
         # 3. Батчевый инференс поз ТОЛЬКО для непокэшированных кандидатов
         uncached_poses: list[list[PoseResult]] = []
@@ -446,6 +481,7 @@ class TrackBestFramesPicker:
 
         # Карта результатов позы для каждого кандидата
         poses_by_cand_idx: dict[int, list[PoseResult]] = {}
+        inferred_indices = set(uncached_indices)
         for idx_in_uncached, orig_idx in enumerate(uncached_indices):
             if idx_in_uncached < len(uncached_poses):
                 poses_by_cand_idx[orig_idx] = uncached_poses[idx_in_uncached]
@@ -464,12 +500,11 @@ class TrackBestFramesPicker:
             crop_crowd_penalty = 1.0
 
             if k in cache_entries:
-                # Читаем из кэша
                 c_item = cache_entries[k]
                 best_pose = _pose_from_dict(c_item.get("pose_result"))
                 n_poses_in_crop = int(c_item.get("n_poses_in_crop", 0))
                 crop_crowd_penalty = float(c_item.get("crop_crowd_penalty", 1.0))
-            else:
+            elif i in inferred_indices:
                 raw_poses = poses_by_cand_idx.get(i, [])
                 n_poses_in_crop = len(raw_poses)
 
@@ -563,8 +598,14 @@ class TrackBestFramesPicker:
             )
 
         # 5. Сохраняем обновленный кэш на диск
-        if cache_path and cache_updated:
-            save_pose_cache(cache_path, cache_entries)
+        if cache_path and (cache_updated or prune_cache):
+            save_pose_cache(
+                cache_path,
+                cache_entries,
+                pose_model=pose_model,
+                kpt_min=self.kpt_min,
+                keep_keys=set(cand_keys) if prune_cache else None,
+            )
 
         return scored_list
 

@@ -108,6 +108,7 @@ export type FaceShot = {
   bbox: number[] | null;
   model?: string | null;
   track_id?: number | null;
+  entity?: string | null;
   solo?: boolean;
 };
 
@@ -549,10 +550,6 @@ export async function fetchMediaMeta(
   crops: Record<string, CropShot[]>;
   faces: Record<string, FaceShot[]>;
   facesByModel: Record<string, Record<string, FaceShot[]>>;
-  groupFaces: Record<string, FaceShot[]>;
-  trackFaces: Record<string, FaceShot[]>;
-  groupFacesByModel: Record<string, Record<string, FaceShot[]>>;
-  trackFacesByModel: Record<string, Record<string, FaceShot[]>>;
   faceModels: string[];
   cameraLink: {
     face_models?: string[];
@@ -575,10 +572,6 @@ export async function fetchMediaMeta(
       crops: {},
       faces: {},
       facesByModel: {},
-      groupFaces: {},
-      trackFaces: {},
-      groupFacesByModel: {},
-      trackFacesByModel: {},
       faceModels: [],
       cameraLink: null,
       similar: {},
@@ -592,10 +585,6 @@ export async function fetchMediaMeta(
     crops?: Record<string, CropShot[]>;
     faces?: Record<string, FaceShot[]>;
     facesByModel?: Record<string, Record<string, FaceShot[]>>;
-    groupFaces?: Record<string, FaceShot[]>;
-    trackFaces?: Record<string, FaceShot[]>;
-    groupFacesByModel?: Record<string, Record<string, FaceShot[]>>;
-    trackFacesByModel?: Record<string, Record<string, FaceShot[]>>;
     faceModels?: string[];
     cameraLink?: {
       face_models?: string[];
@@ -613,10 +602,6 @@ export async function fetchMediaMeta(
     crops: data.crops ?? {},
     faces: data.faces ?? {},
     facesByModel: data.facesByModel ?? {},
-    groupFaces: data.groupFaces ?? {},
-    trackFaces: data.trackFaces ?? {},
-    groupFacesByModel: data.groupFacesByModel ?? {},
-    trackFacesByModel: data.trackFacesByModel ?? {},
     faceModels: data.faceModels ?? [],
     cameraLink: data.cameraLink ?? null,
     similar: data.similar ?? {},

@@ -139,7 +139,7 @@ def run_tracklet_reid(settings: Settings) -> None:
     pose_service: PoseService | None = None
     try:
         pose_service = PoseService(
-            model_name="yolo26s-pose.pt",
+            model_name=settings.pose_model,
             models_dir=settings.models_dir,
             conf=settings.conf,
             imgsz=settings.imgsz,
@@ -248,6 +248,7 @@ def run_tracklet_reid(settings: Settings) -> None:
         show_pbar=True,
         pbar_desc="[STAGE 2b: Pose scoring]",
         cache_path=tracklet_pose_cache_path(settings),
+        prune_cache=True,
     )
 
     scored_by_tid: dict[int, list[ScoredTrackFrame]] = defaultdict(list)

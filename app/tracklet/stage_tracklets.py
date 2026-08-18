@@ -10,6 +10,7 @@ from app.config import (
     Settings,
     detections_json_path,
     tracklet_frames_json_path,
+    tracklet_pose_cache_path,
     tracklets_json_path,
 )
 from app.io.json_util import save_debug_json
@@ -85,6 +86,13 @@ def run_tracklets(settings: Settings) -> None:
     det_path = detections_json_path(settings)
     if not os.path.isfile(det_path):
         raise ValueError(f"Нет detections JSON: {det_path}. Сначала --stage detect")
+
+    cache_path = tracklet_pose_cache_path(settings)
+    if os.path.isfile(cache_path):
+        try:
+            os.remove(cache_path)
+        except OSError:
+            logger.warning("Не удалось удалить кэш поз %s", cache_path)
 
     meta = load_detection_meta(settings, det_path)
     logger.info(

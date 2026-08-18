@@ -210,3 +210,7 @@ def test_pose_caching(tmp_path=None):
         scored2 = picker.score_candidates_batch(cands, cache_path=cache_file)
         assert len(scored2) == 1
         assert scored2[0].score == scored1[0].score
+
+        # Другая модель — miss, файл не подходит
+        miss = load_pose_cache(cache_file, pose_model="other-pose.pt", kpt_min=0.25)
+        assert miss == {}

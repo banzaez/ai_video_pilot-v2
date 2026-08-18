@@ -22,6 +22,7 @@ from app.config import (
     tracklet_reid_npz_path,
     tracks_json_path,
 )
+from app.entity_id import group as group_eid
 from app.face.insight_extractor import extract_faces_for_groups, face_models_for_settings
 from app.io.json_util import load_tracking_json, save_debug_json
 
@@ -94,20 +95,37 @@ def _max_face_similarity_weighted(
     return float(sim_raw[i, j]), min(w_a, w_b)
 
 
+def _face_entries(
+    face_meta: dict[str, Any],
+    gid: int,
+    model: str,
+) -> list[dict[str, Any]]:
+    key = group_eid(gid).format()
+    by_model = face_meta.get("faces_by_model") or {}
+    bucket = by_model.get(model) or face_meta.get("faces") or {}
+    entries = bucket.get(key) or bucket.get(str(gid)) or []
+    if entries:
+        return entries
+    legacy_model = (face_meta.get("groups_by_model") or {}).get(model) or {}
+    legacy_model_tracks = (face_meta.get("tracks_by_model") or {}).get(model) or {}
+    return (
+        legacy_model.get(str(gid))
+        or (face_meta.get("groups") or {}).get(str(gid))
+        or legacy_model_tracks.get(str(gid))
+        or (face_meta.get("tracks") or {}).get(str(gid))
+        or []
+    )
+
+
 def _face_pose_weights(
     face_meta: dict[str, Any],
     gid: int,
     model: str,
     *,
-    solo_global_ids: set[int],
+    solo_global_ids: set[int] | None = None,
 ) -> np.ndarray | None:
-    if gid in solo_global_ids:
-        by_model = face_meta.get("tracks_by_model") or {}
-        bucket = by_model.get(model) or face_meta.get("tracks") or {}
-    else:
-        by_model = face_meta.get("groups_by_model") or {}
-        bucket = by_model.get(model) or face_meta.get("groups") or {}
-    entries = bucket.get(str(gid), [])
+    _ = solo_global_ids
+    entries = _face_entries(face_meta, gid, model)
     if not entries:
         return None
     weights = np.array(
@@ -123,15 +141,22 @@ def _face_embs_for_group(
     model: str,
     *,
     multi: bool,
-    solo_global_ids: set[int],
+    solo_global_ids: set[int] | None = None,
 ) -> np.ndarray | None:
-    if gid in solo_global_ids:
-        if multi:
-            return face_npz.get(f"track_{gid}_{model}")
-        return face_npz.get(f"track_{gid}")
+    _ = solo_global_ids
+    eid = group_eid(gid)
+    keys = []
     if multi:
-        return face_npz.get(f"group_{gid}_{model}")
-    return face_npz.get(f"group_{gid}")
+        keys.append(eid.npz_key(model))
+    keys.append(eid.npz_key())
+    if multi:
+        keys.extend((f"group_{gid}_{model}", f"track_{gid}_{model}"))
+    keys.extend((f"group_{gid}", f"track_{gid}"))
+    for key in keys:
+        arr = face_npz.get(key)
+        if arr is not None and len(arr) > 0:
+            return arr
+    return None
 
 
 def run_camera_link(settings: Settings) -> None:

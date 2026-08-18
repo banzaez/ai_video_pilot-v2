@@ -1,3 +1,4 @@
+import { formatEntityId, groupId, parseEntityIdOptional } from "../src/entityId.js";
 import { readJsonFile, workFile } from "./common.js";
 import type { MergeTimelinePair } from "./merges.js";
 
@@ -31,6 +32,8 @@ type FaceEntryRaw = {
   face_bbox?: number[];
   crop_file?: string;
   track_id?: number;
+  entity?: string;
+  group_id?: number;
   solo?: boolean;
 };
 
@@ -89,74 +92,94 @@ export type FaceShotOut = {
   bbox: number[] | null;
   model?: string | null;
   track_id?: number | null;
+  entity?: string | null;
   solo?: boolean;
 };
+
+function fpsFor(base: string): number {
+  const info = readJsonFile(workFile(base, "info.json")) as { fps?: number } | null;
+  const fps = Number(info?.fps);
+  return Number.isFinite(fps) && fps > 0 ? fps : 25;
+}
+
+function bucketKey(raw: string): string {
+  const parsed = parseEntityIdOptional(raw);
+  if (parsed) return formatEntityId(parsed);
+  const n = Number(raw);
+  if (Number.isInteger(n) && n > 0) return formatEntityId(groupId(n));
+  return raw;
+}
 
 function toShots(
   base: string,
   entries: FaceEntryRaw[],
+  fps: number,
   model?: string,
 ): FaceShotOut[] {
-  return entries.map((e, i) => ({
-    url: e.crop_file
-      ? `/api/face_crop/${encodeURIComponent(base)}/${encodeURIComponent(e.crop_file)}`
-      : "",
-    rank: typeof e.rank === "number" ? e.rank : i,
-    score: typeof e.det_score === "number" ? e.det_score : null,
-    pose_score: typeof e.pose_face_score === "number" ? e.pose_face_score : null,
-    quality: typeof e.quality === "number" ? e.quality : null,
-    frame: e.frame_index ?? 0,
-    t: null,
-    bbox: e.face_bbox ?? null,
-    model: model ?? null,
-    track_id: typeof e.track_id === "number" ? e.track_id : null,
-    solo: Boolean(e.solo),
-  }));
+  return entries.map((e, i) => {
+    const frame = e.frame_index ?? 0;
+    const entity =
+      parseEntityIdOptional(e.entity)?.space === "t"
+        ? e.entity!
+        : typeof e.track_id === "number" && e.track_id > 0
+          ? formatEntityId({ space: "t", n: e.track_id })
+          : null;
+    return {
+      url: e.crop_file
+        ? `/api/face_crop/${encodeURIComponent(base)}/${encodeURIComponent(e.crop_file)}`
+        : "",
+      rank: typeof e.rank === "number" ? e.rank : i,
+      score: typeof e.det_score === "number" ? e.det_score : null,
+      pose_score: typeof e.pose_face_score === "number" ? e.pose_face_score : null,
+      quality: typeof e.quality === "number" ? e.quality : null,
+      frame,
+      t: fps > 0 ? frame / fps : null,
+      bbox: e.face_bbox ?? null,
+      model: model ?? null,
+      track_id: typeof e.track_id === "number" ? e.track_id : null,
+      entity,
+      solo: Boolean(e.solo),
+    };
+  });
 }
 
-function mapFaceBuckets(
+function putBucket(
+  dest: Record<string, FaceShotOut[]>,
+  rawKey: string,
+  shots: FaceShotOut[],
+): void {
+  const key = bucketKey(rawKey);
+  if (!shots.length) return;
+  dest[key] = dest[key] ? dest[key].concat(shots) : shots;
+}
+
+function mapPrefixed(
   base: string,
-  groups: Record<string, FaceEntryRaw[]>,
-  byModel: Record<string, Record<string, FaceEntryRaw[]>>,
-): {
-  faces: Record<string, FaceShotOut[]>;
-  facesByModel: Record<string, Record<string, FaceShotOut[]>>;
-} {
-  const faces: Record<string, FaceShotOut[]> = {};
-  for (const [id, entries] of Object.entries(groups)) {
-    faces[id] = toShots(base, entries);
+  fps: number,
+  raw: Record<string, FaceEntryRaw[]>,
+  dest: Record<string, FaceShotOut[]>,
+  model?: string,
+): void {
+  for (const [id, entries] of Object.entries(raw)) {
+    putBucket(dest, id, toShots(base, entries, fps, model));
   }
-  const facesByModel: Record<string, Record<string, FaceShotOut[]>> = {};
-  for (const [model, bucket] of Object.entries(byModel)) {
-    facesByModel[model] = {};
-    for (const [id, entries] of Object.entries(bucket)) {
-      facesByModel[model][id] = toShots(base, entries, model);
-    }
-  }
-  return { faces, facesByModel };
 }
 
 export function faceGalleryFor(base: string): {
   faces: Record<string, FaceShotOut[]>;
   facesByModel: Record<string, Record<string, FaceShotOut[]>>;
-  groupFaces: Record<string, FaceShotOut[]>;
-  trackFaces: Record<string, FaceShotOut[]>;
-  groupFacesByModel: Record<string, Record<string, FaceShotOut[]>>;
-  trackFacesByModel: Record<string, Record<string, FaceShotOut[]>>;
   faceModels: string[];
 } {
   const empty = {
     faces: {},
     facesByModel: {},
-    groupFaces: {},
-    trackFaces: {},
-    groupFacesByModel: {},
-    trackFacesByModel: {},
     faceModels: [] as string[],
   };
   const cfPath = workFile(base, "camera_face.json");
   const cf = readJsonFile(cfPath) as {
     models?: string[];
+    faces?: Record<string, FaceEntryRaw[]>;
+    faces_by_model?: Record<string, Record<string, FaceEntryRaw[]>>;
     groups?: Record<string, FaceEntryRaw[]>;
     tracks?: Record<string, FaceEntryRaw[]>;
     groups_by_model?: Record<string, Record<string, FaceEntryRaw[]>>;
@@ -164,33 +187,36 @@ export function faceGalleryFor(base: string): {
   } | null;
   if (!cf) return empty;
 
+  const fps = fpsFor(base);
   const models = cf.models ?? [];
-  const groupRaw = cf.groups ?? {};
-  const trackRaw = cf.tracks ?? {};
-  const groupByModelRaw = cf.groups_by_model ?? {};
-  const trackByModelRaw = cf.tracks_by_model ?? {};
-
-  const groupBucket = mapFaceBuckets(base, groupRaw, groupByModelRaw);
-  const trackBucket = mapFaceBuckets(base, trackRaw, trackByModelRaw);
-
-  const faces: Record<string, FaceShotOut[]> = { ...groupBucket.faces, ...trackBucket.faces };
+  const faces: Record<string, FaceShotOut[]> = {};
   const facesByModel: Record<string, Record<string, FaceShotOut[]>> = {};
-  for (const model of models) {
-    facesByModel[model] = {
-      ...(groupBucket.facesByModel[model] ?? {}),
-      ...(trackBucket.facesByModel[model] ?? {}),
-    };
+
+  if (cf.faces && Object.keys(cf.faces).length) {
+    mapPrefixed(base, fps, cf.faces, faces);
+  } else {
+    mapPrefixed(base, fps, cf.groups ?? {}, faces);
+    mapPrefixed(base, fps, cf.tracks ?? {}, faces);
   }
 
-  return {
-    faces,
-    facesByModel,
-    groupFaces: groupBucket.faces,
-    trackFaces: trackBucket.faces,
-    groupFacesByModel: groupBucket.facesByModel,
-    trackFacesByModel: trackBucket.facesByModel,
-    faceModels: models,
-  };
+  if (cf.faces_by_model && Object.keys(cf.faces_by_model).length) {
+    for (const [model, bucket] of Object.entries(cf.faces_by_model)) {
+      facesByModel[model] = {};
+      mapPrefixed(base, fps, bucket, facesByModel[model], model);
+    }
+  } else {
+    const modelsSrc = new Set([
+      ...Object.keys(cf.groups_by_model ?? {}),
+      ...Object.keys(cf.tracks_by_model ?? {}),
+    ]);
+    for (const model of modelsSrc) {
+      facesByModel[model] = {};
+      mapPrefixed(base, fps, cf.groups_by_model?.[model] ?? {}, facesByModel[model], model);
+      mapPrefixed(base, fps, cf.tracks_by_model?.[model] ?? {}, facesByModel[model], model);
+    }
+  }
+
+  return { faces, facesByModel, faceModels: models };
 }
 
 export function cameraLinkFor(base: string): {

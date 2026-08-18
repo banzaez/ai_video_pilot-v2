@@ -261,6 +261,7 @@ export function staleStagesReport(base: string) {
     tracklets: [extraFile(base, "tracklets.json")],
     tracklet_reid: [
       extraFile(base, "tracklet_reid.npz"),
+      extraFile(base, "tracklet_pose_cache.json"),
       {
         key: "tracklet_crops",
         label: "tracklet_crops/",

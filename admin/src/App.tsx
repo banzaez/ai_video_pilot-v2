@@ -76,10 +76,6 @@ export default function App() {
   const [cropUrls, setCropUrls] = useState<Record<string, CropShot[]>>({});
   const [faceUrls, setFaceUrls] = useState<Record<string, FaceShot[]>>({});
   const [faceUrlsByModel, setFaceUrlsByModel] = useState<Record<string, Record<string, FaceShot[]>>>({});
-  const [groupFaceUrls, setGroupFaceUrls] = useState<Record<string, FaceShot[]>>({});
-  const [trackFaceUrls, setTrackFaceUrls] = useState<Record<string, FaceShot[]>>({});
-  const [groupFaceUrlsByModel, setGroupFaceUrlsByModel] = useState<Record<string, Record<string, FaceShot[]>>>({});
-  const [trackFaceUrlsByModel, setTrackFaceUrlsByModel] = useState<Record<string, Record<string, FaceShot[]>>>({});
   const [faceModels, setFaceModels] = useState<string[]>([]);
   const [cameraLink, setCameraLink] = useState<{
     face_models?: string[];
@@ -407,10 +403,6 @@ export default function App() {
       setCropUrls(meta.crops);
       setFaceUrls(meta.faces ?? {});
       setFaceUrlsByModel(meta.facesByModel ?? {});
-      setGroupFaceUrls(meta.groupFaces ?? {});
-      setTrackFaceUrls(meta.trackFaces ?? {});
-      setGroupFaceUrlsByModel(meta.groupFacesByModel ?? {});
-      setTrackFaceUrlsByModel(meta.trackFacesByModel ?? {});
       setFaceModels(meta.faceModels ?? []);
       setCameraLink(meta.cameraLink ?? null);
       setSimilarByTrack(meta.similar);
@@ -422,10 +414,6 @@ export default function App() {
       setCropUrls({});
       setFaceUrls({});
       setFaceUrlsByModel({});
-      setGroupFaceUrls({});
-      setTrackFaceUrls({});
-      setGroupFaceUrlsByModel({});
-      setTrackFaceUrlsByModel({});
       setFaceModels([]);
       setCameraLink(null);
       setSimilarByTrack({});
@@ -653,10 +641,6 @@ export default function App() {
               cropUrls={cropUrls}
               faceUrls={faceUrls}
               faceUrlsByModel={faceUrlsByModel}
-              groupFaceUrls={groupFaceUrls}
-              trackFaceUrls={trackFaceUrls}
-              groupFaceUrlsByModel={groupFaceUrlsByModel}
-              trackFaceUrlsByModel={trackFaceUrlsByModel}
               faceModels={faceModels}
               cameraLink={cameraLink}
               similarByTrack={similarByTrack}

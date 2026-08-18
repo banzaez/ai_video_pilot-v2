@@ -2,6 +2,12 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import { createPortal } from "react-dom";
 import type { TrackingData } from "../types";
 import {
+  faceBucketKeys,
+  formatEntityId,
+  groupId,
+  trackletId,
+} from "../entityId";
+import {
   buildTrackKeyframes,
   colorForTrackId,
   detectionsAtFrame,
@@ -33,10 +39,6 @@ type Props = {
   cropUrls: Record<string, CropShot[]>;
   faceUrls?: Record<string, FaceShot[]>;
   faceUrlsByModel?: Record<string, Record<string, FaceShot[]>>;
-  groupFaceUrls?: Record<string, FaceShot[]>;
-  trackFaceUrls?: Record<string, FaceShot[]>;
-  groupFaceUrlsByModel?: Record<string, Record<string, FaceShot[]>>;
-  trackFaceUrlsByModel?: Record<string, Record<string, FaceShot[]>>;
   faceModels?: string[];
   cameraLink?: {
     face_models?: string[];
@@ -172,7 +174,7 @@ function pairPassFromReason(reason: string | null | undefined): number | null {
 }
 
 function entityRefLabel(kind: "track" | "group", id: number): string {
-  return kind === "group" ? `g${id}` : `t${id}`;
+  return formatEntityId(kind === "group" ? groupId(id) : trackletId(id));
 }
 
 function trackIdsForEntity(
@@ -204,7 +206,8 @@ function spanForEntity(
 }
 
 function filterFaceShotsForTrack(shots: FaceShot[], trackId: number, tr?: MergeTimelineTrack | null): FaceShot[] {
-  const exact = shots.filter((s) => s.track_id === trackId);
+  const want = formatEntityId(trackletId(trackId));
+  const exact = shots.filter((s) => s.entity === want || s.track_id === trackId);
   if (exact.length) return exact;
   if (!tr) return [];
   const inSpan = shots.filter((s) => {
@@ -214,88 +217,57 @@ function filterFaceShotsForTrack(shots: FaceShot[], trackId: number, tr?: MergeT
   return inSpan;
 }
 
-function shotsFromBucket(
-  bucket: "group" | "track",
+function shotsFromFaces(
   key: string,
-  groupFaceUrls?: Record<string, FaceShot[]>,
-  trackFaceUrls?: Record<string, FaceShot[]>,
-  groupFaceUrlsByModel?: Record<string, Record<string, FaceShot[]>>,
-  trackFaceUrlsByModel?: Record<string, Record<string, FaceShot[]>>,
+  faceUrls?: Record<string, FaceShot[]>,
+  faceUrlsByModel?: Record<string, Record<string, FaceShot[]>>,
   model?: string,
 ): FaceShot[] {
-  const primary = bucket === "group" ? groupFaceUrls : trackFaceUrls;
-  const byModel = bucket === "group" ? groupFaceUrlsByModel : trackFaceUrlsByModel;
-  if (model) return byModel?.[model]?.[key] ?? primary?.[key] ?? [];
-  return primary?.[key] ?? [];
+  if (model) {
+    const byModel = faceUrlsByModel?.[model];
+    if (byModel?.[key]?.length) return byModel[key];
+  }
+  return faceUrls?.[key] ?? [];
 }
 
 function faceShotsForEntity(
   kind: "track" | "group",
   id: number,
   mergeTimeline: MergeTimeline | null,
-  groupFaceUrls?: Record<string, FaceShot[]>,
-  trackFaceUrls?: Record<string, FaceShot[]>,
-  groupFaceUrlsByModel?: Record<string, Record<string, FaceShot[]>>,
-  trackFaceUrlsByModel?: Record<string, Record<string, FaceShot[]>>,
+  faceUrls?: Record<string, FaceShot[]>,
+  faceUrlsByModel?: Record<string, Record<string, FaceShot[]>>,
   model?: string,
 ): FaceShot[] {
-  const from = (bucket: "group" | "track", key: string) =>
-    shotsFromBucket(
-      bucket,
-      key,
-      groupFaceUrls,
-      trackFaceUrls,
-      groupFaceUrlsByModel,
-      trackFaceUrlsByModel,
-      model,
-    );
+  const fromGroup = (gid: number) => {
+    for (const key of faceBucketKeys(groupId(gid))) {
+      const shots = shotsFromFaces(key, faceUrls, faceUrlsByModel, model);
+      if (shots.length) return shots;
+    }
+    return [] as FaceShot[];
+  };
 
-  if (kind === "group") return from("group", String(id));
+  if (kind === "group") return fromGroup(id);
 
   const tr = mergeTimeline?.tracks.find((t) => t.track_id === id) ?? null;
-  const groupId = tr?.group_id ?? null;
-  const globalId = tr?.global_id ?? null;
-
-  if (groupId != null) {
-    return filterFaceShotsForTrack(from("group", String(groupId)), id, tr);
-  }
-
-  for (const key of [globalId, id]) {
-    if (key == null) continue;
-    const shots = from("track", String(key));
-    if (shots.length) return shots;
-  }
-  if (globalId != null) {
-    const shots = from("group", String(globalId));
-    if (shots.length) return shots;
-  }
-  return [];
+  const groupN = tr?.group_id ?? tr?.global_id ?? null;
+  if (groupN == null) return [];
+  if (tr?.group_id != null) return filterFaceShotsForTrack(fromGroup(tr.group_id), id, tr);
+  return fromGroup(groupN);
 }
 
 function facesForEntity(
   kind: "track" | "group",
   id: number,
   mergeTimeline: MergeTimeline | null,
-  groupFaceUrls?: Record<string, FaceShot[]>,
-  trackFaceUrls?: Record<string, FaceShot[]>,
-  groupFaceUrlsByModel?: Record<string, Record<string, FaceShot[]>>,
-  trackFaceUrlsByModel?: Record<string, Record<string, FaceShot[]>>,
+  faceUrls?: Record<string, FaceShot[]>,
+  faceUrlsByModel?: Record<string, Record<string, FaceShot[]>>,
   faceModels?: string[],
 ): { model: string; shots: FaceShot[] }[] {
   const models = faceModels?.length ? faceModels : ["buffalo_l"];
   return models
     .map((model) => ({
       model,
-      shots: faceShotsForEntity(
-        kind,
-        id,
-        mergeTimeline,
-        groupFaceUrls,
-        trackFaceUrls,
-        groupFaceUrlsByModel,
-        trackFaceUrlsByModel,
-        model,
-      ).slice(0, 6),
+      shots: faceShotsForEntity(kind, id, mergeTimeline, faceUrls, faceUrlsByModel, model).slice(0, 6),
     }))
     .filter((row) => row.shots.length > 0);
 }
@@ -320,10 +292,8 @@ function MergeEntityRef({
   label,
   mergeTimeline,
   cropUrls,
-  groupFaceUrls,
-  trackFaceUrls,
-  groupFaceUrlsByModel,
-  trackFaceUrlsByModel,
+  faceUrls,
+  faceUrlsByModel,
   faceModels,
   onPickTrack,
   onPickGroup,
@@ -334,10 +304,8 @@ function MergeEntityRef({
   label?: string;
   mergeTimeline: MergeTimeline | null;
   cropUrls: Record<string, CropShot[]>;
-  groupFaceUrls?: Record<string, FaceShot[]>;
-  trackFaceUrls?: Record<string, FaceShot[]>;
-  groupFaceUrlsByModel?: Record<string, Record<string, FaceShot[]>>;
-  trackFaceUrlsByModel?: Record<string, Record<string, FaceShot[]>>;
+  faceUrls?: Record<string, FaceShot[]>;
+  faceUrlsByModel?: Record<string, Record<string, FaceShot[]>>;
   faceModels?: string[];
   onPickTrack: (trackId: number, sec: number) => void;
   onPickGroup: (groupId: number) => void;
@@ -355,16 +323,7 @@ function MergeEntityRef({
   const color = colorForTrackId(colorId);
   const span = spanForEntity(kind, id, mergeTimeline);
   const crops = cropsForEntity(kind, id, mergeTimeline, cropUrls);
-  const faceRows = facesForEntity(
-    kind,
-    id,
-    mergeTimeline,
-    groupFaceUrls,
-    trackFaceUrls,
-    groupFaceUrlsByModel,
-    trackFaceUrlsByModel,
-    faceModels,
-  );
+  const faceRows = facesForEntity(kind, id, mergeTimeline, faceUrls, faceUrlsByModel, faceModels);
 
   useLayoutEffect(() => {
     if (!open || !btnRef.current) return;
@@ -586,10 +545,8 @@ export function MergeInspectPanel({
   activeVideo,
   mergeTimeline,
   cropUrls,
-  groupFaceUrls,
-  trackFaceUrls,
-  groupFaceUrlsByModel,
-  trackFaceUrlsByModel,
+  faceUrls,
+  faceUrlsByModel,
   faceModels = [],
   cameraLink,
   similarByTrack,
@@ -989,10 +946,8 @@ export function MergeInspectPanel({
   const entityRefCommon = {
     mergeTimeline,
     cropUrls,
-    groupFaceUrls,
-    trackFaceUrls,
-    groupFaceUrlsByModel,
-    trackFaceUrlsByModel,
+    faceUrls,
+    faceUrlsByModel,
     faceModels,
     onPickTrack: pickTrack,
     onPickGroup: pickGroup,
@@ -1074,10 +1029,8 @@ export function MergeInspectPanel({
                 row.kind === "group" ? "group" : "track",
                 row.kind === "group" ? row.group.group_id : row.track.track_id,
                 mergeTimeline,
-                groupFaceUrls,
-                trackFaceUrls,
-                groupFaceUrlsByModel,
-                trackFaceUrlsByModel,
+                faceUrls,
+                faceUrlsByModel,
                 primaryFaceModel,
               );
               return (

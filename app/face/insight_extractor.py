@@ -18,9 +18,11 @@ warnings.filterwarnings("ignore", category=FutureWarning, module="insightface")
 warnings.filterwarnings("ignore", category=FutureWarning, module="skimage")
 
 from app.config import Settings, face_crops_dir, tracklet_pose_cache_path
-from app.crops import TrackBestFramesPicker, TrackFrameCandidate, crop_person
+from app.crops import ScoredTrackFrame, TrackBestFramesPicker, TrackFrameCandidate, crop_person
+from app.entity_id import group as group_id
+from app.entity_id import ids_from_detection, parse
+from app.entity_id import tracklet as tracklet_id
 from app.pose import get_pose_service
-from app.pose.types import PoseResult
 from app.progress import make_pbar
 
 logger = logging.getLogger(__name__)
@@ -55,6 +57,8 @@ def get_face_analysis(model_name: str = "buffalo_l") -> Any:
     import shutil
     from insightface.app import FaceAnalysis
 
+    logger.info("STAGE Face: загрузка InsightFace %s", model_name)
+
     home_models = os.path.expanduser(f"~/.insightface/models/{model_name}")
     nested_sub = os.path.join(home_models, model_name)
     if os.path.isdir(nested_sub):
@@ -85,6 +89,7 @@ def get_face_analysis(model_name: str = "buffalo_l") -> Any:
         raise RuntimeError(f"Не удалось инициализировать InsightFace FaceAnalysis ({model_name}): {last_err}")
 
     _FACE_APP_CACHE[model_name] = app
+    logger.info("STAGE Face: InsightFace %s готов", model_name)
     return app
 
 
@@ -243,8 +248,8 @@ def _encode_face_jpeg(frame_img: np.ndarray, face_bbox: tuple[float, float, floa
     return buf.tobytes() if ok else None
 
 
-def _buffer_key(is_solo: bool, group_id: int, model: str) -> tuple[bool, int, str]:
-    return (is_solo, group_id, model)
+def _buffer_key(gid: int, model: str) -> tuple[int, str]:
+    return (gid, model)
 
 
 def extract_faces_for_groups(
@@ -257,13 +262,13 @@ def extract_faces_for_groups(
     use_tracklet_ids: bool = False,
     tracklet_to_global: dict[int, int] | None = None,
 ) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
-    """
-    Извлекает лица для групп (склейки) и solo-треков.
-    tracking.json: track_id = global/group id; solo → tracks[t], группа → groups[g].
-    """
+    """Извлекает лица по группе камеры (gN). Фрагмент пишется в entry.entity = tK."""
+    _ = fps
     models = face_models_for_settings(settings)
     primary_model = models[0]
+    logger.info("STAGE Face: модели %s", ", ".join(models))
     face_apps = {m: get_face_analysis(m) for m in models}
+    logger.info("STAGE Face: PoseService")
     pose_service = get_pose_service(settings)
     top_k = max(1, int(settings.camera_link_face_top_k))
     save_crops = bool(settings.camera_link_save_face_crops)
@@ -282,23 +287,22 @@ def extract_faces_for_groups(
                         pass
         os.makedirs(crops_dir, exist_ok=True)
 
-    # 1. Группировка детекций по (is_solo, group_id, track_id) для TrackBestFramesPicker
+    # 1. Группировка детекций по gN → tK для TrackBestFramesPicker
     mapping = tracklet_to_global or {}
-    group_candidates: dict[tuple[bool, int], dict[int, list[TrackFrameCandidate]]] = defaultdict(lambda: defaultdict(list))
+    _ = use_tracklet_ids
+    group_candidates: dict[int, dict[int, list[TrackFrameCandidate]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
 
     for f in frames_data:
         fi = int(f.get("frame_index", 0))
         all_dets = f.get("detections", [])
         for d in all_dets:
-            tid = int(d.get("track_id") or d.get("tracklet_id") or 0)
-            if tid <= 0:
+            g_ent, t_ent = ids_from_detection(d, mapping)
+            if g_ent is None:
                 continue
-            if use_tracklet_ids:
-                gid = mapping.get(tid, tid)
-                frag_id = tid
-            else:
-                gid = int(d.get("track_id") or tid)
-                frag_id = int(d.get("tracklet_id") or gid)
+            gid = g_ent.n
+            frag_id = t_ent.n if t_ent is not None else gid
             bbox = d.get("bbox")
             if not bbox or len(bbox) < 4:
                 continue
@@ -306,7 +310,6 @@ def extract_faces_for_groups(
             h = max(0.0, y2 - y1)
             if h <= 20.0:
                 continue
-            is_solo = gid in solo_ids
             other_dets = [other for other in all_dets if other is not d]
             cand = TrackFrameCandidate(
                 frame_index=fi,
@@ -314,31 +317,50 @@ def extract_faces_for_groups(
                 all_dets=other_dets,
                 tracklet_id=frag_id,
             )
-            group_candidates[(is_solo, gid)][frag_id].append(cand)
+            group_candidates[gid][frag_id].append(cand)
 
-    # 2. Интеллектуальный отбор лучших кадров лиц через TrackBestFramesPicker с дисковым кэшем
+    n_cands = sum(len(cs) for by_tid in group_candidates.values() for cs in by_tid.values())
+    logger.info(
+        "STAGE Face: групп=%s, кандидатов=%s — отбор кадров (поза/кэш)",
+        len(group_candidates),
+        n_cands,
+    )
+
     picker = TrackBestFramesPicker(
         pose_service=pose_service,
         kpt_min=kpt_min,
     )
     cache_path = tracklet_pose_cache_path(settings)
 
-    # Собираем отобранные лучшие кадры лиц для каждой группы
-    picked_faces_by_group: dict[tuple[bool, int], list[ScoredTrackFrame]] = {}
-    cands_by_frame: dict[int, list[tuple[bool, int, ScoredTrackFrame]]] = defaultdict(list)
+    all_cands: list[TrackFrameCandidate] = []
+    cand_gids: list[int] = []
+    for gid, by_track in group_candidates.items():
+        for cands in by_track.values():
+            for cand in cands:
+                all_cands.append(cand)
+                cand_gids.append(gid)
 
-    for (is_solo, gid), by_track in group_candidates.items():
-        best_faces = picker.pick_best_faces_for_group(
-            by_track,
-            top_k=top_k,
-            cache_path=cache_path,
-        )
+    scored_all = picker.score_candidates_batch(
+        all_cands,
+        extract_faces=False,
+        show_pbar=True,
+        pbar_desc="[STAGE Face: pose pick]",
+        cache_path=cache_path,
+    )
+    scored_by_gid: dict[int, list[ScoredTrackFrame]] = defaultdict(list)
+    for gid, sc in zip(cand_gids, scored_all, strict=True):
+        scored_by_gid[gid].append(sc)
+
+    picked_faces_by_group: dict[int, list[ScoredTrackFrame]] = {}
+    cands_by_frame: dict[int, list[tuple[int, ScoredTrackFrame]]] = defaultdict(list)
+    for gid, scored_g in scored_by_gid.items():
+        best_faces = picker.pick_best_faces_from_scored(scored_g, top_k=top_k)
         if best_faces:
-            picked_faces_by_group[(is_solo, gid)] = best_faces
+            picked_faces_by_group[gid] = best_faces
             for sc in best_faces:
-                cands_by_frame[sc.frame_index].append((is_solo, gid, sc))
+                cands_by_frame[sc.frame_index].append((gid, sc))
 
-    face_buffers: dict[tuple[bool, int, str], list[_BufferedFace]] = {}
+    face_buffers: dict[tuple[int, str], list[_BufferedFace]] = {}
 
     from app.tracklet.common import session_manifest
     from app.session.reader import SessionFrameReader
@@ -354,9 +376,15 @@ def extract_faces_for_groups(
         cap = open_video_capture(video_source_path)
     else:
         logger.error("Видео не найдено для извлечения лиц (input=%s)", settings.input_path)
-        return {"groups": {}, "tracks": {}, "groups_by_model": {}, "tracks_by_model": {}}, {}
+        return {"faces": {}, "faces_by_model": {}, "groups": {}, "tracks": {}}, {}
 
     sorted_frame_indices = sorted(cands_by_frame.keys())
+    logger.info(
+        "STAGE Face: InsightFace на %s кадрах, %s групп с лицами, модели=%s",
+        len(sorted_frame_indices),
+        len(picked_faces_by_group),
+        len(face_apps),
+    )
     current_frame_pos = -1
     pbar = make_pbar(total=len(sorted_frame_indices), desc="[STAGE Face: InsightFace]", unit="frame")
     executor = ThreadPoolExecutor(max_workers=len(face_apps)) if len(face_apps) > 1 else None
@@ -396,7 +424,7 @@ def extract_faces_for_groups(
 
             img_h, img_w = frame_img.shape[:2]
 
-            for is_solo, gid, sc in cands_on_frame:
+            for gid, sc in cands_on_frame:
                 tb = sc.target_det.get("bbox") or [0, 0, 1, 1]
                 person_crop, roi = crop_person(frame_img, tb, pad=0.10)
                 if person_crop.size == 0:
@@ -416,6 +444,7 @@ def extract_faces_for_groups(
 
                 pose_face_score = max(0.1, float(sc.face_conf))
                 pose_conf = float(sc.pose_result.confidence) if sc.pose_result else 0.5
+                is_solo = gid in solo_ids
 
                 for model_name, hit in detected.items():
                     quality = float(hit.det_score) * pose_face_score
@@ -434,7 +463,7 @@ def extract_faces_for_groups(
                         is_solo=is_solo,
                         jpeg_bytes=jpeg_bytes,
                     )
-                    key = _buffer_key(is_solo, gid, model_name)
+                    key = _buffer_key(gid, model_name)
                     face_buffers.setdefault(key, []).append(slot)
 
     finally:
@@ -446,36 +475,33 @@ def extract_faces_for_groups(
         if executor:
             executor.shutdown(wait=False)
 
-    group_faces_by_model: dict[str, dict[str, list[dict[str, Any]]]] = {m: {} for m in models}
-    track_faces_by_model: dict[str, dict[str, list[dict[str, Any]]]] = {m: {} for m in models}
-    group_embeddings_by_model: dict[str, dict[str, list[np.ndarray]]] = {m: {} for m in models}
-    track_embeddings_by_model: dict[str, dict[str, list[np.ndarray]]] = {m: {} for m in models}
+    faces_by_model: dict[str, dict[str, list[dict[str, Any]]]] = {m: {} for m in models}
+    embeddings_by_model: dict[str, dict[str, list[np.ndarray]]] = {m: {} for m in models}
 
-    for (is_solo, gid, model_name), slots in face_buffers.items():
+    for (gid, model_name), slots in face_buffers.items():
         if not slots:
             continue
         slots.sort(key=lambda s: -s.quality)
         slots = slots[:top_k]
-        key_id = slots[0].track_id if is_solo else gid
-        key_str = str(key_id)
-        prefix = "t" if is_solo else "g"
+        g_ent = group_id(gid)
+        key_str = g_ent.format()
         suffix = f"_{model_name}" if multi_model else ""
-        faces_store = track_faces_by_model if is_solo else group_faces_by_model
-        embs_store = track_embeddings_by_model if is_solo else group_embeddings_by_model
 
         entries: list[dict[str, Any]] = []
         embs: list[np.ndarray] = []
         for rank_idx, slot in enumerate(slots):
-            crop_filename = f"face_{prefix}{key_id:04d}_k{rank_idx}_f{slot.frame_index}{suffix}.jpg"
+            crop_filename = f"face_{g_ent.crop_stem()}_k{rank_idx}_f{slot.frame_index}{suffix}.jpg"
             crop_out_path = os.path.join(crops_dir, crop_filename)
             if save_crops and slot.jpeg_bytes:
                 with open(crop_out_path, "wb") as f:
                     f.write(slot.jpeg_bytes)
 
             fx1, fy1, fx2, fy2 = slot.face_bbox
+            t_ent = tracklet_id(slot.track_id) if slot.track_id > 0 else None
             entry = {
                 "group_id": slot.group_id,
                 "track_id": slot.track_id,
+                "entity": t_ent.format() if t_ent else g_ent.format(),
                 "rank": rank_idx,
                 "frame_index": slot.frame_index,
                 "model": model_name,
@@ -491,39 +517,29 @@ def extract_faces_for_groups(
             embs.append(slot.embedding)
 
         if entries:
-            faces_store[model_name][key_str] = entries
-            embs_store[model_name][key_str] = embs
+            faces_by_model[model_name][key_str] = entries
+            embeddings_by_model[model_name][key_str] = embs
 
     final_npz_arrays: dict[str, np.ndarray] = {}
+    for model_name in models:
+        for key_str, emb_list in embeddings_by_model[model_name].items():
+            if not emb_list:
+                continue
+            g_ent = parse(key_str)
+            model_key = g_ent.npz_key(model_name) if multi_model else g_ent.npz_key()
+            stacked = np.vstack(emb_list).astype(np.float32)
+            final_npz_arrays[model_key] = stacked
+            if model_name == primary_model:
+                final_npz_arrays[g_ent.npz_key()] = stacked
 
-    def _write_npz(
-        bucket: dict[str, dict[str, list[np.ndarray]]],
-        prefix: str,
-    ) -> None:
-        for model_name in models:
-            for id_str, emb_list in bucket[model_name].items():
-                if not emb_list:
-                    continue
-                key = f"{prefix}_{id_str}_{model_name}" if multi_model else f"{prefix}_{id_str}"
-                final_npz_arrays[key] = np.vstack(emb_list).astype(np.float32)
-                if model_name == primary_model:
-                    final_npz_arrays[f"{prefix}_{id_str}"] = final_npz_arrays[key]
-
-    _write_npz(group_embeddings_by_model, "group")
-    _write_npz(track_embeddings_by_model, "track")
-
-    primary_groups = group_faces_by_model.get(primary_model, {})
-    primary_tracks = track_faces_by_model.get(primary_model, {})
+    primary_faces = faces_by_model.get(primary_model, {})
     meta_payload = {
         "stage": "camera_face",
         "model": primary_model,
         "models": models,
-        "n_groups_with_faces": len(primary_groups),
-        "n_tracks_with_faces": len(primary_tracks),
-        "groups": primary_groups,
-        "tracks": primary_tracks,
-        "groups_by_model": group_faces_by_model,
-        "tracks_by_model": track_faces_by_model,
+        "n_groups_with_faces": len(primary_faces),
+        "faces": primary_faces,
+        "faces_by_model": faces_by_model,
         "solo_global_ids": sorted(solo_ids),
     }
 
