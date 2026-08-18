@@ -33,6 +33,21 @@ reid:
   solider_image_size: [256, 128]
   solider_transformer: swin_base_patch4_window7_224
 
+# --- Отбор лучших кадров (TrackBestFramesPicker) ---
+# Интеллектуальный отбор качественных кадров по скелету и чистоте от посторонних людей.
+# Используется в Stage 2b (ReID треклетов) и Stage Face / camera_link (извлечение лиц InsightFace).
+best_frames:
+  # Вес оценки скелета/позы человека в итоговом скоре кадра (0.0..1.0).
+  # 0.0 = только геометрия и площадь bbox; 0.40 = приоритет развернутому телу с полным набором ключевых точек
+  pose_weight: 0.40
+  # Штраф за присутствие посторонних людей в кадре/кропе (0.0..1.0).
+  # Множитель итогового скора, если в зоне кропа обнаружены чужие ключевые точки или перекрытия
+  crowd_penalty: 0.50
+  # Минимальная уверенность (confidence) ключевой точки скелета, чтобы считать её видимой (порог полноты)
+  min_completeness: 0.20
+  # Отступ (padding) вокруг bbox при формировании кропа человека (доля от размера)
+  pad: 0.04
+
 # --- Stage 1: detect → detections.json ---
 detection:
   # yolo | rtdetr | rtdetr_v2
@@ -106,10 +121,7 @@ tracklet_pipeline:
     # JPG на диск не нужны для 2c (эмбеддинги в npz). true — только для отладки
     save_crops: false
     crops_dir: tracklet_crops
-    # TrackBestFramesPicker: отбор идеальных кадров по скелету и чистоте от других людей
-    pose_weight: 0.40
-    crowd_penalty: 0.50
-    min_completeness: 0.20
+
   # Stage 2c tracklet_link → tracklet_links.json (вкладка «Склейки»)
   # Pose на f0/f1 уточняет ноги (p0/p1 → map_p0/map_p1); motion экстраполирует конец A к t0(B).
   # Пять проходов: Pass 0 — ReID; Pass 1 — combo в окнах; Pass 2 — стык; Pass 3 — дырка; Pass 4 — handover.
