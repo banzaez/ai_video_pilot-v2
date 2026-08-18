@@ -220,36 +220,29 @@ camera_link:
   face_crops_dir: face_crops
   save_face_crops: true
 
-# --- Stage day_link: глобальная межкамерная склейка дня (Pass 0–4) ---
+# --- Stage day_link: глобальная межкамерная склейка дня (Pass 1→2→4, без лиц) ---
+# С разных камер персона может быть одновременно: overlap по времени не режет пару.
+# На одной камере пересечение треков по-прежнему запрещено.
 day_link:
   enabled: true
-  face_models: [buffalo_l, antelopev2]
-  min_face_score: 0.60
-  min_reid_score: 0.85
-  max_gap_sec: 300.0
-  max_overlap_sec: 20.0
-  max_speed_mps: 3.5
-  motion_sigma_m: 3.0
-  w_face: 0.45
-  w_reid: 0.30
-  w_motion: 0.20
-  w_gap: 0.05
-  min_combo_score: 0.70
-  window_sec: 180
-  window_overlap_sec: 30
-  solver: hungarian
-  pass0:
-    min_face: 0.75
+  candidates:
+    max_gap_sec: 300
+    min_reid_score: 0.90
+    max_spatial_m: 4.0
+    motion_sigma_m: 3.0
+  combo:
+    w_reid: 0.65
+    w_motion: 0.20
+    w_size: 0.0
+    w_gap: 0.15
+  pass1:
     min_reid: 0.94
     min_score: 0.85
-  pass1:
-    min_score: 0.75
-    window_sec: 180
-    window_overlap_sec: 30
   pass2:
-    min_score: 0.80
+    min_score: 0.90
   pass4:
-    max_overlap_sec: 20.0
+    max_overlap_sec: 20
+    min_reid: 0.90
     min_score: 0.70
 
 nvr:

@@ -94,8 +94,12 @@ export function getDayLinksMeta(dayClean: string) {
       const infoPath = path.join(resultsDir, s.key, "info.json");
       let t0_abs = 0;
       if (fs.existsSync(infoPath)) {
-        const info = readJsonFile(infoPath) as { started_at?: string; parts?: Array<{ started_at?: string }> } | null;
-        const startedIso = info?.started_at || info?.parts?.[0]?.started_at;
+        const info = readJsonFile(infoPath) as {
+          started_at?: string;
+          parsed?: { started_at?: string };
+          parts?: Array<{ started_at?: string }>;
+        } | null;
+        const startedIso = info?.parsed?.started_at || info?.started_at || info?.parts?.[0]?.started_at;
         if (startedIso) {
           const match = /(\d{2}):(\d{2}):(\d{2}(?:\.\d+)?)/.exec(startedIso);
           if (match) {
@@ -109,6 +113,11 @@ export function getDayLinksMeta(dayClean: string) {
       };
     });
 
+  const sessionKeys = daySessions.map((s) => s.key);
+  const camerasFromSessions = [
+    ...new Set(daySessions.map((s) => s.camera).filter((c): c is string => Boolean(c))),
+  ];
+
   if (!fs.existsSync(linksPath)) {
     return {
       day: formattedDay,
@@ -117,8 +126,11 @@ export function getDayLinksMeta(dayClean: string) {
       persons: [],
       edges: [],
       candidate_edges: [],
+      sessions: sessionKeys,
+      cameras: camerasFromSessions,
       camera_sessions: daySessions,
       track_to_person: {},
+      n_persons: 0,
       stats: {
         n_persons: 0,
         n_multi_cam_persons: 0,
@@ -132,6 +144,8 @@ export function getDayLinksMeta(dayClean: string) {
       person_id: number;
       tracks: Array<{ uid: string; session_key: string; track_id: number }>;
     }>;
+    sessions?: string[];
+    cameras?: string[];
   };
 
   // Построение быстрого маппинга track_id -> person_id по каждой сессии
@@ -148,12 +162,14 @@ export function getDayLinksMeta(dayClean: string) {
   }
 
   return {
+    ...(doc as object),
     has_links: true,
     day: formattedDay,
     day_clean: clean,
+    sessions: doc?.sessions?.length ? doc.sessions : sessionKeys,
+    cameras: doc?.cameras?.length ? doc.cameras : camerasFromSessions,
     camera_sessions: daySessions,
     track_to_person: trackToPerson,
-    ...(doc as object),
   };
 }
 

@@ -52,11 +52,12 @@ STAGE_PARENT: dict[str, str | None] = {
     "feet": "pose",
     "camera_face": "track",
     "camera_link": "feet",
-    "day_link": "camera_link",
+    "day_link": None,
 }
 
 # Версия формата файла стадии (поднять при несовместимом изменении JSON)
 STAGE_FILE_VERSION: dict[str, int] = {s: 1 for s in STAGE_ORDER}
+STAGE_FILE_VERSION["day_link"] = 3
 
 ARTIFACT_KEY = "artifact"
 

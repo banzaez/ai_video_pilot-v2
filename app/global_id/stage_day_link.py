@@ -1,34 +1,36 @@
-"""Stage day_link: глобальная межкамерная склейка дня (Pass 0–4)."""
+"""Stage day_link: глобальная межкамерная склейка дня (Pass 1→2→4)."""
 
 from __future__ import annotations
 
 import logging
 import math
 import os
+from bisect import bisect_right
 from datetime import datetime
 from typing import Any
 
-import numpy as np
-from scipy.optimize import linear_sum_assignment
-
 from app.artifact_meta import attach_artifact_meta
-from app.config import (
-    Settings,
-    camera_face_json_path,
-    camera_face_npz_path,
-    day_links_json_path,
-    day_results_dir,
-    feet_json_path,
-    info_json_path,
-    tracking_json_path,
-    tracklet_reid_npz_path,
-)
-from app.entity_id import group as group_eid
+from app.config import Settings, day_links_json_path, day_results_dir
+from app.global_id.group_reid import TrackGroupReid, embed_session_tracks, make_group_reid_context
+from app.global_id.spatial import METER_PX
 from app.io.json_util import load_tracking_json, save_debug_json
-from app.session.discover import Session, discover_sessions, parse_day_input
-from app.util.union_find import UnionFind
+from app.session.discover import parse_day_input
+from app.tracklet.link_mcf import (
+    _combo_score,
+    _gap_score,
+    _motion_score,
+    _pair_uses_map,
+    _size_score,
+    _spatial_threshold_exceeded,
+    _tracklet_spatial_point,
+    _unique_groups,
+    link_hungarian_chains,
+)
+from app.util.intervals import intervals_overlap, pair_embed_score
 
 logger = logging.getLogger(__name__)
+
+_CANDIDATE_TOP_K = 50
 
 
 def _parse_iso_to_day_sec(iso_str: str | None) -> float:
@@ -64,130 +66,42 @@ def _load_feet_map_trajectories(feet_path: str) -> dict[int, list[dict[str, Any]
     return trajs
 
 
-def _max_face_similarity_weighted(
-    embs_a: np.ndarray | None,
-    weights_a: np.ndarray | None,
-    embs_b: np.ndarray | None,
-    weights_b: np.ndarray | None,
-) -> tuple[float, float]:
-    """Выбор пары по cos * w_a * w_b; возвращает (raw_cos, min(w_a, w_b))."""
-    if embs_a is None or embs_b is None or len(embs_a) == 0 or len(embs_b) == 0:
+def _bbox_wh(bbox: Any) -> tuple[float, float]:
+    if not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
         return 0.0, 0.0
-    sim_raw = np.dot(embs_a, embs_b.T)
-    sim_weighted = sim_raw.copy()
-    if weights_a is not None and len(weights_a) == len(embs_a):
-        sim_weighted = sim_weighted * weights_a[:, None]
-    if weights_b is not None and len(weights_b) == len(embs_b):
-        sim_weighted = sim_weighted * weights_b[None, :]
-    flat_idx = int(np.argmax(sim_weighted))
-    i, j = divmod(flat_idx, sim_weighted.shape[1])
-    w_a = float(weights_a[i]) if weights_a is not None and len(weights_a) == len(embs_a) else 1.0
-    w_b = float(weights_b[j]) if weights_b is not None and len(weights_b) == len(embs_b) else 1.0
-    return float(sim_raw[i, j]), min(w_a, w_b)
+    return max(0.0, float(bbox[2]) - float(bbox[0])), max(0.0, float(bbox[3]) - float(bbox[1]))
 
 
-def _get_face_embs_for_id(
-    face_npz: dict[str, np.ndarray],
-    track_id: int,
-    model: str,
-) -> np.ndarray | None:
-    eid = group_eid(track_id)
-    keys = [
-        eid.npz_key(model),
-        eid.npz_key(),
-        f"group_{track_id}_{model}",
-        f"track_{track_id}_{model}",
-        f"group_{track_id}",
-        f"track_{track_id}",
-    ]
-    for k in keys:
-        arr = face_npz.get(k)
-        if arr is not None and len(arr) > 0:
-            return arr
-    return None
+def _bbox_feet(bbox: Any) -> list[float] | None:
+    if not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
+        return None
+    return [0.5 * (float(bbox[0]) + float(bbox[2])), float(bbox[3])]
 
 
-def _get_face_entries(
-    face_meta: dict[str, Any],
-    track_id: int,
-    model: str,
-) -> list[dict[str, Any]]:
-    key = group_eid(track_id).format()
-    by_model = face_meta.get("faces_by_model") or {}
-    bucket = by_model.get(model) or face_meta.get("faces") or {}
-    entries = bucket.get(key) or bucket.get(str(track_id)) or []
-    if entries:
-        return entries
-    return []
-
-
-def _load_reid_by_track_id(session_root: str) -> dict[int, np.ndarray]:
-    """Загружает ReID-эмбеддинги для каждого track_id (группы треклетов)."""
-    reid_json_path = os.path.join(session_root, "tracklet_reid.json")
-    reid_npz_path = os.path.join(session_root, "tracklet_reid.npz")
-    links_json_path = os.path.join(session_root, "tracklet_links.json")
-
-    if not (os.path.isfile(reid_json_path) and os.path.isfile(reid_npz_path)):
-        return {}
-
-    reid_doc = load_tracking_json(reid_json_path)
-    tracklet_crops: dict[int, list[str]] = {}
-    for t in reid_doc.get("tracklets", []):
-        tl_id = int(t.get("tracklet_id", 0))
-        crops = t.get("crop_paths", [])
-        if tl_id > 0 and crops:
-            tracklet_crops[tl_id] = crops
-
-    track_to_tls: dict[int, list[int]] = {}
-    if os.path.isfile(links_json_path):
-        links_doc = load_tracking_json(links_json_path)
-        groups = links_doc.get("groups", [])
-        for gid, grp in enumerate(groups, start=1):
-            track_to_tls[gid] = [int(x) for x in grp]
-    else:
-        for tl_id in tracklet_crops:
-            track_to_tls[tl_id] = [tl_id]
-
-    npz_data: dict[str, np.ndarray] = {}
+def _camera_index_from_session(session_key: str, info_doc: dict[str, Any]) -> int:
+    raw = info_doc.get("camera_index")
+    if raw is not None:
+        try:
+            idx = int(raw)
+            if idx > 0:
+                return idx
+        except (TypeError, ValueError):
+            pass
     try:
-        with np.load(reid_npz_path) as npz:
-            for k in npz.files:
-                npz_data[k] = npz[k]
-    except Exception as e:
-        logger.warning("Session %s: ошибка чтения %s: %s", session_root, reid_npz_path, e)
-        return {}
-
-    track_reids: dict[int, np.ndarray] = {}
-    for tid, tls in track_to_tls.items():
-        embs: list[np.ndarray] = []
-        for tl in tls:
-            for cpath in tracklet_crops.get(tl, []):
-                arr = npz_data.get(cpath)
-                if arr is not None:
-                    if arr.ndim == 1:
-                        embs.append(arr)
-                    else:
-                        for row in arr:
-                            embs.append(row)
-        if embs:
-            mat = np.stack(embs, axis=0)
-            norm = np.linalg.norm(mat, axis=-1, keepdims=True)
-            mat = mat / np.maximum(norm, 1e-9)
-            track_reids[tid] = mat
-    return track_reids
+        return int(session_key.split("_")[0])
+    except (TypeError, ValueError, IndexError):
+        return 0
 
 
 def _extract_track_data(
     session_key: str,
     session_root: str,
-    settings: Settings,
+    reid_by_track: dict[int, TrackGroupReid],
 ) -> list[dict[str, Any]]:
     """Извлекает и выравнивает все треки сессии по единому дневному таймлайну."""
     info_path = os.path.join(session_root, "info.json")
     tracking_path = os.path.join(session_root, "tracking.json")
     feet_path = os.path.join(session_root, "feet.json")
-    face_json_path = os.path.join(session_root, "camera_face.json")
-    face_npz_path = os.path.join(session_root, "camera_face.npz")
 
     if not os.path.isfile(info_path) or not os.path.isfile(tracking_path):
         return []
@@ -195,105 +109,67 @@ def _extract_track_data(
     info_doc = load_tracking_json(info_path)
     tracking_doc = load_tracking_json(tracking_path)
     camera_name = str(info_doc.get("camera") or f"Camera_{session_key.split('_')[0]}")
-    camera_idx = int(info_doc.get("camera_index") or 0)
+    camera_idx = _camera_index_from_session(session_key, info_doc)
     fps = float(info_doc.get("fps") or tracking_doc.get("fps") or 25.0)
     started_at_str = str(info_doc.get("parsed", {}).get("started_at") or info_doc.get("started_at") or "")
     if not started_at_str and info_doc.get("parts"):
         started_at_str = str(info_doc["parts"][0].get("started_at") or "")
     session_start_sec = _parse_iso_to_day_sec(started_at_str)
 
-    # Точки ног на 2D-карте
     feet_trajs = _load_feet_map_trajectories(feet_path)
 
-    # ReID эмбеддинги по каждому track_id
-    reid_by_track = _load_reid_by_track_id(session_root)
-
-    # Лица InsightFace
-    face_meta: dict[str, Any] = load_tracking_json(face_json_path) if os.path.isfile(face_json_path) else {}
-    face_npz_dict: dict[str, np.ndarray] = {}
-    if os.path.isfile(face_npz_path):
-        try:
-            with np.load(face_npz_path) as npz:
-                for k in npz.files:
-                    face_npz_dict[k] = npz[k]
-        except Exception as e:
-            logger.warning("Session %s: ошибка чтения %s: %s", session_key, face_npz_path, e)
-
-    # Сбор спанов треков по кадрам
-    track_frames: dict[int, list[int]] = {}
+    track_meta: dict[int, dict[str, Any]] = {}
     for f in tracking_doc.get("frames", []):
         fi = int(f.get("frame_index", 0))
         for d in f.get("detections", []):
             tid = int(d.get("track_id") or d.get("tracklet_id") or 0)
             if tid <= 0:
                 continue
-            track_frames.setdefault(tid, []).append(fi)
+            bbox = d.get("bbox")
+            rec = track_meta.get(tid)
+            if rec is None:
+                rec = {
+                    "frames": [],
+                    "bbox0": bbox,
+                    "bbox1": bbox,
+                    "f0": fi,
+                    "f1": fi,
+                }
+                track_meta[tid] = rec
+            rec["frames"].append(fi)
+            if fi < rec["f0"]:
+                rec["f0"] = fi
+                rec["bbox0"] = bbox
+            if fi >= rec["f1"]:
+                rec["f1"] = fi
+                rec["bbox1"] = bbox
 
-    face_models = list(settings.day_link_face_models)
     track_nodes: list[dict[str, Any]] = []
 
-    for tid, frames in sorted(track_frames.items()):
-        f0, f1 = min(frames), max(frames)
+    for tid, meta in sorted(track_meta.items()):
+        frames = meta["frames"]
+        f0, f1 = int(meta["f0"]), int(meta["f1"])
         t0_sec = session_start_sec + (f0 / fps)
         t1_sec = session_start_sec + (f1 / fps)
+        bbox0 = meta.get("bbox0")
+        bbox1 = meta.get("bbox1")
+        w0, h0 = _bbox_wh(bbox0)
+        w1, h1 = _bbox_wh(bbox1)
+        img_p0 = _bbox_feet(bbox0)
+        img_p1 = _bbox_feet(bbox1)
 
-        # Траектория ног на 2D-карте
         ft = feet_trajs.get(tid, [])
-        p0 = ft[0]["map"] if ft else None
-        p1 = ft[-1]["map"] if ft else None
+        map_p0 = ft[0]["map"] if ft else None
+        map_p1 = ft[-1]["map"] if ft else None
         avg_speed_mps = 0.0
-        v_out = (0.0, 0.0)
-        if len(ft) >= 2:
+        if len(ft) >= 2 and map_p0 and map_p1:
             dt = max(0.1, (ft[-1]["frame_index"] - ft[0]["frame_index"]) / fps)
-            dist_total_px = math.hypot(p1[0] - p0[0], p1[1] - p0[1])
-            dist_total_m = dist_total_px / 160.0
+            dist_total_m = math.hypot(map_p1[0] - map_p0[0], map_p1[1] - map_p0[1]) / METER_PX
             avg_speed_mps = dist_total_m / dt
-            # Выходной вектор скорости по последним 3-5 точкам (в м/с)
-            recent = ft[-min(len(ft), 5):]
-            dt_r = max(0.04, (recent[-1]["frame_index"] - recent[0]["frame_index"]) / fps)
-            v_out = (
-                ((recent[-1]["map"][0] - recent[0]["map"][0]) / 160.0) / dt_r,
-                ((recent[-1]["map"][1] - recent[0]["map"][1]) / 160.0) / dt_r,
-            )
 
-        # ReID векторы
-        reid_arr = reid_by_track.get(tid)
-
-        # Лица по моделям
-        face_embs_by_model: dict[str, np.ndarray | None] = {}
-        face_pose_weights_by_model: dict[str, np.ndarray | None] = {}
-        face_crops_list: list[str] = []
-        best_face_det_score = 0.0
-
-        for model in face_models:
-            fembs = _get_face_embs_for_id(face_npz_dict, tid, model)
-            if fembs is not None:
-                if fembs.ndim == 1:
-                    fembs = fembs.reshape(1, -1)
-                norm = np.linalg.norm(fembs, axis=1, keepdims=True)
-                fembs = fembs / np.maximum(norm, 1e-9)
-            face_embs_by_model[model] = fembs
-
-            entries = _get_face_entries(face_meta, tid, model)
-            if entries:
-                pw = np.array(
-                    [max(0.0, min(1.0, float(e.get("pose_face_score", 1.0)))) for e in entries],
-                    dtype=np.float32,
-                )
-                face_pose_weights_by_model[model] = pw
-                for e in entries:
-                    cfile = e.get("crop_file")
-                    if cfile and cfile not in face_crops_list:
-                        face_crops_list.append(cfile)
-                    dscore = float(e.get("det_score") or 0.0)
-                    if dscore > best_face_det_score:
-                        best_face_det_score = dscore
-            else:
-                face_pose_weights_by_model[model] = None
-
-        has_any_face = any(
-            arr is not None and len(arr) > 0 for arr in face_embs_by_model.values()
-        )
+        reid_rec = reid_by_track.get(tid)
+        reid_arr = reid_rec.embs if reid_rec is not None else None
+        crop_files = list(reid_rec.crop_files) if reid_rec is not None else []
 
         track_nodes.append({
             "uid": f"{session_key}#{tid}",
@@ -303,21 +179,25 @@ def _extract_track_data(
             "track_id": tid,
             "f0": f0,
             "f1": f1,
-            "t0": round(t0_sec, 3),
-            "t1": round(t1_sec, 3),
+            "t0": float(t0_sec),
+            "t1": float(t1_sec),
             "duration_sec": round(t1_sec - t0_sec, 2),
-            "p0": [round(p0[0], 2), round(p0[1], 2)] if p0 else None,
-            "p1": [round(p1[0], 2), round(p1[1], 2)] if p1 else None,
-            "v_out": (round(v_out[0], 2), round(v_out[1], 2)),
+            "p0": img_p0,
+            "p1": img_p1,
+            "map_p0": [float(map_p0[0]), float(map_p0[1])] if map_p0 else None,
+            "map_p1": [float(map_p1[0]), float(map_p1[1])] if map_p1 else None,
+            "map_src0": "kpt_map" if map_p0 else "",
+            "map_src1": "kpt_map" if map_p1 else "",
+            "bbox0": list(bbox0) if isinstance(bbox0, (list, tuple)) else None,
+            "bbox1": list(bbox1) if isinstance(bbox1, (list, tuple)) else None,
+            "h": float(h0 or h1 or 0.0),
+            "w": float(w0 or w1 or 0.0),
             "avg_speed_mps": round(avg_speed_mps, 2),
             "n_frames": len(frames),
             "reid_embs": reid_arr,
             "has_reid": reid_arr is not None,
-            "has_face": has_any_face,
-            "face_embs_by_model": face_embs_by_model,
-            "face_pose_weights_by_model": face_pose_weights_by_model,
-            "face_crops": face_crops_list,
-            "best_face_score": round(best_face_det_score, 4),
+            "crops": crop_files,
+            "best_crop": crop_files[0] if crop_files else None,
         })
 
     return track_nodes
@@ -328,106 +208,77 @@ def _score_pair(
     v: dict[str, Any],
     settings: Settings,
 ) -> dict[str, Any] | None:
-    """Вычисляет многомодальный скор перехода u -> v."""
-    is_same_camera = (u["camera_index"] == v["camera_index"])
+    """Скор перехода u → v как tracklet_link: ReID + motion + size + gap, без лиц.
 
-    # Временной интервал: u должен завершиться до старта v (или небольшой оверлап для handover)
-    gap_sec = v["t0"] - u["t1"]
+    На одной камере пересечение по времени запрещено. С разных камер персона
+    может быть видна одновременно — overlap не отбрасывает пару.
+    """
+    is_same_camera = int(u["camera_index"]) == int(v["camera_index"])
+    u_t0, u_t1 = float(u["t0"]), float(u["t1"])
+    v_t0, v_t1 = float(v["t0"]), float(v["t1"])
+    gap_sec = v_t0 - u_t1
     max_gap_sec = float(settings.day_link_max_gap_sec)
-    max_overlap_sec = float(settings.day_link_max_overlap_sec)
+    is_overlap = intervals_overlap(u_t0, u_t1, v_t0, v_t1)
 
-    if gap_sec < -max_overlap_sec or gap_sec > max_gap_sec:
+    if is_same_camera:
+        if is_overlap or gap_sec < 0.0 or gap_sec > max_gap_sec:
+            return None
+    elif not is_overlap and (gap_sec < 0.0 or gap_sec > max_gap_sec):
         return None
 
-    is_overlap = (gap_sec < 0.0)
+    s_reid = pair_embed_score(u.get("reid_embs"), v.get("reid_embs"))
+    min_reid_score = float(settings.day_link_min_reid_score)
+    if s_reid is None or s_reid < min_reid_score:
+        return None
 
-    # Пространственная метрика на 2D карте (160 px = 1 метр)
-    pA1 = u["p1"]
-    pB0 = v["p0"]
-    dist_m = 0.0
-    s_motion = 0.5
-    speed_mps = 0.0
-    motion_sigma = float(settings.day_link_motion_sigma_m)
-    max_speed = float(settings.day_link_max_speed_mps)
+    s_motion, residual = _motion_score(
+        u,
+        v,
+        sigma_px=float(settings.day_link_motion_sigma_px),
+        sigma_m=float(settings.day_link_motion_sigma_m),
+    )
+    space = "map" if _pair_uses_map(u, v, "p1", "p0") else "image"
+    if _spatial_threshold_exceeded(
+        residual,
+        space=space,
+        max_px=float(settings.day_link_max_spatial_px),
+        max_m=float(settings.day_link_max_spatial_m),
+    ):
+        return None
 
-    if pA1 and pB0:
-        dist_px = float(math.hypot(pB0[0] - pA1[0], pB0[1] - pA1[1]))
-        dist_m = dist_px / 160.0
-        dt = max(0.5, abs(gap_sec) if is_overlap else gap_sec)
-        speed_mps = dist_m / dt
-        if not is_overlap and speed_mps > max_speed:
-            # Превышение физически возможной скорости перемещения человека
-            return None
-        if is_overlap and dist_m > 3.0:
-            # При одновременной видимости на разных камерах человек не может быть дальше 3м
-            return None
-        s_motion = float(math.exp(- (dist_m ** 2) / (2.0 * (motion_sigma ** 2))))
+    dist_m = float(residual) if space == "map" else float(residual) / METER_PX
+    dt = max(0.5, abs(gap_sec) if is_overlap else max(gap_sec, 1e-6))
+    p1x, p1y, _ = _tracklet_spatial_point(u, "p1")
+    b0x, b0y, _ = _tracklet_spatial_point(v, "p0")
+    dist_last = math.hypot(p1x - b0x, p1y - b0y)
+    dist_last_m = dist_last / METER_PX if space == "map" else dist_last / METER_PX
+    speed_mps = dist_last_m / dt
 
-    # Сходство лиц (InsightFace)
-    face_models = list(settings.day_link_face_models)
-    face_scores: dict[str, float] = {}
-    best_raw_face = 0.0
-    pose_face_weight = 0.0
-
-    for model in face_models:
-        fembs_u = u["face_embs_by_model"].get(model)
-        fembs_v = v["face_embs_by_model"].get(model)
-        pw_u = u["face_pose_weights_by_model"].get(model)
-        pw_v = v["face_pose_weights_by_model"].get(model)
-        raw_cos, min_w = _max_face_similarity_weighted(fembs_u, pw_u, fembs_v, pw_v)
-        if raw_cos > 0.0:
-            face_scores[model] = round(raw_cos, 4)
-            if raw_cos > best_raw_face:
-                best_raw_face = raw_cos
-                pose_face_weight = min_w
-
-    s_face = max(face_scores.values()) if face_scores else 0.0
-    has_face = bool(face_scores)
-    s_face_eff = s_face * max(0.1, pose_face_weight)
-
-    # Сходство ReID тела (SOLIDER)
-    s_reid = 0.0
-    has_reid = False
-    if u["reid_embs"] is not None and v["reid_embs"] is not None:
-        reid_sim = np.dot(u["reid_embs"], v["reid_embs"].T)
-        s_reid = float(np.max(reid_sim))
-        has_reid = True
-
-    # Штраф за временной зазор
-    s_gap = max(0.0, 1.0 - abs(gap_sec) / max(1.0, max_gap_sec))
-
-    w_face = float(settings.day_link_w_face)
-    w_reid = float(settings.day_link_w_reid)
-    w_motion = float(settings.day_link_w_motion)
-    w_gap = float(settings.day_link_w_gap)
-
-    # Вычисление комбинированного скора
-    combo = (
-        w_face * (s_face_eff if has_face else 0.0)
-        + w_reid * (s_reid if has_reid else 0.0)
-        + w_motion * s_motion
-        + w_gap * s_gap
+    s_size = _size_score(u, v, log_scale=float(settings.day_link_size_log_scale))
+    gap_for_score = 0.0 if is_overlap else max(0.0, gap_sec)
+    s_gap = _gap_score(gap_for_score, max_gap_sec)
+    combo = _combo_score(
+        float(s_reid),
+        float(s_motion),
+        float(s_size),
+        float(s_gap),
+        w_reid=float(settings.day_link_w_reid),
+        w_motion=float(settings.day_link_w_motion),
+        w_size=float(settings.day_link_w_size),
+        w_gap=float(settings.day_link_w_gap),
     )
 
-    # Если лицо четкое и высококачественное — повышаем уверенность
-    min_face_score = float(settings.day_link_min_face_score)
-    if has_face and s_face >= min_face_score and pose_face_weight >= 0.35:
-        combo = max(combo, s_face_eff * 0.85 + s_motion * 0.15)
-
-    min_reid_score = float(settings.day_link_min_reid_score)
-    if not has_face and has_reid and s_reid >= min_reid_score:
-        combo = max(combo, s_reid * 0.70 + s_motion * 0.30)
-
-    face_parts = [f"{m}={sc:.2f}" for m, sc in sorted(face_scores.items())]
-    face_str = f"Face[{', '.join(face_parts)}]" if face_parts else "Face=—"
-    reid_str = f"ReID={s_reid:.2f}" if has_reid else "ReID=—"
-    motion_str = f"Motion={s_motion:.2f} (Δd={dist_m:.1f}м, v={speed_mps:.1f}м/с, Δt={gap_sec:.1f}с)"
-
-    reason = f"{face_str}, {reid_str}, {motion_str}"
+    reid_str = f"ReID={s_reid:.2f}"
+    motion_str = (
+        f"Motion={s_motion:.2f} (Δd={dist_m:.1f}м, v={speed_mps:.1f}м/с, Δt={gap_sec:.1f}с)"
+    )
+    size_str = f"Size={s_size:.2f}"
 
     return {
         "from": u["uid"],
         "to": v["uid"],
+        "from_idx": int(u["_idx"]),
+        "to_idx": int(v["_idx"]),
         "from_session": u["session_key"],
         "from_camera": u["camera"],
         "from_track": u["track_id"],
@@ -436,24 +287,231 @@ def _score_pair(
         "to_track": v["track_id"],
         "is_same_camera": is_same_camera,
         "is_overlap": is_overlap,
-        "score": round(combo, 4),
-        "face": round(s_face, 4) if has_face else None,
-        "face_scores": face_scores or None,
-        "pose_face": round(pose_face_weight, 4) if pose_face_weight > 0 else None,
-        "reid": round(s_reid, 4) if has_reid else None,
-        "motion": round(s_motion, 4),
+        "score": round(float(combo), 4),
+        "reid": round(float(s_reid), 4),
+        "motion": round(float(s_motion), 4),
+        "size": round(float(s_size), 4),
         "dist_m": round(dist_m, 2),
         "gap_sec": round(gap_sec, 2),
         "speed_mps": round(speed_mps, 2),
-        "reason": reason,
+        "reason": f"{reid_str}, {motion_str}, {size_str}",
     }
+
+
+def _build_candidate_edges(
+    nodes: list[dict[str, Any]],
+    settings: Settings,
+) -> list[dict[str, Any]]:
+    """Пары A→B: same-cam только после конца A; cross-cam — и overlap, и пауза ≤ max_gap."""
+    n = len(nodes)
+    if n < 2:
+        return []
+    order = sorted(range(n), key=lambda i: float(nodes[i]["t0"]))
+    t0s = [float(nodes[i]["t0"]) for i in order]
+    max_gap = float(settings.day_link_max_gap_sec)
+    edges: list[dict[str, Any]] = []
+    for u in nodes:
+        hi = float(u["t1"]) + max_gap
+        right = bisect_right(t0s, hi)
+        for pos in range(right):
+            v = nodes[order[pos]]
+            if v["_idx"] == u["_idx"]:
+                continue
+            edge = _score_pair(u, v, settings)
+            if edge is not None:
+                edges.append(edge)
+    return edges
+
+
+def _same_cam_overlap(
+    ids: set[int],
+    nodes: list[dict[str, Any]],
+) -> bool:
+    items = sorted(ids)
+    for i, a in enumerate(items):
+        na = nodes[a]
+        for b in items[i + 1 :]:
+            nb = nodes[b]
+            if int(na["camera_index"]) != int(nb["camera_index"]):
+                continue
+            if intervals_overlap(float(na["t0"]), float(na["t1"]), float(nb["t0"]), float(nb["t1"])):
+                return True
+    return False
+
+
+def _split_same_cam_overlap(
+    groups: list[list[int]],
+    nodes: list[dict[str, Any]],
+) -> list[list[int]]:
+    spans = {i: (float(nodes[i]["t0"]), float(nodes[i]["t1"])) for i in range(len(nodes))}
+    final: list[list[int]] = []
+    for group in groups:
+        bucket: list[list[int]] = []
+        for tid in sorted(group, key=lambda x: spans.get(x, (0.0, 0.0))[0]):
+            placed = False
+            for part in bucket:
+                if not _same_cam_overlap(set(part) | {tid}, nodes):
+                    part.append(tid)
+                    placed = True
+                    break
+            if not placed:
+                bucket.append([tid])
+        final.extend(bucket)
+    return final
+
+
+def _group_span(group: list[int], nodes: list[dict[str, Any]]) -> tuple[float, float]:
+    t0 = min(float(nodes[i]["t0"]) for i in group)
+    t1 = max(float(nodes[i]["t1"]) for i in group)
+    return t0, t1
+
+
+def _exit_idx(group: list[int], nodes: list[dict[str, Any]]) -> int:
+    return max(group, key=lambda i: (float(nodes[i]["t1"]), i))
+
+
+def _entry_idx(group: list[int], nodes: list[dict[str, Any]]) -> int:
+    return min(group, key=lambda i: (float(nodes[i]["t0"]), i))
+
+
+def _public_edge(edge: dict[str, Any], *, pass_n: int, prefix: str) -> dict[str, Any]:
+    skip = {"from_idx", "to_idx"}
+    out = {k: v for k, v in edge.items() if k not in skip}
+    out["pass"] = pass_n
+    out["reason"] = f"{prefix}: {edge.get('reason') or ''}".strip()
+    return out
+
+
+def _merge_groups_by_endpoints(
+    groups: list[list[int]],
+    by_pair: dict[tuple[int, int], dict[str, Any]],
+    nodes: list[dict[str, Any]],
+    *,
+    min_score: float,
+    accept: Any,
+    solver: str,
+) -> tuple[list[list[int]], set[tuple[int, int]]]:
+    """Hungarian: стык цепочек только выход A → вход B. Overlap разных камер можно."""
+    if min_score <= 0 or len(groups) < 2:
+        return groups, set()
+
+    best: dict[tuple[int, int], tuple[float, int, int]] = {}
+    for ga, group_a in enumerate(groups):
+        if not group_a:
+            continue
+        for gb, group_b in enumerate(groups):
+            if ga == gb or not group_b:
+                continue
+            if _same_cam_overlap(set(group_a) | set(group_b), nodes):
+                continue
+            exit_id = _exit_idx(group_a, nodes)
+            entry_id = _entry_idx(group_b, nodes)
+            rec = by_pair.get((exit_id, entry_id))
+            if rec is None or not accept(rec):
+                continue
+            best[(ga, gb)] = (float(rec["score"]), exit_id, entry_id)
+
+    if not best:
+        return groups, set()
+
+    group_ids = list(range(len(groups)))
+    t0_g = {gi: _group_span(groups[gi], nodes)[0] for gi in group_ids if groups[gi]}
+    fake_edges = [(ga, gb, val) for (ga, gb), (val, _, _) in best.items()]
+    chains = link_hungarian_chains(group_ids, fake_edges, min_score=min_score, t0=t0_g)
+
+    used: set[tuple[int, int]] = set()
+    new_groups: list[list[int]] = []
+    for chain in chains:
+        merged: list[int] = []
+        for i, gi in enumerate(chain):
+            merged.extend(groups[gi])
+            if i + 1 < len(chain):
+                rec = best.get((gi, chain[i + 1]))
+                if rec:
+                    used.add((rec[1], rec[2]))
+        new_groups.append(sorted(set(merged), key=lambda tid: (float(nodes[tid]["t0"]), tid)))
+
+    new_groups = _split_same_cam_overlap(new_groups, nodes)
+    return _unique_groups(new_groups), used
+
+
+def _pass4_handover(
+    groups: list[list[int]],
+    by_pair: dict[tuple[int, int], dict[str, Any]],
+    nodes: list[dict[str, Any]],
+    *,
+    max_overlap_sec: float,
+    min_score: float,
+    min_reid: float,
+    solver: str,
+) -> tuple[list[list[int]], set[tuple[int, int]]]:
+    if max_overlap_sec <= 0 or min_score <= 0 or len(groups) < 2:
+        return groups, set()
+
+    work = [sorted(g, key=lambda tid: (float(nodes[tid]["t0"]), tid)) for g in groups if g]
+    best: dict[tuple[int, int], tuple[float, int, int]] = {}
+    for ga, group_a in enumerate(work):
+        sa = _group_span(group_a, nodes)
+        for gb, group_b in enumerate(work):
+            if ga == gb:
+                continue
+            sb = _group_span(group_b, nodes)
+            if not (sa[0] <= sb[0] < sa[1] < sb[1]):
+                continue
+            overlap = sa[1] - sb[0]
+            if overlap > max_overlap_sec + 1e-9:
+                continue
+            exit_id = _exit_idx(group_a, nodes)
+            entry_id = _entry_idx(group_b, nodes)
+            if int(nodes[exit_id]["camera_index"]) == int(nodes[entry_id]["camera_index"]):
+                continue
+            rec = by_pair.get((exit_id, entry_id))
+            if rec is None or not rec.get("is_overlap"):
+                continue
+            if float(rec["score"]) < min_score:
+                continue
+            reid = rec.get("reid")
+            if min_reid > 0 and (reid is None or float(reid) < min_reid):
+                continue
+            if _same_cam_overlap(set(group_a) | set(group_b), nodes):
+                continue
+            best[(ga, gb)] = (float(rec["score"]), exit_id, entry_id)
+
+    if not best:
+        return work, set()
+
+    group_ids = list(range(len(work)))
+    t0_g = {gi: _group_span(work[gi], nodes)[0] for gi in group_ids if work[gi]}
+    fake_edges = [(ga, gb, combo) for (ga, gb), (combo, _, _) in best.items()]
+    chains = link_hungarian_chains(group_ids, fake_edges, min_score=min_score, t0=t0_g)
+
+    used: set[tuple[int, int]] = set()
+    new_groups: list[list[int]] = []
+    for chain in chains:
+        merged: list[int] = []
+        for i, gi in enumerate(chain):
+            merged.extend(work[gi])
+            if i + 1 < len(chain):
+                rec = best.get((gi, chain[i + 1]))
+                if rec:
+                    used.add((rec[1], rec[2]))
+        new_groups.append(sorted(set(merged), key=lambda tid: (float(nodes[tid]["t0"]), tid)))
+
+    new_groups = _split_same_cam_overlap(new_groups, nodes)
+    return _unique_groups(new_groups), used
+
+
+def _crop_ref(session_key: str, file: str | None) -> dict[str, str] | None:
+    if not file:
+        return None
+    return {"session_key": session_key, "file": file}
 
 
 def link_day_tracks(
     nodes: list[dict[str, Any]],
     settings: Settings,
 ) -> dict[str, Any]:
-    """5-проходный межкамерный солвер дня."""
+    """Межкамерный солвер дня: Pass 1 (стык по ReID) → 2 → 4."""
     if not nodes:
         return {
             "n_persons": 0,
@@ -463,224 +521,99 @@ def link_day_tracks(
             "stats": {},
         }
 
-    # 1. Попарный скоринг всех потенциальных кандидатов
-    candidate_edges: list[dict[str, Any]] = []
-    n = len(nodes)
-    for i in range(n):
-        u = nodes[i]
-        for j in range(n):
-            if i == j:
-                continue
-            v = nodes[j]
-            edge = _score_pair(u, v, settings)
-            if edge is not None:
-                candidate_edges.append(edge)
+    for i, node in enumerate(nodes):
+        node["_idx"] = i
 
-    # 2. Инициализация системы связей (Union-Find)
-    uids = [node["uid"] for node in nodes]
-    uf = UnionFind(uids)
-    used_from: set[str] = set()
-    used_to: set[str] = set()
-    accepted_edges: list[dict[str, Any]] = []
+    candidate_edges = _build_candidate_edges(nodes, settings)
+    by_pair = {(int(e["from_idx"]), int(e["to_idx"])): e for e in candidate_edges}
+    groups = [[i] for i in range(len(nodes))]
 
-    # -------------------------------------------------------------
-    # Pass 0: Сверхнадежные совпадения (Direct Face/ReID Match)
-    # -------------------------------------------------------------
-    pass0_min_face = float(settings.day_link_pass0_min_face)
-    pass0_min_reid = float(settings.day_link_pass0_min_reid)
-    pass0_min_score = float(settings.day_link_pass0_min_score)
+    def _pass1_ok(rec: dict[str, Any]) -> bool:
+        if float(rec["score"]) < float(settings.day_link_pass1_min_score):
+            return False
+        reid = rec.get("reid")
+        return reid is not None and float(reid) >= float(settings.day_link_pass1_min_reid)
 
-    pass0_candidates = [
-        e for e in candidate_edges
-        if not e["is_overlap"]
-        and e["score"] >= pass0_min_score
-        and (
-            (e.get("face") and e["face"] >= pass0_min_face)
-            or (e.get("reid") and e["reid"] >= pass0_min_reid)
+    def _pass2_ok(rec: dict[str, Any]) -> bool:
+        return float(rec["score"]) >= float(settings.day_link_pass2_min_score)
+
+    pass1_used: set[tuple[int, int]] = set()
+    if settings.day_link_pass1_min_reid > 0 or settings.day_link_pass1_min_score > 0:
+        groups, pass1_used = _merge_groups_by_endpoints(
+            groups,
+            by_pair,
+            nodes,
+            min_score=float(settings.day_link_pass1_min_score),
+            accept=_pass1_ok,
+            solver="hungarian",
         )
-    ]
-    pass0_candidates.sort(key=lambda e: -e["score"])
 
-    pass0_count = 0
-    for e in pass0_candidates:
-        u, v = e["from"], e["to"]
-        if u in used_from or v in used_to or uf.find(u) == uf.find(v):
-            continue
-        used_from.add(u)
-        used_to.add(v)
-        uf.union(u, v)
-        e_copy = dict(e)
-        e_copy["pass"] = 0
-        e_copy["reason"] = f"Pass 0 (Direct Match): {e['reason']}"
-        accepted_edges.append(e_copy)
-        pass0_count += 1
+    pass2_used: set[tuple[int, int]] = set()
+    if settings.day_link_pass2_min_score > 0:
+        groups, pass2_used = _merge_groups_by_endpoints(
+            groups,
+            by_pair,
+            nodes,
+            min_score=float(settings.day_link_pass2_min_score),
+            accept=_pass2_ok,
+            solver="hungarian",
+        )
 
-    # -------------------------------------------------------------
-    # Pass 1: Оконное венгерское сопоставление (Windowed Temporal Matching)
-    # -------------------------------------------------------------
-    pass1_min_score = float(settings.day_link_pass1_min_score)
-    window_sec = float(settings.day_link_window_sec)
-    window_overlap_sec = float(settings.day_link_window_overlap_sec)
+    pass4_used: set[tuple[int, int]] = set()
+    if settings.day_link_pass4_max_overlap_sec > 0:
+        groups, pass4_used = _pass4_handover(
+            groups,
+            by_pair,
+            nodes,
+            max_overlap_sec=float(settings.day_link_pass4_max_overlap_sec),
+            min_score=float(settings.day_link_pass4_min_score),
+            min_reid=float(settings.day_link_pass4_min_reid),
+            solver="hungarian",
+        )
 
-    min_t = min(node["t0"] for node in nodes)
-    max_t = max(node["t1"] for node in nodes)
-    cur_t = min_t
-    step_sec = max(10.0, window_sec - window_overlap_sec)
-
-    pass1_count = 0
-    while cur_t < max_t:
-        w_start = cur_t
-        w_end = cur_t + window_sec
-        # Собираем доступные узлы и ребра в текущем окне
-        w_nodes = [node for node in nodes if w_start <= node["t0"] <= w_end or w_start <= node["t1"] <= w_end]
-        w_uids = [node["uid"] for node in w_nodes]
-
-        w_edges = [
-            e for e in candidate_edges
-            if e["from"] in w_uids and e["to"] in w_uids
-            and e["from"] not in used_from and e["to"] not in used_to
-            and not e["is_overlap"]
-            and e["score"] >= pass1_min_score
-            and uf.find(e["from"]) != uf.find(e["to"])
-        ]
-
-        if w_edges:
-            # Формируем матрицу стоимостей для Linear Sum Assignment
-            u_srcs = sorted(set(e["from"] for e in w_edges))
-            v_dsts = sorted(set(e["to"] for e in w_edges))
-            src_idx = {uid: i for i, uid in enumerate(u_srcs)}
-            dst_idx = {uid: j for j, uid in enumerate(v_dsts)}
-            cost_matrix = np.full((len(u_srcs), len(v_dsts)), 10.0, dtype=np.float32)
-
-            edge_map: dict[tuple[int, int], dict[str, Any]] = {}
-            for e in w_edges:
-                i, j = src_idx[e["from"]], dst_idx[e["to"]]
-                cost = 1.0 - float(e["score"])
-                if cost < cost_matrix[i, j]:
-                    cost_matrix[i, j] = cost
-                    edge_map[(i, j)] = e
-
-            row_ind, col_ind = linear_sum_assignment(cost_matrix)
-            for r, c in zip(row_ind, col_ind):
-                if cost_matrix[r, c] < (1.0 - pass1_min_score + 1e-4):
-                    e = edge_map.get((r, c))
-                    if not e:
-                        continue
-                    u, v = e["from"], e["to"]
-                    if u in used_from or v in used_to or uf.find(u) == uf.find(v):
-                        continue
-                    used_from.add(u)
-                    used_to.add(v)
-                    uf.union(u, v)
-                    e_copy = dict(e)
-                    e_copy["pass"] = 1
-                    e_copy["reason"] = f"Pass 1 (Window {int(window_sec)}s): {e['reason']}"
-                    accepted_edges.append(e_copy)
-                    pass1_count += 1
-
-        cur_t += step_sec
-
-    # -------------------------------------------------------------
-    # Pass 2: Склейка цепочек (Chain-to-Chain Stitching)
-    # -------------------------------------------------------------
-    pass2_min_score = float(settings.day_link_pass2_min_score)
-    pass2_candidates = [
-        e for e in candidate_edges
-        if e["from"] not in used_from and e["to"] not in used_to
-        and not e["is_overlap"]
-        and e["score"] >= pass2_min_score
-        and uf.find(e["from"]) != uf.find(e["to"])
-    ]
-    pass2_candidates.sort(key=lambda e: -e["score"])
-
-    pass2_count = 0
-    for e in pass2_candidates:
-        u, v = e["from"], e["to"]
-        if u in used_from or v in used_to or uf.find(u) == uf.find(v):
-            continue
-        used_from.add(u)
-        used_to.add(v)
-        uf.union(u, v)
-        e_copy = dict(e)
-        e_copy["pass"] = 2
-        e_copy["reason"] = f"Pass 2 (Chain Stitch): {e['reason']}"
-        accepted_edges.append(e_copy)
-        pass2_count += 1
-
-    # -------------------------------------------------------------
-    # Pass 4: Handover / Co-visibility Overlap (Мультикамерный оверлап)
-    # -------------------------------------------------------------
-    pass4_min_score = float(settings.day_link_pass4_min_score)
-    pass4_candidates = [
-        e for e in candidate_edges
-        if e["is_overlap"]
-        and not e["is_same_camera"]
-        and e["score"] >= pass4_min_score
-        and e["from"] not in used_from and e["to"] not in used_to
-        and uf.find(e["from"]) != uf.find(e["to"])
-    ]
-    pass4_candidates.sort(key=lambda e: -e["score"])
-
-    pass4_count = 0
-    for e in pass4_candidates:
-        u, v = e["from"], e["to"]
-        if u in used_from or v in used_to or uf.find(u) == uf.find(v):
-            continue
-        used_from.add(u)
-        used_to.add(v)
-        uf.union(u, v)
-        e_copy = dict(e)
-        e_copy["pass"] = 4
-        e_copy["reason"] = f"Pass 4 (Multi-Camera Handover): {e['reason']}"
-        accepted_edges.append(e_copy)
-        pass4_count += 1
-
-    # -------------------------------------------------------------
-    # Сборка финальных глобальных персон (Global Person Entities)
-    # -------------------------------------------------------------
     node_map = {node["uid"]: node for node in nodes}
-    person_clusters: dict[str, list[dict[str, Any]]] = {}
-
-    for uid in uids:
-        root = uf.find(uid)
-        person_clusters.setdefault(root, []).append(node_map[uid])
-
-    # Сортировка кластеров по времени первого появления
-    sorted_roots = sorted(
-        person_clusters.keys(),
-        key=lambda r: min(node["t0"] for node in person_clusters[r]),
+    idx_to_person: dict[int, int] = {}
+    sorted_groups = sorted(
+        groups,
+        key=lambda g: min(float(nodes[i]["t0"]) for i in g) if g else 0.0,
     )
 
     persons: list[dict[str, Any]] = []
     person_track_mapping: dict[str, int] = {}
+    accepted_edges: list[dict[str, Any]] = []
+    used_pairs: dict[tuple[int, int], int] = {}
+    for pair in pass4_used:
+        used_pairs[pair] = 4
+    for pair in pass2_used:
+        used_pairs.setdefault(pair, 2)
+    for pair in pass1_used:
+        used_pairs.setdefault(pair, 1)
 
-    for gid, root in enumerate(sorted_roots, start=1):
-        members = sorted(person_clusters[root], key=lambda n: n["t0"])
+    for gid, group in enumerate(sorted_groups, start=1):
+        members = sorted((nodes[i] for i in group), key=lambda n: float(n["t0"]))
         for m in members:
             person_track_mapping[m["uid"]] = gid
+            idx_to_person[int(m["_idx"])] = gid
 
-        visited_cameras = []
+        visited_cameras: list[str] = []
         for m in members:
             if not visited_cameras or visited_cameras[-1] != m["camera"]:
                 visited_cameras.append(m["camera"])
 
-        all_face_crops = []
-        best_face_crop = None
-        best_face_score = 0.0
-
+        all_crops: list[dict[str, str]] = []
+        best_crop = None
         for m in members:
-            for cfile in m["face_crops"]:
-                crop_path = f"/api/face_crop/{m['session_key']}/{cfile}"
-                if crop_path not in all_face_crops:
-                    all_face_crops.append(crop_path)
-                if m["best_face_score"] > best_face_score:
-                    best_face_score = m["best_face_score"]
-                    best_face_crop = crop_path
+            for cfile in m.get("crops") or []:
+                ref = _crop_ref(m["session_key"], str(cfile))
+                if ref and ref not in all_crops:
+                    all_crops.append(ref)
+            if best_crop is None and m.get("best_crop"):
+                best_crop = _crop_ref(m["session_key"], str(m["best_crop"]))
+        if best_crop is None and all_crops:
+            best_crop = all_crops[0]
 
-        p_t0 = min(m["t0"] for m in members)
-        p_t1 = max(m["t1"] for m in members)
-
-        # Вычисляем количество межкамерных переходов внутри персоны
+        p_t0 = min(float(m["t0"]) for m in members)
+        p_t1 = max(float(m["t1"]) for m in members)
         n_transitions = sum(
             1 for i in range(len(members) - 1)
             if members[i]["camera_index"] != members[i + 1]["camera_index"]
@@ -696,8 +629,8 @@ def link_day_tracks(
             "n_cameras": len(set(m["camera"] for m in members)),
             "n_transitions": n_transitions,
             "cameras": visited_cameras,
-            "best_face_crop": best_face_crop,
-            "face_crops": all_face_crops[:10],
+            "best_crop": best_crop,
+            "crops": all_crops[:10],
             "tracks": [
                 {
                     "uid": m["uid"],
@@ -705,22 +638,53 @@ def link_day_tracks(
                     "camera": m["camera"],
                     "camera_index": m["camera_index"],
                     "track_id": m["track_id"],
-                    "t0": m["t0"],
-                    "t1": m["t1"],
-                    "p0": m["p0"],
-                    "p1": m["p1"],
+                    "t0": round(float(m["t0"]), 3),
+                    "t1": round(float(m["t1"]), 3),
+                    "p0": (
+                        [round(m["map_p0"][0], 2), round(m["map_p0"][1], 2)]
+                        if m.get("map_p0")
+                        else ([round(m["p0"][0], 2), round(m["p0"][1], 2)] if m.get("p0") else None)
+                    ),
+                    "p1": (
+                        [round(m["map_p1"][0], 2), round(m["map_p1"][1], 2)]
+                        if m.get("map_p1")
+                        else ([round(m["p1"][0], 2), round(m["p1"][1], 2)] if m.get("p1") else None)
+                    ),
                     "n_frames": m["n_frames"],
-                    "has_face": m["has_face"],
                     "has_reid": m["has_reid"],
-                    "best_face_score": m["best_face_score"],
-                    "crops": [f"/api/face_crop/{m['session_key']}/{c}" for c in m["face_crops"]],
+                    "crops": list(m.get("crops") or []),
                 }
                 for m in members
             ],
         })
 
-    # Сортируем ребра по времени перехода
+    pass_prefix = {
+        1: "Pass 1 (Direct Match)",
+        2: "Pass 2 (Chain Stitch)",
+        4: "Pass 4 (Multi-Camera Handover)",
+    }
+    for pair, pass_n in used_pairs.items():
+        rec = by_pair.get(pair)
+        if rec is None:
+            continue
+        if idx_to_person.get(pair[0]) != idx_to_person.get(pair[1]):
+            continue
+        accepted_edges.append(_public_edge(rec, pass_n=pass_n, prefix=pass_prefix.get(pass_n, "Link")))
+
     accepted_edges.sort(key=lambda e: node_map.get(e["from"], {}).get("t1", 0.0))
+    pass1_count = sum(1 for e in accepted_edges if e.get("pass") == 1)
+    pass2_count = sum(1 for e in accepted_edges if e.get("pass") == 2)
+    pass4_count = sum(1 for e in accepted_edges if e.get("pass") == 4)
+
+    accepted_set = set(used_pairs.keys())
+    leftover = [
+        _public_edge(e, pass_n=-1, prefix="Candidate")
+        for e in sorted(candidate_edges, key=lambda x: -float(x["score"]))
+        if (int(e["from_idx"]), int(e["to_idx"])) not in accepted_set
+    ][:_CANDIDATE_TOP_K]
+    for e in leftover:
+        e.pop("pass", None)
+        e["reason"] = e.get("reason", "").split(": ", 1)[-1]
 
     stats = {
         "n_tracks_total": len(nodes),
@@ -728,7 +692,6 @@ def link_day_tracks(
         "n_multi_cam_persons": sum(1 for p in persons if p["n_cameras"] > 1),
         "n_solo_persons": sum(1 for p in persons if p["n_cameras"] == 1 and p["n_tracks"] == 1),
         "n_merges_total": len(accepted_edges),
-        "pass0_merges": pass0_count,
         "pass1_merges": pass1_count,
         "pass2_merges": pass2_count,
         "pass4_merges": pass4_count,
@@ -738,7 +701,7 @@ def link_day_tracks(
         "n_persons": len(persons),
         "persons": persons,
         "edges": accepted_edges,
-        "candidate_edges": candidate_edges,
+        "candidate_edges": leftover,
         "person_track_mapping": person_track_mapping,
         "stats": stats,
     }
@@ -752,18 +715,21 @@ def run_day_link(settings: Settings, target_day: str | None = None) -> None:
 
     day_clean = target_day or parse_day_input(str(settings.input_path))
     if not day_clean:
-        # Проверяем, может передана сессия или видео — извлекаем день из info.json
         from app.session.discover import resolve_sessions_for_input
         mode, sessions, _ = resolve_sessions_for_input(str(settings.input_path))
-        if sessions:
+        _ = mode
+        if sessions and sessions[0].day:
             day_clean = sessions[0].day.replace("-", "")
 
     if not day_clean:
-        raise ValueError(f"Не удалось определить день для day_link из '{settings.input_path}'. Укажите --day YYYYMMDD")
+        logger.warning(
+            "STAGE day_link: день не определён из '%s', пропуск",
+            settings.input_path,
+        )
+        return
 
     logger.info("=== STAGE day_link: глобальная склейка дня %s ===", day_clean)
 
-    # 1. Поиск всех сессий этого дня
     results_root = str(settings.json_output_dir or "data/results")
     sessions_for_day: list[str] = []
     if os.path.isdir(results_root):
@@ -782,16 +748,21 @@ def run_day_link(settings: Settings, target_day: str | None = None) -> None:
                     pass
 
     if not sessions_for_day:
-        raise ValueError(f"Нет обработанных сессий для дня {day_clean} в {results_root}")
+        logger.warning("STAGE day_link: нет обработанных сессий для дня %s в %s", day_clean, results_root)
+        return
 
     logger.info("STAGE day_link: найдено сессий за день %s: %s", day_clean, ", ".join(sessions_for_day))
 
-    # 2. Сбор треков по всем сессиям дня
+    reid_ctx = make_group_reid_context(settings)
+    if not reid_ctx.available:
+        logger.warning("STAGE day_link: ReID недоступен, пары без эмбеддингов не склеятся")
+
     all_nodes: list[dict[str, Any]] = []
     cameras_list: list[str] = []
     for sk in sessions_for_day:
         s_root = os.path.join(results_root, sk)
-        nodes = _extract_track_data(sk, s_root, settings)
+        reid_by_track = embed_session_tracks(s_root, settings, reid_ctx, session_key=sk)
+        nodes = _extract_track_data(sk, s_root, reid_by_track)
         if nodes:
             cam_name = nodes[0]["camera"]
             if cam_name not in cameras_list:
@@ -803,12 +774,15 @@ def run_day_link(settings: Settings, target_day: str | None = None) -> None:
         logger.warning("STAGE day_link: нет треков для объединения в день %s", day_clean)
         return
 
-    logger.info("STAGE day_link: всего %s треков по %s камерам (%s)", len(all_nodes), len(cameras_list), ", ".join(cameras_list))
+    logger.info(
+        "STAGE day_link: всего %s треков по %s камерам (%s)",
+        len(all_nodes),
+        len(cameras_list),
+        ", ".join(cameras_list),
+    )
 
-    # 3. Запуск межкамерного солвера дня
     result = link_day_tracks(all_nodes, settings)
 
-    # 4. Сохранение артефакта day_links.json
     out_dir = day_results_dir(settings, day_clean)
     os.makedirs(out_dir, exist_ok=True)
     out_json = day_links_json_path(settings, day_clean)
@@ -819,8 +793,7 @@ def run_day_link(settings: Settings, target_day: str | None = None) -> None:
         "day_clean": day_clean,
         "cameras": cameras_list,
         "sessions": sessions_for_day,
-        "solver": settings.day_link_solver,
-        "face_models": list(settings.day_link_face_models),
+        "solver": "hungarian",
         "n_persons": result["n_persons"],
         "persons": result["persons"],
         "edges": result["edges"],
@@ -833,11 +806,10 @@ def run_day_link(settings: Settings, target_day: str | None = None) -> None:
     save_debug_json(out_json, payload)
 
     logger.info(
-        "STAGE day_link: готово! Персон=%s (мультикамерных=%s), склеек=%s (Pass0=%s, Pass1=%s, Pass2=%s, Pass4=%s) → %s",
+        "STAGE day_link: готово! Персон=%s (мультикамерных=%s), склеек=%s (Pass1=%s, Pass2=%s, Pass4=%s) → %s",
         result["stats"]["n_persons"],
         result["stats"]["n_multi_cam_persons"],
         result["stats"]["n_merges_total"],
-        result["stats"]["pass0_merges"],
         result["stats"]["pass1_merges"],
         result["stats"]["pass2_merges"],
         result["stats"]["pass4_merges"],

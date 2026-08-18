@@ -572,12 +572,9 @@ def run(settings: Settings) -> None:
 
     # Выполнение глобальных стадий дня (day_link)
     if "day_link" in day_stages:
-        if mode == "day" and sessions:
-            day_str = sessions[0].day.replace("-", "")
-            run_day_link(settings, target_day=day_str)
-        elif mode == "session" and sessions:
+        if mode in ("day", "session") and sessions and sessions[0].day:
             day_str = sessions[0].day.replace("-", "")
             run_day_link(settings, target_day=day_str)
         else:
-            run_day_link(settings)
+            logger.info("STAGE day_link: пропуск (нет дня/сессии)")
 

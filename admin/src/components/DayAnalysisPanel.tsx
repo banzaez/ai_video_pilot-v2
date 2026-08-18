@@ -1,8 +1,13 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { colorForTrackId, fetchTrackingJson, formatDuration } from "../utils";
 import { TrackingPlayer, type TrackingPlayerHandle } from "./TrackingPlayer";
 import type { MediaSession } from "../session";
 import type { TrackingData } from "../types";
+
+export interface CropRef {
+  session_key: string;
+  file: string;
+}
 
 export interface DayTrack {
   uid: string;
@@ -15,9 +20,7 @@ export interface DayTrack {
   p0: [number, number] | null;
   p1: [number, number] | null;
   n_frames: number;
-  has_face: boolean;
   has_reid: boolean;
-  best_face_score: number;
   crops: string[];
 }
 
@@ -33,11 +36,9 @@ export interface DayTransitionEdge {
   is_same_camera: boolean;
   is_overlap: boolean;
   score: number;
-  face?: number | null;
-  face_scores?: Record<string, number> | null;
-  pose_face?: number | null;
   reid?: number | null;
   motion: number;
+  size?: number | null;
   dist_m: number;
   gap_sec: number;
   speed_mps: number;
@@ -55,8 +56,8 @@ export interface GlobalPerson {
   n_cameras: number;
   n_transitions: number;
   cameras: string[];
-  best_face_crop: string | null;
-  face_crops: string[];
+  best_crop: string | CropRef | null;
+  crops: Array<string | CropRef>;
   tracks: DayTrack[];
 }
 
@@ -69,7 +70,6 @@ export interface DayLinksData {
   camera_sessions?: Array<MediaSession & { t0_abs?: number }>;
   track_to_person?: Record<string, Record<number, number>>;
   solver?: string;
-  face_models?: string[];
   n_persons: number;
   persons: GlobalPerson[];
   edges: DayTransitionEdge[];
@@ -96,9 +96,31 @@ export interface DaySummaryItem {
   stats?: DayLinksData["stats"];
 }
 
-type FilterMode = "all" | "multi_cam" | "with_face" | "pass0" | "pass1" | "pass2" | "pass4" | "solo";
+type FilterMode = "all" | "multi_cam" | "pass1" | "pass2" | "pass4" | "solo";
 type SortMode = "person_id" | "tracks" | "span" | "time";
 type RightTab = "edges" | "tracks" | "inspector";
+type TimeBounds = { minT: number; maxT: number; span: number };
+type DayCameraSession = MediaSession & { t0_abs?: number };
+
+const trackingCache = new Map<string, Record<string, TrackingData>>();
+const UI_HZ_MS = 100;
+
+function groupCropUrl(sessionKey: string, file: string): string {
+  return `/api/group_crop/${encodeURIComponent(sessionKey)}/${encodeURIComponent(file)}`;
+}
+
+function cropSrc(crop: string | CropRef | null | undefined, sessionKey?: string): string | null {
+  if (!crop) return null;
+  if (typeof crop === "string") {
+    if (crop.startsWith("/")) return crop;
+    if (crop.includes("/") && !sessionKey) {
+      const slash = crop.indexOf("/");
+      return groupCropUrl(crop.slice(0, slash), crop.slice(slash + 1));
+    }
+    return sessionKey ? groupCropUrl(sessionKey, crop) : crop;
+  }
+  return groupCropUrl(crop.session_key, crop.file);
+}
 
 function formatSecToTimeOfDay(sec: number): string {
   const s = Math.floor(sec) % 86400;
@@ -122,207 +144,791 @@ function formatScore(v: number | null | undefined): string {
   return v.toFixed(2);
 }
 
-function badgeClass(score: number): string {
-  if (score >= 0.85) return "badge-score high";
-  if (score >= 0.70) return "badge-score mid";
-  return "badge-score low";
+function scoreClass(score: number): string {
+  if (score >= 0.85) return "day-score high";
+  if (score >= 0.7) return "day-score mid";
+  return "day-score low";
 }
 
 function passBadge(pass?: number) {
   switch (pass) {
     case 0:
-      return <span className="pass-pill pass0">Pass 0 · Direct</span>;
+      return <span className="pass-pill pass0">Pass 0</span>;
     case 1:
-      return <span className="pass-pill pass1">Pass 1 · Hungarian</span>;
+      return <span className="pass-pill pass1">Pass 1</span>;
     case 2:
-      return <span className="pass-pill pass2">Pass 2 · Chain</span>;
+      return <span className="pass-pill pass2">Pass 2</span>;
     case 4:
-      return <span className="pass-pill pass4">Pass 4 · Handover</span>;
+      return <span className="pass-pill pass4">Pass 4</span>;
     default:
-      return <span className="pass-pill pass-other">Link</span>;
+      return <span className="pass-pill">Link</span>;
   }
 }
+
+function cameraShort(name: string): string {
+  return name.replace(/^Camera_0?/, "C");
+}
+
+function CropThumb({
+  crop,
+  sessionKey,
+  color,
+  label,
+  className,
+}: {
+  crop: string | CropRef | null | undefined;
+  sessionKey?: string;
+  color: string;
+  label: string;
+  className?: string;
+}) {
+  const src = cropSrc(crop, sessionKey);
+  return (
+    <div className={`day-crop ${className ?? ""}`} style={{ borderColor: color }}>
+      {src ? (
+        <img src={src} alt={label} loading="lazy" />
+      ) : (
+        <div className="day-crop-fallback" style={{ background: color }}>
+          {label}
+        </div>
+      )}
+      <span className="day-crop-id">{label}</span>
+    </div>
+  );
+}
+
+const DayPersonList = memo(function DayPersonList({
+  persons,
+  counts,
+  filterMode,
+  sortMode,
+  searchQuery,
+  selectedPersonId,
+  onFilter,
+  onSort,
+  onSearch,
+  onSelect,
+}: {
+  persons: GlobalPerson[];
+  counts: { all: number; multi: number; solo: number };
+  filterMode: FilterMode;
+  sortMode: SortMode;
+  searchQuery: string;
+  selectedPersonId: number | null;
+  onFilter: (mode: FilterMode) => void;
+  onSort: (mode: SortMode) => void;
+  onSearch: (q: string) => void;
+  onSelect: (person: GlobalPerson) => void;
+}) {
+  return (
+    <section className="day-list" aria-label="Список персон">
+      <input
+        type="search"
+        className="day-search"
+        placeholder="Поиск по ID, треку, камере…"
+        value={searchQuery}
+        onChange={(e) => onSearch(e.target.value)}
+      />
+      <div className="day-filters">
+        <button type="button" className={filterMode === "all" ? "on" : ""} onClick={() => onFilter("all")}>
+          Все ({counts.all})
+        </button>
+        <button type="button" className={filterMode === "multi_cam" ? "on" : ""} onClick={() => onFilter("multi_cam")}>
+          Мультикам ({counts.multi})
+        </button>
+        <button type="button" className={filterMode === "pass1" ? "on" : ""} onClick={() => onFilter("pass1")}>
+          Pass 1
+        </button>
+        <button type="button" className={filterMode === "pass2" ? "on" : ""} onClick={() => onFilter("pass2")}>
+          Pass 2
+        </button>
+        <button type="button" className={filterMode === "pass4" ? "on" : ""} onClick={() => onFilter("pass4")}>
+          Pass 4
+        </button>
+        <button type="button" className={filterMode === "solo" ? "on" : ""} onClick={() => onFilter("solo")}>
+          Соло ({counts.solo})
+        </button>
+      </div>
+      <div className="day-sort">
+        <span>Сортировка</span>
+        <select value={sortMode} onChange={(e) => onSort(e.target.value as SortMode)}>
+          <option value="person_id">По ID</option>
+          <option value="tracks">По трекам</option>
+          <option value="span">По длительности</option>
+          <option value="time">По времени</option>
+        </select>
+      </div>
+      {persons.length === 0 ? (
+        <p className="day-empty">Нет персон по текущему фильтру.</p>
+      ) : (
+        <ul className="day-rows">
+          {persons.map((p) => {
+            const isSelected = p.person_id === selectedPersonId;
+            const pColor = colorForTrackId(p.person_id);
+            return (
+              <li key={p.person_id}>
+                <button
+                  type="button"
+                  className={`day-row ${isSelected ? "on" : ""}`}
+                  onClick={() => onSelect(p)}
+                >
+                  <CropThumb crop={p.best_crop} color={pColor} label={`#${p.person_id}`} />
+                  <div className="day-row-body">
+                    <div className="day-row-head">
+                      <div className="day-row-title">
+                        <strong>{p.label}</strong>
+                        {p.n_cameras > 1 && <span className="day-tag">{p.n_cameras} кам.</span>}
+                      </div>
+                      <span className={scoreClass(p.best_crop ? 0.9 : 0.7)}>{p.tracks.length} тр.</span>
+                    </div>
+                    <div className="day-row-meta">
+                      <span>
+                        {formatShortTime(p.t0)}–{formatShortTime(p.t1)}
+                      </span>
+                      <span>{formatDuration(p.duration_sec)}</span>
+                    </div>
+                    <div className="day-row-route">{p.cameras.join(" → ")}</div>
+                    <div className="day-row-ids">
+                      {p.tracks.map((t) => (
+                        <span key={t.uid} style={{ borderLeft: `2px solid ${colorForTrackId(t.track_id)}`, paddingLeft: 4 }}>
+                          {cameraShort(t.camera)} #{t.track_id}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                </button>
+              </li>
+            );
+          })}
+        </ul>
+      )}
+    </section>
+  );
+});
+
+const DayInspector = memo(function DayInspector({
+  person,
+  edges,
+  selectedEdge,
+  rightTab,
+  onTab,
+  onSelectEdge,
+  onSeek,
+}: {
+  person: GlobalPerson | null;
+  edges: DayTransitionEdge[];
+  selectedEdge: DayTransitionEdge | null;
+  rightTab: RightTab;
+  onTab: (tab: RightTab) => void;
+  onSelectEdge: (edge: DayTransitionEdge) => void;
+  onSeek: (sec: number) => void;
+}) {
+  if (!person) {
+    return (
+      <section className="day-inspect" aria-label="Инспектор персоны">
+        <p className="day-empty">Выберите персону в списке или на таймлайне.</p>
+      </section>
+    );
+  }
+
+  const pColor = colorForTrackId(person.person_id);
+  const crops = person.crops ?? [];
+
+  return (
+    <section className="day-inspect" aria-label="Инспектор персоны">
+      <div className="day-inspect-stack">
+        <div className="day-person-card">
+          <CropThumb crop={person.best_crop} color={pColor} label={`#${person.person_id}`} />
+          <div className="day-person-meta">
+            <div className="day-person-meta-top">
+              <strong>{person.label}</strong>
+              <span className="day-score high">{person.n_tracks} треков</span>
+            </div>
+            <div className="day-row-meta">
+              {formatShortTime(person.t0)}–{formatShortTime(person.t1)} ({formatDuration(person.duration_sec)})
+            </div>
+            <div className="day-row-route">{person.cameras.join(" → ")}</div>
+          </div>
+        </div>
+
+        {crops.length > 0 && (
+          <div>
+            <div className="day-gallery-label">Кропы тела</div>
+            <div className="day-gallery">
+              {crops.map((crop, i) => {
+                const src = cropSrc(crop);
+                if (!src) return null;
+                return (
+                  <a key={i} href={src} target="_blank" rel="noreferrer">
+                    <img src={src} alt="" />
+                  </a>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
+        <div className="day-tabs">
+          <button type="button" className={rightTab === "edges" ? "on" : ""} onClick={() => onTab("edges")}>
+            Склейки ({edges.length})
+          </button>
+          <button type="button" className={rightTab === "tracks" ? "on" : ""} onClick={() => onTab("tracks")}>
+            Треки ({person.tracks.length})
+          </button>
+          {selectedEdge && (
+            <button type="button" className={rightTab === "inspector" ? "on" : ""} onClick={() => onTab("inspector")}>
+              Пара
+            </button>
+          )}
+        </div>
+
+        {rightTab === "edges" && (
+          <div className="day-inspect-stack">
+            {edges.length === 0 ? (
+              <p className="day-empty">Один трек — межкамерных склеек нет.</p>
+            ) : (
+              edges.map((edge) => {
+                const on = selectedEdge?.from === edge.from && selectedEdge?.to === edge.to;
+                return (
+                  <div
+                    key={`${edge.from}->${edge.to}`}
+                    className={`day-edge ${on ? "on" : ""}`}
+                    onClick={() => onSelectEdge(edge)}
+                  >
+                    <div className="day-edge-head">
+                      <div className="day-edge-title">
+                        {cameraShort(edge.from_camera)} #{edge.from_track} → {cameraShort(edge.to_camera)} #{edge.to_track}
+                      </div>
+                      {passBadge(edge.pass)}
+                    </div>
+                    <div className="day-edge-metrics">
+                      <span className={scoreClass(edge.score)}>Скор {formatScore(edge.score)}</span>
+                      {edge.reid != null && <span className="pass-pill">ReID {formatScore(edge.reid)}</span>}
+                      <span className="pass-pill">Motion {formatScore(edge.motion)}</span>
+                      <span className="pass-pill">Δt {edge.gap_sec.toFixed(1)}с</span>
+                    </div>
+                    <div className="day-edge-reason">{edge.reason}</div>
+                  </div>
+                );
+              })
+            )}
+          </div>
+        )}
+
+        {rightTab === "inspector" && selectedEdge && (
+          <div className="day-inspect-stack">
+            <div className="day-edge-head">
+              <strong>
+                {cameraShort(selectedEdge.from_camera)} #{selectedEdge.from_track} → {cameraShort(selectedEdge.to_camera)} #
+                {selectedEdge.to_track}
+              </strong>
+              {passBadge(selectedEdge.pass)}
+            </div>
+            <div className="day-pair">
+              {(["from", "to"] as const).map((side) => {
+                const tr = person.tracks.find((t) => t.uid === (side === "from" ? selectedEdge.from : selectedEdge.to));
+                const isFrom = side === "from";
+                return (
+                  <div
+                    key={side}
+                    className="day-pair-col"
+                    onClick={() => {
+                      if (tr) onSeek(isFrom ? tr.t1 : tr.t0);
+                    }}
+                    title={isFrom ? "К точке выхода" : "К точке входа"}
+                  >
+                    <strong>
+                      {isFrom ? "До" : "После"} {cameraShort(isFrom ? selectedEdge.from_camera : selectedEdge.to_camera)} #
+                      {isFrom ? selectedEdge.from_track : selectedEdge.to_track}
+                    </strong>
+                    {tr?.crops[0] && cropSrc(tr.crops[0], tr.session_key) && (
+                      <img src={cropSrc(tr.crops[0], tr.session_key)!} alt="" />
+                    )}
+                    <p>{isFrom ? "Конец" : "Старт"}: {formatShortTime(isFrom ? tr?.t1 ?? 0 : tr?.t0 ?? 0)}</p>
+                    <p>
+                      Точка:{" "}
+                      {isFrom
+                        ? tr?.p1
+                          ? `(${tr.p1[0].toFixed(0)}, ${tr.p1[1].toFixed(0)})`
+                          : "—"
+                        : tr?.p0
+                          ? `(${tr.p0[0].toFixed(0)}, ${tr.p0[1].toFixed(0)})`
+                          : "—"}
+                    </p>
+                  </div>
+                );
+              })}
+            </div>
+            <table className="day-metrics">
+              <tbody>
+                <tr>
+                  <td>Скор</td>
+                  <td>
+                    <span className={scoreClass(selectedEdge.score)}>{formatScore(selectedEdge.score)}</span>
+                  </td>
+                </tr>
+                <tr>
+                  <td>ReID</td>
+                  <td>
+                    <strong>{formatScore(selectedEdge.reid)}</strong>
+                  </td>
+                </tr>
+                <tr>
+                  <td>Motion</td>
+                  <td>
+                    <strong>{formatScore(selectedEdge.motion)}</strong>
+                  </td>
+                </tr>
+                <tr>
+                  <td>Δd</td>
+                  <td>
+                    <strong>{selectedEdge.dist_m.toFixed(2)} м</strong>
+                  </td>
+                </tr>
+                <tr>
+                  <td>Δt</td>
+                  <td>
+                    <strong>{selectedEdge.gap_sec.toFixed(2)} с</strong>
+                  </td>
+                </tr>
+                <tr>
+                  <td>Солвер</td>
+                  <td className="day-muted">{selectedEdge.reason}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        {rightTab === "tracks" && (
+          <table className="day-metrics">
+            <thead>
+              <tr>
+                <th>Камера</th>
+                <th>ID</th>
+                <th>Интервал</th>
+                <th>Кадров</th>
+                <th>ReID</th>
+              </tr>
+            </thead>
+            <tbody>
+              {person.tracks.map((t) => (
+                <tr key={t.uid} onClick={() => onSeek(t.t0)} title="К началу трека">
+                  <td>
+                    <strong>{t.camera}</strong>
+                  </td>
+                  <td>#{t.track_id}</td>
+                  <td>
+                    {formatShortTime(t.t0)}–{formatShortTime(t.t1)}
+                  </td>
+                  <td>{t.n_frames}</td>
+                  <td>{t.has_reid ? "да" : "—"}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+    </section>
+  );
+});
+
+const DayTimeline = memo(function DayTimeline({
+  cameras,
+  persons,
+  selectedPersonId,
+  timeBounds,
+  zoom,
+  currentDaySec,
+  onSeek,
+  onSelectPerson,
+  onScrubbing,
+}: {
+  cameras: DayCameraSession[];
+  persons: GlobalPerson[];
+  selectedPersonId: number | null;
+  timeBounds: TimeBounds;
+  zoom: number;
+  currentDaySec: number;
+  onSeek: (sec: number) => void;
+  onSelectPerson: (id: number, t0: number) => void;
+  onScrubbing?: (active: boolean) => void;
+}) {
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const shellRef = useRef<HTMLDivElement>(null);
+  const plotRef = useRef<HTMLDivElement>(null);
+  const dragging = useRef(false);
+  const downPos = useRef({ x: 0, y: 0 });
+  const barHit = useRef<{ id: number; t0: number } | null>(null);
+
+  const seekFromClientX = useCallback(
+    (clientX: number) => {
+      const plot = plotRef.current;
+      if (!plot) return;
+      const rect = plot.getBoundingClientRect();
+      const pct = Math.max(0, Math.min(1, (clientX - rect.left) / Math.max(1, rect.width)));
+      onSeek(timeBounds.minT + pct * timeBounds.span);
+    },
+    [onSeek, timeBounds.minT, timeBounds.span],
+  );
+
+  const endDrag = useCallback(
+    (e: ReactPointerEvent<HTMLDivElement>) => {
+      if (!dragging.current) return;
+      dragging.current = false;
+      onScrubbing?.(false);
+      e.currentTarget.classList.remove("is-dragging");
+      if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+        e.currentTarget.releasePointerCapture(e.pointerId);
+      }
+      const dx = Math.abs(e.clientX - downPos.current.x);
+      const dy = Math.abs(e.clientY - downPos.current.y);
+      if (dx < 5 && dy < 5 && barHit.current) {
+        onSelectPerson(barHit.current.id, barHit.current.t0);
+      } else {
+        seekFromClientX(e.clientX);
+      }
+      barHit.current = null;
+    },
+    [onSelectPerson, onScrubbing, seekFromClientX],
+  );
+
+  useEffect(() => {
+    if (dragging.current) return;
+    const scroller = scrollRef.current;
+    const plot = plotRef.current;
+    if (!scroller || !plot || timeBounds.span <= 0) return;
+    const pct = (currentDaySec - timeBounds.minT) / timeBounds.span;
+    const plotRect = plot.getBoundingClientRect();
+    const scrollRect = scroller.getBoundingClientRect();
+    const x = plotRect.left - scrollRect.left + scroller.scrollLeft + pct * plot.offsetWidth;
+    const view = scroller.clientWidth;
+    const sl = scroller.scrollLeft;
+    if (x < sl + 48 || x > sl + view - 48) {
+      scroller.scrollLeft = Math.max(0, x - view * 0.45);
+    }
+  }, [currentDaySec, zoom, timeBounds.minT, timeBounds.span]);
+
+  const playheadPct = timeBounds.span > 0 ? ((currentDaySec - timeBounds.minT) / timeBounds.span) * 100 : 0;
+
+  return (
+    <div className="day-timeline-scroll" ref={scrollRef}>
+      <div
+        ref={shellRef}
+        className="day-timeline-inner"
+        style={{ width: `${Math.max(100, 100 * zoom)}%` }}
+        onPointerDown={(e) => {
+          if (e.button !== 0) return;
+          e.preventDefault();
+          e.currentTarget.setPointerCapture(e.pointerId);
+          e.currentTarget.classList.add("is-dragging");
+          dragging.current = true;
+          onScrubbing?.(true);
+          downPos.current = { x: e.clientX, y: e.clientY };
+          const bar = (e.target as HTMLElement).closest(".day-bar") as HTMLElement | null;
+          const pid = bar?.dataset.personId;
+          const t0 = bar?.dataset.t0;
+          barHit.current = pid != null && t0 != null ? { id: Number(pid), t0: Number(t0) } : null;
+          seekFromClientX(e.clientX);
+        }}
+        onPointerMove={(e) => {
+          if (!dragging.current) return;
+          e.preventDefault();
+          seekFromClientX(e.clientX);
+        }}
+        onPointerUp={endDrag}
+        onPointerCancel={endDrag}
+        onDragStart={(e) => e.preventDefault()}
+      >
+        <div className="day-axis-row">
+          <div className="day-lane-label" aria-hidden />
+          <div className="day-axis" ref={plotRef}>
+            {Array.from({ length: 11 }).map((_, i) => {
+              const frac = i / 10;
+              const t = timeBounds.minT + frac * timeBounds.span;
+              return (
+                <div key={i} className="day-axis-tick" style={{ left: `${frac * 100}%` }}>
+                  <i />
+                  {formatShortTime(t)}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+        <div className="day-playhead-layer" aria-hidden>
+          <div className="day-lane-label" />
+          <div className="day-playhead-track">
+            <div className="day-playhead" style={{ left: `${playheadPct}%` }} />
+          </div>
+        </div>
+        <div className="day-lanes">
+          {cameras.map((sess) => {
+            const hasSel =
+              selectedPersonId != null &&
+              persons.some(
+                (p) => p.person_id === selectedPersonId && p.tracks.some((t) => t.camera === sess.camera),
+              );
+            return (
+              <div key={sess.key} className={`day-lane ${hasSel ? "has-sel" : ""}`}>
+                <div className="day-lane-label">{sess.camera}</div>
+                <div className="day-lane-track">
+                  {persons.map((person) => {
+                    const selected = person.person_id === selectedPersonId;
+                    const noFocus = selectedPersonId == null;
+                    return person.tracks
+                      .filter((t) => t.camera === sess.camera)
+                      .map((t) => {
+                        const leftPct = ((t.t0 - timeBounds.minT) / timeBounds.span) * 100;
+                        const widthPct = Math.max(0.45, ((t.t1 - t.t0) / timeBounds.span) * 100);
+                        return (
+                          <div
+                            key={t.uid}
+                            role="button"
+                            tabIndex={-1}
+                            data-person-id={person.person_id}
+                            data-t0={t.t0}
+                            className={`day-bar ${noFocus ? "" : selected ? "on" : "dim"}`}
+                            style={{
+                              left: `${leftPct}%`,
+                              width: `${widthPct}%`,
+                              background: colorForTrackId(t.track_id),
+                            }}
+                            title={`${person.label} (${sess.camera} #${t.track_id}) ${formatShortTime(t.t0)}–${formatShortTime(t.t1)}`}
+                          >
+                            {selected && !noFocus ? `T${t.track_id}` : ""}
+                          </div>
+                        );
+                      });
+                  })}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+});
 
 export function DayAnalysisPanel({ selectedDay }: { selectedDay: string }) {
   const [dayData, setDayData] = useState<DayLinksData | null>(null);
   const [loading, setLoading] = useState(false);
   const [runningSolver, setRunningSolver] = useState(false);
   const [error, setError] = useState<string | null>(null);
-
-  // Детекции tracking.json по каждой сессии
   const [cameraTracking, setCameraTracking] = useState<Record<string, TrackingData>>({});
 
-  // Фильтры и выбор персоны
-  const [filterMode, setFilterMode] = useState<FilterMode>("all");
+  const [filterMode, setFilterMode] = useState<FilterMode>("multi_cam");
   const [sortMode, setSortMode] = useState<SortMode>("person_id");
   const [searchQuery, setSearchQuery] = useState("");
   const [selectedPersonId, setSelectedPersonId] = useState<number | null>(null);
   const [selectedEdge, setSelectedEdge] = useState<DayTransitionEdge | null>(null);
   const [rightTab, setRightTab] = useState<RightTab>("edges");
 
-  // Мастер-таймлайн и управление воспроизведением
-  const [currentDaySec, setCurrentDaySec] = useState<number>(0);
-  const [isPlaying, setIsPlaying] = useState<boolean>(false);
-  const [playbackSpeed, setPlaybackSpeed] = useState<number>(1.0);
-  const [zoom, setZoom] = useState<number>(1.0);
+  const [currentDaySec, setCurrentDaySec] = useState(0);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [playbackSpeed, setPlaybackSpeed] = useState(1);
+  const [zoom, setZoom] = useState(1);
 
-  const timelineContainerRef = useRef<HTMLDivElement>(null);
   const playerRefs = useRef<Record<string, TrackingPlayerHandle | null>>({});
-  const videoRefs = useRef<Record<string, HTMLVideoElement | null>>({});
+  const currentDaySecRef = useRef(0);
+  const isPlayingRef = useRef(false);
+  const scrubbingRef = useRef(false);
+  const playbackSpeedRef = useRef(1);
+  const timeBoundsRef = useRef<TimeBounds>({ minT: 0, maxT: 300, span: 300 });
+  const seekToDaySecRef = useRef<(sec: number, playAfter?: boolean) => void>(() => {});
+  const syncPlayersRef = useRef<(t: number, play?: boolean) => void>(() => {});
 
-  // Границы времени дня
-  const timeBounds = useMemo(() => {
-    if (!dayData?.persons || dayData.persons.length === 0) {
-      return { minT: 0, maxT: 300, span: 300 };
-    }
+  const timeBounds = useMemo((): TimeBounds => {
+    if (!dayData?.persons?.length) return { minT: 0, maxT: 300, span: 300 };
     let minT = Infinity;
     let maxT = -Infinity;
     for (const p of dayData.persons) {
-      if (p.t0 < minT) minT = p.t0;
-      if (p.t1 > maxT) maxT = p.t1;
+      if (p.tracks?.length) {
+        for (const t of p.tracks) {
+          if (t.t0 < minT) minT = t.t0;
+          if (t.t1 > maxT) maxT = t.t1;
+        }
+      } else {
+        if (p.t0 < minT) minT = p.t0;
+        if (p.t1 > maxT) maxT = p.t1;
+      }
     }
     if (!Number.isFinite(minT)) minT = 0;
     if (!Number.isFinite(maxT) || maxT <= minT) maxT = minT + 300;
-    return { minT, maxT, span: Math.max(1, maxT - minT) };
+    return { minT, maxT, span: Math.max(1e-6, maxT - minT) };
   }, [dayData?.persons]);
 
-  // Загрузка метаданных дня и tracking.json по камерам
+  timeBoundsRef.current = timeBounds;
+  isPlayingRef.current = isPlaying;
+  playbackSpeedRef.current = playbackSpeed;
+
   useEffect(() => {
     if (!selectedDay) return;
-    let isCancelled = false;
+    let cancelled = false;
 
-    const loadDayMeta = async () => {
+    const load = async () => {
       try {
         setLoading(true);
         setError(null);
         const res = await fetch(`/api/day/meta?day=${encodeURIComponent(selectedDay)}`);
         const json = (await res.json()) as DayLinksData;
-        if (isCancelled) return;
-
+        if (cancelled) return;
         setDayData(json);
-        if (json.persons && json.persons.length > 0) {
-          setSelectedPersonId(json.persons[0].person_id);
-          setCurrentDaySec(json.persons[0].t0);
+        if (json.persons?.length) {
+          const multi = json.persons.find((p) => p.n_cameras > 1);
+          setFilterMode(multi ? "multi_cam" : "all");
+          const first = multi ?? json.persons[0]!;
+          setSelectedPersonId(first.person_id);
+          setCurrentDaySec(first.t0);
+          currentDaySecRef.current = first.t0;
         } else {
           setSelectedPersonId(null);
           setCurrentDaySec(0);
+          currentDaySecRef.current = 0;
         }
         setSelectedEdge(null);
         setIsPlaying(false);
 
-        // Загрузка tracking.json для каждой сессии дня через fetchTrackingJson
-        if (json.camera_sessions && json.camera_sessions.length > 0) {
-          const loadedTracks: Record<string, TrackingData> = {};
+        const cached = trackingCache.get(selectedDay);
+        if (cached) {
+          setCameraTracking(cached);
+        } else if (json.camera_sessions?.length) {
+          const loaded: Record<string, TrackingData> = {};
           await Promise.all(
             json.camera_sessions.map(async (sess) => {
-              if (sess.jsonUrl) {
-                try {
-                  const trData = await fetchTrackingJson(sess.jsonUrl);
-                  loadedTracks[sess.key] = trData;
-                } catch {
-                  // Игнорируем отсутствие трекинга
-                }
+              if (!sess.jsonUrl) return;
+              try {
+                loaded[sess.key] = await fetchTrackingJson(sess.jsonUrl);
+              } catch {
+                /* нет tracking.json */
               }
             }),
           );
-          if (!isCancelled) {
-            setCameraTracking(loadedTracks);
+          if (!cancelled) {
+            trackingCache.set(selectedDay, loaded);
+            setCameraTracking(loaded);
           }
         }
       } catch (e) {
-        if (!isCancelled) setError(`Ошибка загрузки дня ${selectedDay}: ${e}`);
+        if (!cancelled) setError(`Ошибка загрузки дня ${selectedDay}: ${e}`);
       } finally {
-        if (!isCancelled) setLoading(false);
+        if (!cancelled) setLoading(false);
       }
     };
 
-    loadDayMeta();
+    void load();
     return () => {
-      isCancelled = true;
+      cancelled = true;
     };
   }, [selectedDay]);
 
-  // Синхронизация всех плееров при смене currentDaySec или isPlaying
-  const syncPlayersToTime = useCallback(
-    (tDay: number, playAfter = false) => {
-      if (!dayData?.camera_sessions) return;
-      for (const sess of dayData.camera_sessions) {
-        const t0_abs = sess.t0_abs ?? timeBounds.minT;
-        const tLocal = Math.max(0, tDay - t0_abs);
-        const handle = playerRefs.current[sess.key];
-        if (handle) {
-          handle.seekToGlobal(tLocal, playAfter);
-        }
+  const syncPlayersToTime = useCallback((tDay: number, playAfter = false) => {
+    const sessions = dayData?.camera_sessions;
+    if (!sessions) return;
+    const minT = timeBoundsRef.current.minT;
+    for (const sess of sessions) {
+      const handle = playerRefs.current[sess.key];
+      if (!handle) continue;
+      const t0Abs = sess.t0_abs ?? minT;
+      const duration = sess.duration_sec ?? 300;
+      if (tDay < t0Abs || tDay > t0Abs + duration) {
+        handle.pause();
+        continue;
       }
-    },
-    [dayData?.camera_sessions, timeBounds.minT],
-  );
+      handle.setPlaybackRate(playbackSpeedRef.current);
+      if (!playAfter) handle.pause();
+      handle.seekToGlobal(Math.max(0, tDay - t0Abs), playAfter);
+    }
+  }, [dayData?.camera_sessions]);
 
   const seekToDaySec = useCallback(
     (targetSec: number, playAfter?: boolean) => {
-      const clamped = Math.max(timeBounds.minT, Math.min(timeBounds.maxT, targetSec));
+      const { minT, maxT } = timeBoundsRef.current;
+      const clamped = Math.max(minT, Math.min(maxT, targetSec));
+      currentDaySecRef.current = clamped;
       setCurrentDaySec(clamped);
-      syncPlayersToTime(clamped, playAfter ?? isPlaying);
+      syncPlayersToTime(clamped, playAfter ?? isPlayingRef.current);
     },
-    [timeBounds.minT, timeBounds.maxT, syncPlayersToTime, isPlaying],
+    [syncPlayersToTime],
   );
 
-  // Мастер RAF цикл воспроизведения
+  seekToDaySecRef.current = seekToDaySec;
+  syncPlayersRef.current = syncPlayersToTime;
+
+  useEffect(() => {
+    if (!isPlaying) return;
+    const id = window.setInterval(() => {
+      if (scrubbingRef.current) return;
+      syncPlayersRef.current(currentDaySecRef.current, true);
+    }, 1000);
+    return () => window.clearInterval(id);
+  }, [isPlaying]);
+
+  useEffect(() => {
+    if (!isPlaying) return;
+    for (const handle of Object.values(playerRefs.current)) {
+      handle?.setPlaybackRate(playbackSpeed);
+    }
+  }, [isPlaying, playbackSpeed]);
+
   useEffect(() => {
     if (!isPlaying) return;
     let animId = 0;
     let lastTs = performance.now();
+    let lastUi = 0;
 
     const loop = (now: number) => {
-      const dt = ((now - lastTs) / 1000) * playbackSpeed;
+      if (scrubbingRef.current) {
+        lastTs = now;
+        animId = requestAnimationFrame(loop);
+        return;
+      }
+      const dt = ((now - lastTs) / 1000) * playbackSpeedRef.current;
       lastTs = now;
-
-      setCurrentDaySec((prev) => {
-        const next = prev + dt;
-        if (next >= timeBounds.maxT) {
-          setIsPlaying(false);
-          syncPlayersToTime(timeBounds.maxT, false);
-          return timeBounds.maxT;
-        }
-        return next;
-      });
-
+      const bounds = timeBoundsRef.current;
+      let next = currentDaySecRef.current + dt;
+      if (next >= bounds.maxT) {
+        next = bounds.maxT;
+        currentDaySecRef.current = next;
+        setCurrentDaySec(next);
+        setIsPlaying(false);
+        syncPlayersRef.current(next, false);
+        return;
+      }
+      currentDaySecRef.current = next;
+      if (now - lastUi >= UI_HZ_MS) {
+        lastUi = now;
+        setCurrentDaySec(next);
+      }
       animId = requestAnimationFrame(loop);
     };
 
     animId = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(animId);
-  }, [isPlaying, playbackSpeed, timeBounds.maxT, syncPlayersToTime]);
+  }, [isPlaying]);
 
-  // Горячие клавиши (Space, Arrows)
   useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      // Игнорируем если фокус в инпуте
+    const onKey = (e: KeyboardEvent) => {
       if (["INPUT", "TEXTAREA", "SELECT"].includes((e.target as HTMLElement)?.tagName)) return;
-
       if (e.code === "Space") {
         e.preventDefault();
         setIsPlaying((p) => {
           const next = !p;
-          syncPlayersToTime(currentDaySec, next);
+          syncPlayersRef.current(currentDaySecRef.current, next);
           return next;
         });
       } else if (e.code === "ArrowLeft") {
         e.preventDefault();
-        const step = e.shiftKey ? 1.0 : 1 / 25;
-        seekToDaySec(currentDaySec - step);
+        seekToDaySecRef.current(currentDaySecRef.current - (e.shiftKey ? 1 : 1 / 25));
       } else if (e.code === "ArrowRight") {
         e.preventDefault();
-        const step = e.shiftKey ? 1.0 : 1 / 25;
-        seekToDaySec(currentDaySec + step);
+        seekToDaySecRef.current(currentDaySecRef.current + (e.shiftKey ? 1 : 1 / 25));
       }
     };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
 
-    window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [currentDaySec, seekToDaySec, syncPlayersToTime]);
-
-  // Запуск склейки дня
   const handleRunDayLink = async () => {
     if (!selectedDay || runningSolver) return;
     try {
@@ -337,6 +943,7 @@ export function DayAnalysisPanel({ selectedDay }: { selectedDay: string }) {
       if (!json.success) {
         setError(`Склейка дня завершилась с ошибкой: ${json.output || json.error}`);
       } else {
+        trackingCache.delete(selectedDay);
         const metaRes = await fetch(`/api/day/meta?day=${encodeURIComponent(selectedDay)}`);
         const metaJson = (await metaRes.json()) as DayLinksData;
         setDayData(metaJson);
@@ -348,1077 +955,337 @@ export function DayAnalysisPanel({ selectedDay }: { selectedDay: string }) {
     }
   };
 
-  // Выбранная персона
   const selectedPerson = useMemo(() => {
     if (!dayData?.persons || selectedPersonId == null) return null;
     return dayData.persons.find((p) => p.person_id === selectedPersonId) || null;
   }, [dayData?.persons, selectedPersonId]);
 
-  // Ребра склеек выбранной персоны
   const personEdges = useMemo(() => {
     if (!selectedPerson || !dayData?.edges) return [];
     const uids = new Set(selectedPerson.tracks.map((t) => t.uid));
     return dayData.edges.filter((e) => uids.has(e.from) && uids.has(e.to));
   }, [selectedPerson, dayData?.edges]);
 
-  // Маппинг треков выбранной персоны по камерам: cameraName -> track_id[]
   const focusTrackIdsByCamera = useMemo(() => {
     const map: Record<string, number[]> = {};
     if (!selectedPerson) return map;
     for (const tr of selectedPerson.tracks) {
-      if (!map[tr.camera]) map[tr.camera] = [];
-      map[tr.camera]!.push(tr.track_id);
+      (map[tr.camera] ??= []).push(tr.track_id);
     }
     return map;
   }, [selectedPerson]);
 
-  // Фильтрация и сортировка списка персон
   const displayPersons = useMemo(() => {
     if (!dayData?.persons) return [];
     let list = dayData.persons.filter((p) => {
       if (filterMode === "multi_cam" && p.n_cameras < 2) return false;
-      if (filterMode === "with_face" && !p.best_face_crop) return false;
       if (filterMode === "solo" && (p.n_cameras > 1 || p.n_tracks > 1)) return false;
-      if (filterMode === "pass0") {
+      if (filterMode === "pass1" || filterMode === "pass2" || filterMode === "pass4") {
+        const passN = Number(filterMode.slice(4));
         const uids = new Set(p.tracks.map((t) => t.uid));
-        const hasP0 = dayData.edges.some((e) => e.pass === 0 && uids.has(e.from) && uids.has(e.to));
-        if (!hasP0) return false;
-      }
-      if (filterMode === "pass1") {
-        const uids = new Set(p.tracks.map((t) => t.uid));
-        const hasP1 = dayData.edges.some((e) => e.pass === 1 && uids.has(e.from) && uids.has(e.to));
-        if (!hasP1) return false;
-      }
-      if (filterMode === "pass2") {
-        const uids = new Set(p.tracks.map((t) => t.uid));
-        const hasP2 = dayData.edges.some((e) => e.pass === 2 && uids.has(e.from) && uids.has(e.to));
-        if (!hasP2) return false;
-      }
-      if (filterMode === "pass4") {
-        const uids = new Set(p.tracks.map((t) => t.uid));
-        const hasP4 = dayData.edges.some((e) => e.pass === 4 && uids.has(e.from) && uids.has(e.to));
-        if (!hasP4) return false;
+        if (!dayData.edges.some((e) => e.pass === passN && uids.has(e.from) && uids.has(e.to))) return false;
       }
       if (searchQuery.trim()) {
         const q = searchQuery.toLowerCase().trim();
-        const matchesId = String(p.person_id).includes(q) || p.label.toLowerCase().includes(q);
-        const matchesCam = p.cameras.some((c) => c.toLowerCase().includes(q));
-        const matchesTrack = p.tracks.some((t) => String(t.track_id).includes(q) || t.uid.toLowerCase().includes(q));
-        if (!matchesId && !matchesCam && !matchesTrack) return false;
+        const hit =
+          String(p.person_id).includes(q) ||
+          p.label.toLowerCase().includes(q) ||
+          p.cameras.some((c) => c.toLowerCase().includes(q)) ||
+          p.tracks.some((t) => String(t.track_id).includes(q) || t.uid.toLowerCase().includes(q));
+        if (!hit) return false;
       }
       return true;
     });
-
     list = [...list].sort((a, b) => {
       if (sortMode === "person_id") return a.person_id - b.person_id;
       if (sortMode === "tracks") return b.n_tracks - a.n_tracks;
       if (sortMode === "span") return b.duration_sec - a.duration_sec;
-      if (sortMode === "time") return a.t0 - b.t0;
-      return 0;
+      return a.t0 - b.t0;
     });
-
     return list;
   }, [dayData?.persons, dayData?.edges, filterMode, sortMode, searchQuery]);
 
-  const cameraSessionsList = useMemo(() => {
-    return dayData?.camera_sessions || [];
-  }, [dayData?.camera_sessions]);
+  const cameraSessionsList = dayData?.camera_sessions ?? [];
+  const timelinePersons = selectedPerson ? dayData?.persons ?? [] : displayPersons;
 
-  // Обработка клика/скруббинга по таймлайну
-  const handleTimelineClick = (e: React.MouseEvent<HTMLDivElement>) => {
-    const rect = e.currentTarget.getBoundingClientRect();
-    const clickX = e.clientX - rect.left;
-    const pct = Math.max(0, Math.min(1, clickX / rect.width));
-    const targetSec = timeBounds.minT + pct * timeBounds.span;
-    seekToDaySec(targetSec);
-  };
+  const selectPerson = useCallback(
+    (person: GlobalPerson) => {
+      setSelectedPersonId(person.person_id);
+      setSelectedEdge(null);
+      setRightTab("edges");
+      seekToDaySec(person.t0);
+    },
+    [seekToDaySec],
+  );
 
-  // Переход к следующей/предыдущей склейке персоны
   const jumpToTransition = (direction: "prev" | "next") => {
     if (!personEdges.length || !selectedPerson) return;
-    const sortedEdges = [...personEdges].sort((a, b) => {
+    const sorted = [...personEdges].sort((a, b) => {
       const trA = selectedPerson.tracks.find((t) => t.uid === a.from);
       const trB = selectedPerson.tracks.find((t) => t.uid === b.from);
       return (trA?.t1 ?? 0) - (trB?.t1 ?? 0);
     });
-
-    if (direction === "next") {
-      const nextEdge = sortedEdges.find((e) => {
-        const tr = selectedPerson.tracks.find((t) => t.uid === e.from);
-        return (tr?.t1 ?? 0) > currentDaySec + 0.5;
-      }) || sortedEdges[0];
-      if (nextEdge) {
-        setSelectedEdge(nextEdge);
-        const tr = selectedPerson.tracks.find((t) => t.uid === nextEdge.from);
-        if (tr) seekToDaySec(tr.t1);
-      }
-    } else {
-      const prevEdge = [...sortedEdges].reverse().find((e) => {
-        const tr = selectedPerson.tracks.find((t) => t.uid === e.from);
-        return (tr?.t1 ?? 0) < currentDaySec - 0.5;
-      }) || sortedEdges[sortedEdges.length - 1];
-      if (prevEdge) {
-        setSelectedEdge(prevEdge);
-        const tr = selectedPerson.tracks.find((t) => t.uid === prevEdge.from);
-        if (tr) seekToDaySec(tr.t1);
-      }
-    }
+    const cur = currentDaySecRef.current;
+    const edge =
+      direction === "next"
+        ? sorted.find((e) => (selectedPerson.tracks.find((t) => t.uid === e.from)?.t1 ?? 0) > cur + 0.5) ?? sorted[0]
+        : [...sorted].reverse().find((e) => (selectedPerson.tracks.find((t) => t.uid === e.from)?.t1 ?? 0) < cur - 0.5) ??
+          sorted[sorted.length - 1];
+    if (!edge) return;
+    setSelectedEdge(edge);
+    setRightTab("inspector");
+    const tr = selectedPerson.tracks.find((t) => t.uid === edge.from);
+    if (tr) seekToDaySec(tr.t1);
   };
 
+  const onSelectEdge = useCallback(
+    (edge: DayTransitionEdge) => {
+      setSelectedEdge(edge);
+      setRightTab("inspector");
+      const trFrom = selectedPerson?.tracks.find((t) => t.uid === edge.from);
+      if (trFrom) seekToDaySec(trFrom.t1);
+    },
+    [selectedPerson, seekToDaySec],
+  );
+
+  if (!selectedDay) {
+    return (
+      <div className="day-panel">
+        <p className="day-empty">Выберите день в шапке, чтобы открыть межкамерную склейку.</p>
+      </div>
+    );
+  }
+
+  const stats = dayData?.stats;
+  const camCount = dayData?.cameras?.length ?? cameraSessionsList.length;
+  const sessionTitle = dayData?.sessions?.join(", ") || "";
+
   return (
-    <div className="merge-inspect-panel">
-      {/* 1. Верхний Summary Bar */}
-      <div className="merge-inspect-summary">
-        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-          <strong style={{ color: "var(--ink)" }}>День:</strong>
-          <span
-            style={{
-              fontFamily: "var(--mono)",
-              fontSize: 12,
-              fontWeight: 700,
-              color: "var(--accent, #0d6efd)",
-              background: "rgba(13, 110, 253, 0.08)",
-              padding: "2px 8px",
-              borderRadius: 4,
-              border: "1px solid rgba(13, 110, 253, 0.2)",
-            }}
-          >
-            {dayData?.day || selectedDay}
+    <div className="day-panel">
+      <div className="day-header">
+        <div className="day-kpi" title={sessionTitle}>
+          <span>
+            Камеры <b>{camCount || "—"}</b>
           </span>
+          {stats && (
+            <>
+              <span>
+                Персоны <b>{stats.n_persons ?? 0}</b>
+              </span>
+              <span className="day-kpi-accent">
+                Мультикам <b>{stats.n_multi_cam_persons ?? 0}</b>
+              </span>
+              <span>
+                Склейки <b>{stats.n_merges_total ?? 0}</b>
+              </span>
+              <span className="pass-pill pass1">P1 {stats.pass1_merges ?? 0}</span>
+              <span className="pass-pill pass2">P2 {stats.pass2_merges ?? 0}</span>
+              <span className="pass-pill pass4">P4 {stats.pass4_merges ?? 0}</span>
+            </>
+          )}
         </div>
-
-        <span>
-          Сессии: <strong>{dayData?.sessions?.join(", ") || "—"}</strong>
-        </span>
-
-        {dayData?.stats && (
-          <>
-            <span>
-              Глобальных персон: <strong>{dayData.stats.n_persons ?? 0}</strong>
-            </span>
-            <span style={{ color: "var(--accent)" }}>
-              Мультикамерных: <strong>{dayData.stats.n_multi_cam_persons ?? 0}</strong>
-            </span>
-            <span>
-              Склеек: <strong>{dayData.stats.n_merges_total ?? 0}</strong> (
-              <span className="pass-pill pass0">P0: {dayData.stats.pass0_merges ?? 0}</span>{" "}
-              <span className="pass-pill pass1">P1: {dayData.stats.pass1_merges ?? 0}</span>{" "}
-              <span className="pass-pill pass2">P2: {dayData.stats.pass2_merges ?? 0}</span>{" "}
-              <span className="pass-pill pass4">P4: {dayData.stats.pass4_merges ?? 0}</span>)
-            </span>
-          </>
-        )}
-
-        <button
-          type="button"
-          className="merge-inspect-face-btn"
-          style={{
-            marginLeft: "auto",
-            background: "var(--accent, #0d6efd)",
-            color: "#fff",
-            fontWeight: 600,
-            padding: "3px 10px",
-            borderRadius: 4,
-          }}
-          onClick={handleRunDayLink}
-          disabled={runningSolver || !selectedDay}
-        >
-          {runningSolver ? "⏳ Выполняется склейка..." : "⚡ Запустить склейку дня"}
-        </button>
-
-        {loading && <span style={{ color: "var(--muted)" }}>Загрузка данных...</span>}
+        <div className="day-header-actions">
+          {loading && <span className="day-muted">Загрузка…</span>}
+          <button
+            type="button"
+            className="day-btn day-btn-primary"
+            onClick={() => void handleRunDayLink()}
+            disabled={runningSolver || !selectedDay}
+          >
+            {runningSolver ? "Склейка…" : "Склеить день"}
+          </button>
+        </div>
       </div>
 
-      {error && (
-        <div className="merge-inspect-stale" style={{ borderColor: "#e53e3e", background: "#fff5f5", color: "#c53030" }}>
-          {error}
-        </div>
-      )}
+      {error && <div className="day-error">{error}</div>}
 
-      {/* 2. Основной 3-колоночный Grid Layout */}
-      <div className="merge-inspect-grid">
-        {/* ЛЕВАЯ КОЛОНКА: Поиск, фильтры и список персон */}
-        <section className="merge-inspect-list" aria-label="Список персон">
-          <input
-            type="search"
-            className="merge-inspect-search"
-            placeholder="Поиск по ID, треку, камере…"
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
+      {!loading && dayData && !dayData.has_links && !(dayData.persons?.length) ? (
+        <div className="day-empty">
+          Нет day_links для этого дня.
+          <div className="day-empty-actions">
+            <button type="button" className="day-btn day-btn-primary" onClick={() => void handleRunDayLink()} disabled={runningSolver}>
+              Склеить день
+            </button>
+          </div>
+        </div>
+      ) : (
+        <div className="day-grid">
+          <DayPersonList
+            persons={displayPersons}
+            counts={{
+              all: dayData?.persons?.length ?? 0,
+              multi: stats?.n_multi_cam_persons ?? 0,
+              solo: stats?.n_solo_persons ?? 0,
+            }}
+            filterMode={filterMode}
+            sortMode={sortMode}
+            searchQuery={searchQuery}
+            selectedPersonId={selectedPersonId}
+            onFilter={setFilterMode}
+            onSort={setSortMode}
+            onSearch={setSearchQuery}
+            onSelect={selectPerson}
           />
 
-          <div className="merge-inspect-filters">
-            <button
-              type="button"
-              className={filterMode === "all" ? "on" : ""}
-              onClick={() => setFilterMode("all")}
-            >
-              Все ({dayData?.persons?.length ?? 0})
-            </button>
-            <button
-              type="button"
-              className={filterMode === "multi_cam" ? "on" : ""}
-              onClick={() => setFilterMode("multi_cam")}
-            >
-              Мультикам ({dayData?.stats?.n_multi_cam_persons ?? 0})
-            </button>
-            <button
-              type="button"
-              className={filterMode === "with_face" ? "on" : ""}
-              onClick={() => setFilterMode("with_face")}
-            >
-              С лицом
-            </button>
-            <button
-              type="button"
-              className={filterMode === "pass0" ? "on" : ""}
-              onClick={() => setFilterMode("pass0")}
-            >
-              Pass 0
-            </button>
-            <button
-              type="button"
-              className={filterMode === "pass1" ? "on" : ""}
-              onClick={() => setFilterMode("pass1")}
-            >
-              Pass 1
-            </button>
-            <button
-              type="button"
-              className={filterMode === "solo" ? "on" : ""}
-              onClick={() => setFilterMode("solo")}
-            >
-              Соло ({dayData?.stats?.n_solo_persons ?? 0})
-            </button>
-          </div>
-
-          <div className="merge-inspect-sort">
-            <span>Сортировка:</span>
-            <select value={sortMode} onChange={(e) => setSortMode(e.target.value as SortMode)}>
-              <option value="person_id">По ID персоны</option>
-              <option value="tracks">По числу треков</option>
-              <option value="span">По длительности</option>
-              <option value="time">По времени дня</option>
-            </select>
-          </div>
-
-          <ul className="merge-inspect-rows">
-            {displayPersons.map((p) => {
-              const isSelected = p.person_id === selectedPersonId;
-              const pColor = colorForTrackId(p.person_id);
-
-              return (
-                <li key={p.person_id}>
-                  <button
-                    type="button"
-                    className={`merge-inspect-row ${isSelected ? "on" : ""}`}
-                    onClick={() => {
-                      setSelectedPersonId(p.person_id);
-                      setSelectedEdge(null);
-                      setRightTab("edges");
-                      seekToDaySec(p.t0);
-                    }}
-                  >
-                    {/* Кроп лица */}
-                    <div className="merge-inspect-face-wrap">
-                      <div className="merge-inspect-face-box" style={{ borderColor: pColor }}>
-                        {p.best_face_crop ? (
-                          <img src={p.best_face_crop} alt={p.label} loading="lazy" />
-                        ) : (
-                          <div
-                            style={{
-                              width: "100%",
-                              height: "100%",
-                              display: "flex",
-                              alignItems: "center",
-                              justifyContent: "center",
-                              background: pColor,
-                              color: "#fff",
-                              fontWeight: 700,
-                              fontSize: 14,
-                            }}
-                          >
-                            #{p.person_id}
-                          </div>
-                        )}
-                        <span className="merge-inspect-face-tid">#{p.person_id}</span>
-                      </div>
-                    </div>
-
-                    {/* Мета-информация строки */}
-                    <div className="merge-inspect-row-content">
-                      <div className="merge-inspect-row-head">
-                        <div className="merge-inspect-row-title">
-                          <strong>{p.label}</strong>
-                          {p.n_cameras > 1 && (
-                            <span
-                              style={{
-                                fontSize: 9.5,
-                                fontWeight: 700,
-                                padding: "1px 4px",
-                                borderRadius: 3,
-                                background: "rgba(13, 110, 253, 0.12)",
-                                color: "var(--accent)",
-                              }}
-                            >
-                              {p.n_cameras} кам.
-                            </span>
-                          )}
-                        </div>
-
-                        <span className={badgeClass(p.best_face_crop ? 0.9 : 0.7)}>
-                          {p.tracks.length} тр.
-                        </span>
-                      </div>
-
-                      <div className="merge-inspect-row-meta">
-                        <span>🕒 {formatShortTime(p.t0)}–{formatShortTime(p.t1)}</span>
-                        <span>{formatDuration(p.duration_sec)}</span>
-                      </div>
-
-                      <div style={{ fontSize: 10, color: "#0f6e56", fontWeight: 600 }}>
-                        {p.cameras.join(" ➔ ")}
-                      </div>
-
-                      <div className="merge-inspect-ids">
-                        {p.tracks.map((t) => (
-                          <span
-                            key={t.uid}
-                            style={{
-                              borderLeft: `2px solid ${colorForTrackId(t.track_id)}`,
-                              paddingLeft: 3,
-                            }}
-                          >
-                            {t.camera.replace("Camera_", "C")} #{t.track_id}
-                          </span>
-                        ))}
-                      </div>
-                    </div>
-                  </button>
-                </li>
-              );
-            })}
-          </ul>
-        </section>
-
-        {/* ЦЕНТРАЛЬНАЯ КОЛОНКА: Профессиональный таймлайн + Синхронизированные плееры TrackingPlayer */}
-        <section className="merge-inspect-center" aria-label="Таймлайн и видео дня" style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-          {/* Тулбар управления воспроизведением дня */}
-          <div className="merge-inspect-center-toolbar" style={{ flexWrap: "wrap", gap: 8 }}>
-            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-              {/* Play / Pause */}
-              <button
-                type="button"
-                className="merge-inspect-face-btn"
-                style={{
-                  background: isPlaying ? "#e53e3e" : "var(--accent, #0d6efd)",
-                  color: "#fff",
-                  padding: "4px 10px",
-                  borderRadius: 4,
-                  fontSize: 12,
-                  fontWeight: 700,
-                }}
-                onClick={() => {
-                  const next = !isPlaying;
-                  setIsPlaying(next);
-                  syncPlayersToTime(currentDaySec, next);
-                }}
-                title="Воспроизведение / Пауза (Пробел)"
-              >
-                {isPlaying ? "⏸ Пауза" : "▶ Пуск"}
-              </button>
-
-              {/* Step Back / Forward */}
-              <button
-                type="button"
-                className="merge-inspect-face-btn"
-                onClick={() => seekToDaySec(currentDaySec - 1 / 25)}
-                title="Назад на 1 кадр (←)"
-              >
-                ⏮ -1к
-              </button>
-              <button
-                type="button"
-                className="merge-inspect-face-btn"
-                onClick={() => seekToDaySec(currentDaySec + 1 / 25)}
-                title="Вперед на 1 кадр (→)"
-              >
-                +1к ⏭
-              </button>
-
-              {/* Скорость */}
-              <div style={{ display: "flex", alignItems: "center", gap: 2, marginLeft: 4 }}>
-                {[0.5, 1.0, 2.0, 4.0].map((spd) => (
+          <section className="day-center" aria-label="Таймлайн и видео дня">
+            <div className="day-toolbar">
+              <div className="day-toolbar-group">
+                <button
+                  type="button"
+                  className={`day-btn day-btn-play ${isPlaying ? "is-playing" : "day-btn-primary"}`}
+                  onClick={() => {
+                    const next = !isPlaying;
+                    setIsPlaying(next);
+                    syncPlayersToTime(currentDaySecRef.current, next);
+                  }}
+                  title="Пробел"
+                >
+                  {isPlaying ? "Пауза" : "Пуск"}
+                </button>
+                <button type="button" className="day-btn" onClick={() => seekToDaySec(currentDaySecRef.current - 1 / 25)} title="←">
+                  −1к
+                </button>
+                <button type="button" className="day-btn" onClick={() => seekToDaySec(currentDaySecRef.current + 1 / 25)} title="→">
+                  +1к
+                </button>
+                {[0.5, 1, 2, 4].map((spd) => (
                   <button
                     key={spd}
                     type="button"
-                    className={`merge-inspect-face-btn ${playbackSpeed === spd ? "on" : ""}`}
-                    style={{
-                      padding: "2px 5px",
-                      fontSize: 10,
-                      fontWeight: playbackSpeed === spd ? 700 : 400,
-                    }}
+                    className={`day-btn day-speed ${playbackSpeed === spd ? "on" : ""}`}
                     onClick={() => setPlaybackSpeed(spd)}
                   >
-                    {spd}x
+                    {spd}×
                   </button>
                 ))}
               </div>
-            </div>
-
-            {/* Часы суток и позиция */}
-            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-              <span
-                style={{
-                  fontFamily: "var(--mono)",
-                  fontSize: 12,
-                  fontWeight: 700,
-                  color: "var(--ink)",
-                  background: "rgba(0,0,0,0.05)",
-                  padding: "2px 6px",
-                  borderRadius: 4,
-                }}
-              >
-                🕒 {formatSecToTimeOfDay(currentDaySec)}
+              <span className="day-clock">{formatSecToTimeOfDay(currentDaySec)}</span>
+              <span className="day-clock-span">
+                {formatShortTime(timeBounds.minT)}–{formatShortTime(timeBounds.maxT)} ({formatDuration(timeBounds.span)})
               </span>
-              <span style={{ fontSize: 10, color: "var(--muted)" }}>
-                из {formatShortTime(timeBounds.maxT)} ({formatDuration(timeBounds.span)})
-              </span>
-            </div>
-
-            {/* Кнопки перехода по склейкам и сброс выбора */}
-            <div style={{ display: "flex", alignItems: "center", gap: 6, marginLeft: "auto" }}>
-              {selectedPerson && (
-                <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-                  <button
-                    type="button"
-                    className="merge-inspect-face-btn"
-                    style={{ background: "rgba(13, 110, 253, 0.1)", color: "var(--accent)", fontWeight: 700 }}
-                    onClick={() => {
-                      setSelectedPersonId(null);
-                      setSelectedEdge(null);
-                    }}
-                    title="Показать все персоны на таймлайне"
-                  >
-                    ✕ Все персоны
-                  </button>
-
-                  {personEdges.length > 0 && (
-                    <>
-                      <button
-                        type="button"
-                        className="merge-inspect-face-btn"
-                        onClick={() => jumpToTransition("prev")}
-                        title="К предыдущей склейке"
-                      >
-                        ← Склейка
-                      </button>
-                      <button
-                        type="button"
-                        className="merge-inspect-face-btn"
-                        onClick={() => jumpToTransition("next")}
-                        title="К следующей склейке"
-                      >
-                        Склейка →
-                      </button>
-                    </>
-                  )}
-                </div>
-              )}
-
-              {/* Зум таймлайна */}
-              <div style={{ display: "flex", alignItems: "center", gap: 2 }}>
-                <button
-                  type="button"
-                  className="merge-inspect-face-btn"
-                  onClick={() => setZoom((z) => Math.max(0.5, z - 0.25))}
-                >
+              <div className="day-toolbar-group right">
+                {selectedPerson && (
+                  <>
+                    <button
+                      type="button"
+                      className="day-btn"
+                      onClick={() => {
+                        setSelectedPersonId(null);
+                        setSelectedEdge(null);
+                      }}
+                    >
+                      Все персоны
+                    </button>
+                    {personEdges.length > 0 && (
+                      <>
+                        <button type="button" className="day-btn" onClick={() => jumpToTransition("prev")}>
+                          ← Склейка
+                        </button>
+                        <button type="button" className="day-btn" onClick={() => jumpToTransition("next")}>
+                          Склейка →
+                        </button>
+                      </>
+                    )}
+                  </>
+                )}
+                <button type="button" className="day-btn" onClick={() => setZoom((z) => Math.max(0.5, z - 0.25))}>
                   −
                 </button>
-                <span style={{ fontSize: 10, fontFamily: "var(--mono)", minWidth: 28, textAlign: "center" }}>
-                  {Math.round(zoom * 100)}%
-                </span>
-                <button
-                  type="button"
-                  className="merge-inspect-face-btn"
-                  onClick={() => setZoom((z) => Math.min(4.0, z + 0.25))}
-                >
+                <span className="day-clock-span">{Math.round(zoom * 100)}%</span>
+                <button type="button" className="day-btn" onClick={() => setZoom((z) => Math.min(4, z + 0.25))}>
                   +
                 </button>
-                <button
-                  type="button"
-                  className="merge-inspect-face-btn"
-                  onClick={() => setZoom(1.0)}
-                >
+                <button type="button" className="day-btn" onClick={() => setZoom(1)}>
                   100%
                 </button>
               </div>
             </div>
-          </div>
 
-          {/* Таймлайн с красным курсором воспроизведения */}
-          <div
-            ref={timelineContainerRef}
-            style={{
-              overflowX: "auto",
-              overflowY: "hidden",
-              position: "relative",
-              flex: "0 0 auto",
-              maxHeight: 220,
-              background: "var(--panel, #fff)",
-              border: "1px solid var(--line)",
-              borderRadius: 6,
-              padding: "6px 12px 14px",
-            }}
-          >
+            <DayTimeline
+              cameras={cameraSessionsList}
+              persons={timelinePersons}
+              selectedPersonId={selectedPersonId}
+              timeBounds={timeBounds}
+              zoom={zoom}
+              currentDaySec={currentDaySec}
+              onSeek={seekToDaySec}
+              onScrubbing={(active) => {
+                scrubbingRef.current = active;
+              }}
+              onSelectPerson={(id, t0) => {
+                setSelectedPersonId(id);
+                setSelectedEdge(null);
+                setRightTab("edges");
+                seekToDaySec(t0);
+              }}
+            />
+
             <div
-              style={{ width: `${Math.max(100, 100 * zoom)}%`, position: "relative", cursor: "crosshair" }}
-              onClick={handleTimelineClick}
+              className="day-cameras"
+              style={{
+                gridTemplateColumns: cameraSessionsList.length > 1 ? "repeat(auto-fit, minmax(240px, 1fr))" : "1fr",
+              }}
             >
-              {/* Шкала времени суток */}
-              <div className="merge-inspect-axis" style={{ marginBottom: 8, height: 20 }}>
-                {Array.from({ length: 11 }).map((_, i) => {
-                  const frac = i / 10;
-                  const t = timeBounds.minT + frac * timeBounds.span;
-                  return (
-                    <div
-                      key={i}
-                      style={{
-                        position: "absolute",
-                        left: `${frac * 100}%`,
-                        transform: "translateX(-50%)",
-                        textAlign: "center",
-                        fontSize: 9,
-                        fontFamily: "var(--mono)",
-                        color: "var(--muted)",
-                      }}
-                    >
-                      <div style={{ width: 1, height: 5, background: "var(--line)", margin: "0 auto 2px" }} />
-                      {formatShortTime(t)}
-                    </div>
-                  );
-                })}
-              </div>
-
-              {/* Красный курсор воспроизведения (Playhead needle) */}
-              {(() => {
-                const playheadPct = ((currentDaySec - timeBounds.minT) / timeBounds.span) * 100;
+              {cameraSessionsList.map((sess) => {
+                const t0Abs = sess.t0_abs ?? timeBounds.minT;
+                const duration = sess.duration_sec ?? 300;
+                const isActiveNow = currentDaySec >= t0Abs && currentDaySec <= t0Abs + duration;
+                const localSec = Math.max(0, currentDaySec - t0Abs);
+                const focusIds = focusTrackIdsByCamera[sess.camera] ?? [];
+                const isPersonInCamera = focusIds.length > 0 && isActiveNow;
                 return (
                   <div
-                    style={{
-                      position: "absolute",
-                      left: `${playheadPct}%`,
-                      top: 0,
-                      bottom: 0,
-                      width: 2,
-                      background: "#ff4d4d",
-                      zIndex: 20,
-                      pointerEvents: "none",
-                      boxShadow: "0 0 4px rgba(255, 77, 77, 0.8)",
-                    }}
+                    key={sess.key}
+                    className={`day-camera-card ${isPersonInCamera ? "has-person" : ""} ${isActiveNow ? "" : "is-idle"}`}
                   >
-                    <div
-                      style={{
-                        position: "absolute",
-                        top: 0,
-                        left: -4,
-                        width: 0,
-                        height: 0,
-                        borderLeft: "5px solid transparent",
-                        borderRight: "5px solid transparent",
-                        borderTop: "6px solid #ff4d4d",
-                      }}
-                    />
+                    <div className="day-camera-head">
+                      <div className="day-camera-head-left">
+                        <span className="day-camera-name">{sess.camera}</span>
+                        {isActiveNow ? <span className="day-live">В эфире</span> : <span className="day-idle">Нет записи</span>}
+                      </div>
+                      <div className="day-camera-head-right">
+                        {selectedPerson && isPersonInCamera && (
+                          <span className="day-focus-tag">
+                            {selectedPerson.label} · T{focusIds.join(",")}
+                          </span>
+                        )}
+                        <span className="day-camera-local">{formatDuration(localSec)}</span>
+                      </div>
+                    </div>
+                    <div className="day-camera-body">
+                      <TrackingPlayer
+                        ref={(r) => {
+                          playerRefs.current[sess.key] = r;
+                        }}
+                        videoUrl={sess.parts[0]?.videoUrl ?? null}
+                        tracking={cameraTracking[sess.key] ?? null}
+                        sessionParts={sess.parts.length ? sess.parts : null}
+                        showLabels={true}
+                        showTrails={true}
+                        trailLength={25}
+                        groupByTrack={dayData?.track_to_person?.[sess.key] ?? {}}
+                        focusTrackIds={selectedPerson ? focusIds : null}
+                        hideUnfocused={selectedPerson != null}
+                        compact={true}
+                      />
+                    </div>
                   </div>
                 );
-              })()}
-
-              {/* Дорожки по камерам дня */}
-              <div style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: 4 }}>
-                {cameraSessionsList.map((sess) => {
-                  const camName = sess.camera;
-                  // При выборе персоны показываем только треки входящие в эту персону
-                  const personsToRender = selectedPerson
-                    ? [selectedPerson]
-                    : dayData?.persons || [];
-
-                  return (
-                    <div
-                      key={sess.key}
-                      style={{
-                        display: "flex",
-                        flexDirection: "column",
-                        gap: 2,
-                        background: "rgba(0, 0, 0, 0.02)",
-                        border: "1px solid var(--line)",
-                        borderRadius: 4,
-                        padding: "3px 6px",
-                      }}
-                    >
-                      <div style={{ fontSize: 10, fontWeight: 700, color: "var(--ink)", fontFamily: "var(--mono)" }}>
-                        {camName}
-                      </div>
-
-                      <div style={{ position: "relative", height: 26 }}>
-                        {personsToRender.map((person) => {
-                          const isPersonSelected = person.person_id === selectedPersonId;
-                          const pColor = colorForTrackId(person.person_id);
-                          const camTracks = person.tracks.filter((t) => t.camera === camName);
-
-                          return camTracks.map((t) => {
-                            const leftPct = ((t.t0 - timeBounds.minT) / timeBounds.span) * 100;
-                            const widthPct = Math.max(0.4, ((t.t1 - t.t0) / timeBounds.span) * 100);
-
-                            return (
-                              <div
-                                key={t.uid}
-                                className={`merge-inspect-track ${isPersonSelected ? "on" : ""}`}
-                                style={{
-                                  position: "absolute",
-                                  left: `${leftPct}%`,
-                                  width: `${widthPct}%`,
-                                  top: 1,
-                                  height: 22,
-                                  borderRadius: 3,
-                                  background: pColor,
-                                  opacity: 1,
-                                  color: "#fff",
-                                  display: "flex",
-                                  alignItems: "center",
-                                  padding: "0 4px",
-                                  fontSize: 9.5,
-                                  fontWeight: 700,
-                                  cursor: "pointer",
-                                  border: isPersonSelected ? "2px solid #000" : "1px solid rgba(255,255,255,0.4)",
-                                  boxShadow: isPersonSelected ? "0 0 6px rgba(0,0,0,0.4)" : "none",
-                                  overflow: "hidden",
-                                  whiteSpace: "nowrap",
-                                  zIndex: isPersonSelected ? 5 : 1,
-                                }}
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  setSelectedPersonId(person.person_id);
-                                  setSelectedEdge(null);
-                                  seekToDaySec(t.t0);
-                                }}
-                                title={`${person.label} (${camName} #${t.track_id}): ${formatShortTime(t.t0)} - ${formatShortTime(t.t1)} (${formatDuration(t.t1 - t.t0)})`}
-                              >
-                                P#{person.person_id} · T{t.track_id} ({formatDuration(t.t1 - t.t0)})
-                              </div>
-                            );
-                          });
-                        })}
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
+              })}
             </div>
-          </div>
+          </section>
 
-          {/* Синхронизированный мультикамерный видеовывод на базе существующего TrackingPlayer */}
-          <div
-            style={{
-              flex: "1 1 auto",
-              minHeight: 280,
-              display: "grid",
-              gridTemplateColumns: cameraSessionsList.length > 1 ? "repeat(auto-fit, minmax(280px, 1fr))" : "1fr",
-              gap: 8,
-              background: "var(--panel, #fff)",
-              border: "1px solid var(--line)",
-              borderRadius: 6,
-              padding: 8,
-            }}
-          >
-            {cameraSessionsList.map((sess) => {
-              const t0_abs = sess.t0_abs ?? timeBounds.minT;
-              const duration = sess.duration_sec ?? 300;
-              const isActiveNow = currentDaySec >= t0_abs && currentDaySec <= t0_abs + duration;
-              const localSec = Math.max(0, currentDaySec - t0_abs);
-
-              // Треки выбранной персоны для этой камеры
-              const focusIds = focusTrackIdsByCamera[sess.camera] ?? [];
-              const isPersonInCamera = focusIds.length > 0 && isActiveNow;
-
-              return (
-                <div
-                  key={sess.key}
-                  className={`day-camera-card ${isPersonInCamera ? "has-person" : ""}`}
-                >
-                  {/* Шапка камеры */}
-                  <div
-                    style={{
-                      display: "flex",
-                      alignItems: "center",
-                      justifyContent: "space-between",
-                      padding: "4px 8px",
-                      background: isPersonInCamera ? "rgba(13, 110, 253, 0.08)" : "rgba(0,0,0,0.03)",
-                      borderBottom: "1px solid var(--line)",
-                    }}
-                  >
-                    <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                      <span style={{ fontSize: 11, fontWeight: 700, color: "var(--ink)", fontFamily: "var(--mono)" }}>
-                        {sess.camera}
-                      </span>
-                      {isActiveNow ? (
-                        <span style={{ fontSize: 9.5, color: "#2e7d32", fontWeight: 700 }}>🟢 Активна</span>
-                      ) : (
-                        <span style={{ fontSize: 9.5, color: "var(--muted)" }}>⚪ Вне диапазона</span>
-                      )}
-                    </div>
-
-                    <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                      {selectedPerson && isPersonInCamera && (
-                        <span
-                          style={{
-                            fontSize: 9.5,
-                            fontWeight: 700,
-                            background: "var(--accent)",
-                            color: "#fff",
-                            padding: "1px 5px",
-                            borderRadius: 3,
-                          }}
-                        >
-                          👁 {selectedPerson.label} (T#{focusIds.join(", T#")})
-                        </span>
-                      )}
-                      <span style={{ fontSize: 10, fontFamily: "var(--mono)", color: "var(--muted)" }}>
-                        {formatDuration(localSec)}
-                      </span>
-                    </div>
-                  </div>
-
-                  {/* Тело плеера TrackingPlayer */}
-                  <div style={{ flex: "1 1 auto", minHeight: 180, position: "relative", background: "var(--surface, #fff)" }}>
-                    <TrackingPlayer
-                      ref={(r) => {
-                        playerRefs.current[sess.key] = r;
-                      }}
-                      videoRef={{ current: videoRefs.current[sess.key] ?? null }}
-                      videoUrl={sess.parts[0]?.videoUrl ?? null}
-                      tracking={cameraTracking[sess.key] ?? null}
-                      sessionParts={sess.parts.length ? sess.parts : null}
-                      showLabels={true}
-                      showTrails={true}
-                      trailLength={25}
-                      groupByTrack={dayData?.track_to_person?.[sess.key] ?? {}}
-                      focusTrackIds={selectedPerson ? focusIds : null}
-                      hideUnfocused={selectedPerson != null}
-                      compact={true}
-                    />
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        </section>
-
-        {/* ПРАВАЯ КОЛОНКА: Детальный инспектор склейки и персоны */}
-        <section className="merge-inspect-why" aria-label="Детали персоны и склейки">
-          {selectedPerson ? (
-            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-              {/* Шапка персоны */}
-              <div
-                style={{
-                  display: "flex",
-                  gap: 10,
-                  background: "var(--surface, #fff)",
-                  border: "1px solid var(--line)",
-                  borderRadius: 6,
-                  padding: 8,
-                  alignItems: "center",
-                }}
-              >
-                <div
-                  className="merge-inspect-face-box"
-                  style={{
-                    width: 56,
-                    height: 64,
-                    borderColor: colorForTrackId(selectedPerson.person_id),
-                    flexShrink: 0,
-                  }}
-                >
-                  {selectedPerson.best_face_crop ? (
-                    <img src={selectedPerson.best_face_crop} alt={selectedPerson.label} />
-                  ) : (
-                    <div
-                      style={{
-                        width: "100%",
-                        height: "100%",
-                        display: "flex",
-                        alignItems: "center",
-                        justifyContent: "center",
-                        background: colorForTrackId(selectedPerson.person_id),
-                        color: "#fff",
-                        fontWeight: 700,
-                        fontSize: 15,
-                      }}
-                    >
-                      #{selectedPerson.person_id}
-                    </div>
-                  )}
-                  <span className="merge-inspect-face-tid">#{selectedPerson.person_id}</span>
-                </div>
-
-                <div style={{ display: "flex", flexDirection: "column", gap: 2, flex: 1, minWidth: 0 }}>
-                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-                    <strong style={{ fontSize: 12.5, color: "var(--ink)" }}>{selectedPerson.label}</strong>
-                    <span className={badgeClass(0.9)}>{selectedPerson.n_tracks} треков</span>
-                  </div>
-
-                  <div style={{ fontSize: 10.5, color: "var(--muted)", fontFamily: "var(--mono)" }}>
-                    {formatShortTime(selectedPerson.t0)}–{formatShortTime(selectedPerson.t1)} ({formatDuration(selectedPerson.duration_sec)})
-                  </div>
-
-                  <div style={{ fontSize: 10.5, color: "#0f6e56", fontWeight: 600 }}>
-                    {selectedPerson.cameras.join(" ➔ ")}
-                  </div>
-                </div>
-              </div>
-
-              {/* Галерея кропов лица персоны */}
-              {selectedPerson.face_crops.length > 0 && (
-                <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
-                  <div style={{ fontSize: 9.5, fontWeight: 700, color: "var(--muted)", textTransform: "uppercase" }}>
-                    Кропы лиц InsightFace:
-                  </div>
-                  <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
-                    {selectedPerson.face_crops.map((url, i) => (
-                      <a key={i} href={url} target="_blank" rel="noreferrer" className="merge-inspect-face-box" style={{ width: 38, height: 44 }}>
-                        <img src={url} alt="face" />
-                      </a>
-                    ))}
-                  </div>
-                </div>
-              )}
-
-              {/* Табы правой панели */}
-              <div className="merge-inspect-why-tabs">
-                <button
-                  type="button"
-                  className={rightTab === "edges" ? "on" : ""}
-                  onClick={() => setRightTab("edges")}
-                >
-                  Склейки ({personEdges.length})
-                </button>
-                <button
-                  type="button"
-                  className={rightTab === "tracks" ? "on" : ""}
-                  onClick={() => setRightTab("tracks")}
-                >
-                  Все треки ({selectedPerson.tracks.length})
-                </button>
-                {selectedEdge && (
-                  <button
-                    type="button"
-                    className={rightTab === "inspector" ? "on" : ""}
-                    onClick={() => setRightTab("inspector")}
-                  >
-                    Инспектор пары
-                  </button>
-                )}
-              </div>
-
-              {/* Содержимое вкладки: Склейки */}
-              {rightTab === "edges" && (
-                <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-                  {personEdges.length === 0 ? (
-                    <div className="merge-inspect-empty">
-                      Одиночный трек — межкамерных склеек не производилось.
-                    </div>
-                  ) : (
-                    personEdges.map((edge, idx) => {
-                      const isEdgeSelected = selectedEdge?.from === edge.from && selectedEdge?.to === edge.to;
-                      return (
-                        <div
-                          key={idx}
-                          className={`merge-why-card ${isEdgeSelected ? "on" : ""}`}
-                          style={{
-                            border: isEdgeSelected ? "1.5px solid var(--accent)" : "1px solid var(--line)",
-                            background: isEdgeSelected ? "rgba(13, 110, 253, 0.04)" : "var(--surface, #fff)",
-                            borderRadius: 6,
-                            padding: 6,
-                            cursor: "pointer",
-                            display: "flex",
-                            flexDirection: "column",
-                            gap: 4,
-                          }}
-                          onClick={() => {
-                            setSelectedEdge(edge);
-                            setRightTab("inspector");
-                            const trFrom = selectedPerson.tracks.find((t) => t.uid === edge.from);
-                            if (trFrom) seekToDaySec(trFrom.t1);
-                          }}
-                        >
-                          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                            <div style={{ fontSize: 10.5, fontWeight: 700, color: "var(--ink)", fontFamily: "var(--mono)" }}>
-                              {edge.from_camera} #{edge.from_track} ➔ {edge.to_camera} #{edge.to_track}
-                            </div>
-                            {passBadge(edge.pass)}
-                          </div>
-
-                          <div style={{ display: "flex", flexWrap: "wrap", gap: 4, fontSize: 9.5 }}>
-                            <span className={badgeClass(edge.score)}>Скор: {formatScore(edge.score)}</span>
-                            {edge.face != null && <span className="pass-pill">Лицо: {formatScore(edge.face)}</span>}
-                            {edge.reid != null && <span className="pass-pill">ReID: {formatScore(edge.reid)}</span>}
-                            <span className="pass-pill">Δd: {edge.dist_m.toFixed(1)}м</span>
-                            <span className="pass-pill">v: {edge.speed_mps.toFixed(1)}м/с</span>
-                            <span className="pass-pill">Δt: {edge.gap_sec.toFixed(1)}с</span>
-                          </div>
-
-                          <div style={{ fontSize: 9.5, color: "var(--muted)", fontFamily: "var(--mono)" }}>
-                            {edge.reason}
-                          </div>
-                        </div>
-                      );
-                    })
-                  )}
-                </div>
-              )}
-
-              {/* Содержимое вкладки: Инспектор пары */}
-              {rightTab === "inspector" && selectedEdge && (
-                <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                    <strong style={{ fontSize: 11.5, color: "var(--ink)" }}>
-                      Инспектор: {selectedEdge.from_camera} #{selectedEdge.from_track} ➔ {selectedEdge.to_camera} #{selectedEdge.to_track}
-                    </strong>
-                    {passBadge(selectedEdge.pass)}
-                  </div>
-
-                  {/* 2-колоночное попарное сравнение ДО и ПОСЛЕ */}
-                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
-                    {/* ДО */}
-                    <div
-                      style={{ background: "var(--surface, #fff)", border: "1px solid var(--line)", borderRadius: 6, padding: 6, cursor: "pointer" }}
-                      onClick={() => {
-                        const tr = selectedPerson.tracks.find((t) => t.uid === selectedEdge.from);
-                        if (tr) seekToDaySec(tr.t1);
-                      }}
-                      title="Кликните для перехода к точке выхода"
-                    >
-                      <div style={{ fontSize: 10.5, fontWeight: 700, color: "var(--ink)", marginBottom: 3 }}>
-                        [ДО] {selectedEdge.from_camera} #{selectedEdge.from_track}
-                      </div>
-                      {(() => {
-                        const tFrom = selectedPerson.tracks.find((t) => t.uid === selectedEdge.from);
-                        return (
-                          <div style={{ display: "flex", flexDirection: "column", gap: 3, fontSize: 9.5, fontFamily: "var(--mono)" }}>
-                            {tFrom?.crops[0] && (
-                              <img src={tFrom.crops[0]} alt="crop" style={{ width: 44, height: 50, objectFit: "cover", borderRadius: 4, border: "1px solid var(--line)" }} />
-                            )}
-                            <div>Конец: {formatShortTime(tFrom?.t1 ?? 0)}</div>
-                            <div>Точка: {tFrom?.p1 ? `(${tFrom.p1[0].toFixed(0)}, ${tFrom.p1[1].toFixed(0)})` : "—"}</div>
-                          </div>
-                        );
-                      })()}
-                    </div>
-
-                    {/* ПОСЛЕ */}
-                    <div
-                      style={{ background: "var(--surface, #fff)", border: "1px solid var(--line)", borderRadius: 6, padding: 6, cursor: "pointer" }}
-                      onClick={() => {
-                        const tr = selectedPerson.tracks.find((t) => t.uid === selectedEdge.to);
-                        if (tr) seekToDaySec(tr.t0);
-                      }}
-                      title="Кликните для перехода к точке входа"
-                    >
-                      <div style={{ fontSize: 10.5, fontWeight: 700, color: "var(--ink)", marginBottom: 3 }}>
-                        [ПОСЛЕ] {selectedEdge.to_camera} #{selectedEdge.to_track}
-                      </div>
-                      {(() => {
-                        const tTo = selectedPerson.tracks.find((t) => t.uid === selectedEdge.to);
-                        return (
-                          <div style={{ display: "flex", flexDirection: "column", gap: 3, fontSize: 9.5, fontFamily: "var(--mono)" }}>
-                            {tTo?.crops[0] && (
-                              <img src={tTo.crops[0]} alt="crop" style={{ width: 44, height: 50, objectFit: "cover", borderRadius: 4, border: "1px solid var(--line)" }} />
-                            )}
-                            <div>Старт: {formatShortTime(tTo?.t0 ?? 0)}</div>
-                            <div>Точка: {tTo?.p0 ? `(${tTo.p0[0].toFixed(0)}, ${tTo.p0[1].toFixed(0)})` : "—"}</div>
-                          </div>
-                        );
-                      })()}
-                    </div>
-                  </div>
-
-                  {/* Метрики склейки */}
-                  <table className="merge-why-table" style={{ width: "100%", fontSize: 9.5, borderCollapse: "collapse" }}>
-                    <tbody>
-                      <tr>
-                        <td><strong>Комбинированный скор:</strong></td>
-                        <td><span className={badgeClass(selectedEdge.score)}>{formatScore(selectedEdge.score)}</span></td>
-                      </tr>
-                      <tr>
-                        <td>Лицо сходство (cos):</td>
-                        <td><strong>{formatScore(selectedEdge.face)}</strong></td>
-                      </tr>
-                      <tr>
-                        <td>ReID тела (cos):</td>
-                        <td><strong>{formatScore(selectedEdge.reid)}</strong></td>
-                      </tr>
-                      <tr>
-                        <td>Расстояние между точками:</td>
-                        <td><strong>{selectedEdge.dist_m.toFixed(2)} м</strong></td>
-                      </tr>
-                      <tr>
-                        <td>Скорость перемещения:</td>
-                        <td><strong>{selectedEdge.speed_mps.toFixed(2)} м/с</strong></td>
-                      </tr>
-                      <tr>
-                        <td>Временной зазор Δt:</td>
-                        <td><strong>{selectedEdge.gap_sec.toFixed(2)} с</strong></td>
-                      </tr>
-                      <tr>
-                        <td>Причина солвера:</td>
-                        <td style={{ fontSize: 9, color: "var(--muted)" }}>{selectedEdge.reason}</td>
-                      </tr>
-                    </tbody>
-                  </table>
-                </div>
-              )}
-
-              {/* Содержимое вкладки: Все треки */}
-              {rightTab === "tracks" && (
-                <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                  <table className="merge-why-table" style={{ width: "100%", fontSize: 9.5, borderCollapse: "collapse" }}>
-                    <thead>
-                      <tr style={{ background: "rgba(0,0,0,0.04)", textAlign: "left" }}>
-                        <th style={{ padding: 3 }}>Камера</th>
-                        <th style={{ padding: 3 }}>ID</th>
-                        <th style={{ padding: 3 }}>Интервал</th>
-                        <th style={{ padding: 3 }}>Кадров</th>
-                        <th style={{ padding: 3 }}>Лицо</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {selectedPerson.tracks.map((t) => (
-                        <tr
-                          key={t.uid}
-                          style={{ borderBottom: "1px solid var(--line)", cursor: "pointer" }}
-                          onClick={() => seekToDaySec(t.t0)}
-                          title="Кликните для перехода к началу трека"
-                        >
-                          <td style={{ padding: 3 }}><strong>{t.camera}</strong></td>
-                          <td style={{ padding: 3 }}>#{t.track_id}</td>
-                          <td style={{ padding: 3 }}>{formatShortTime(t.t0)}–{formatShortTime(t.t1)}</td>
-                          <td style={{ padding: 3 }}>{t.n_frames}</td>
-                          <td style={{ padding: 3 }}>
-                            {t.has_face ? <span style={{ color: "#0f6e56", fontWeight: 700 }}>✓ {formatScore(t.best_face_score)}</span> : "—"}
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              )}
-            </div>
-          ) : (
-            <div className="merge-inspect-empty">
-              Выберите персону в левом списке или на таймлайне.
-            </div>
-          )}
-        </section>
-      </div>
+          <DayInspector
+            person={selectedPerson}
+            edges={personEdges}
+            selectedEdge={selectedEdge}
+            rightTab={rightTab}
+            onTab={setRightTab}
+            onSelectEdge={onSelectEdge}
+            onSeek={seekToDaySec}
+          />
+        </div>
+      )}
     </div>
   );
 }

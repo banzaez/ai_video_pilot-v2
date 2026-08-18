@@ -492,6 +492,33 @@ export function mediaLibraryPlugin(): Plugin {
           return;
         }
 
+        if (url.startsWith("/api/group_crop/")) {
+          const rawPath = url.slice("/api/group_crop/".length).split("?")[0];
+          const slashIdx = rawPath.indexOf("/");
+          if (slashIdx === -1) {
+            res.statusCode = 400;
+            res.end("Invalid group crop path");
+            return;
+          }
+          const gcBase = decodeURIComponent(rawPath.slice(0, slashIdx)).trim();
+          const gcFile = decodeURIComponent(rawPath.slice(slashIdx + 1)).trim();
+          if (!gcBase || !gcFile || gcBase.includes("..") || gcFile.includes("..")) {
+            res.statusCode = 400;
+            res.end("Bad base/filename");
+            return;
+          }
+          const gcPath = path.resolve(resultsDir, gcBase, "day_group_crops", gcFile);
+          if (!isInside(resultsDir, gcPath) || !fs.existsSync(gcPath) || !fs.statSync(gcPath).isFile()) {
+            res.statusCode = 404;
+            res.end("Group crop not found");
+            return;
+          }
+          res.setHeader("Content-Type", "image/jpeg");
+          res.setHeader("Cache-Control", "public, max-age=86400");
+          fs.createReadStream(gcPath).pipe(res);
+          return;
+        }
+
         if (url.startsWith("/api/face_crop/")) {
           const rawPath = url.slice("/api/face_crop/".length).split("?")[0];
           const slashIdx = rawPath.indexOf("/");

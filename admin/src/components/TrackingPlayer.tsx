@@ -46,6 +46,8 @@ type Props = {
 /** Seek по глобальному времени сессии (с учётом кусков). */
 export type TrackingPlayerHandle = {
   seekToGlobal: (tSec: number, playAfter?: boolean) => void;
+  setPlaybackRate: (rate: number) => void;
+  pause: () => void;
 };
 
 type JogStripProps = {
@@ -428,7 +430,26 @@ export const TrackingPlayer = forwardRef<TrackingPlayerHandle, Props>(function T
     [videoRef, isSession, sessionParts, fps, durationSec],
   );
 
-  useImperativeHandle(ref, () => ({ seekToGlobal }), [seekToGlobal]);
+  const setPlaybackRate = useCallback(
+    (rate: number) => {
+      const video = videoRef.current;
+      if (!video || !Number.isFinite(rate) || rate <= 0) return;
+      video.playbackRate = rate;
+    },
+    [videoRef],
+  );
+
+  const pause = useCallback(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    video.pause();
+  }, [videoRef]);
+
+  useImperativeHandle(ref, () => ({ seekToGlobal, setPlaybackRate, pause }), [
+    seekToGlobal,
+    setPlaybackRate,
+    pause,
+  ]);
 
   const scrubRafRef = useRef<number | null>(null);
   const frameStep = 1 / Math.max(fps, 1);

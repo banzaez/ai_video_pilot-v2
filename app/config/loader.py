@@ -47,6 +47,48 @@ def _link_value(
     return default
 
 
+def _parse_day_link_cfg(dl: dict[str, Any]) -> dict[str, Any]:
+    """Nested day_link.candidates / combo / passN + fallback на плоские ключи."""
+    cand = _link_section(dl, "candidates")
+    combo = _link_section(dl, "combo")
+    p1 = _link_section(dl, "pass1")
+    p2 = _link_section(dl, "pass2")
+    p4 = _link_section(dl, "pass4")
+
+    def g(section: dict[str, Any], key: str, *flat: str, default: Any) -> Any:
+        return _link_value(dl, section, key, *flat, default=default)
+
+    return {
+        "day_link_enabled": bool(dl.get("enabled", True)),
+        "day_link_top_k": int(dl.get("top_k", 0) or 0),
+        "day_link_save_crops": bool(dl.get("save_crops", True)),
+        "day_link_min_reid_score": float(g(cand, "min_reid_score", "min_reid_score", default=0.85)),
+        "day_link_max_gap_sec": float(g(cand, "max_gap_sec", "max_gap_sec", default=300.0)),
+        "day_link_max_overlap_sec": float(
+            g(p4, "max_overlap_sec", "max_overlap_sec", default=20.0)
+        ),
+        "day_link_max_spatial_px": float(g(cand, "max_spatial_px", "max_spatial_px", default=0.0)),
+        "day_link_max_spatial_m": float(g(cand, "max_spatial_m", "max_spatial_m", default=4.0)),
+        "day_link_motion_sigma_px": float(
+            g(cand, "motion_sigma_px", "motion_sigma_px", default=180.0)
+        ),
+        "day_link_motion_sigma_m": float(g(cand, "motion_sigma_m", "motion_sigma_m", default=3.0)),
+        "day_link_size_log_scale": float(g(cand, "size_log_scale", "size_log_scale", default=0.45)),
+        "day_link_w_reid": float(g(combo, "w_reid", "w_reid", default=0.65)),
+        "day_link_w_motion": float(g(combo, "w_motion", "w_motion", default=0.20)),
+        "day_link_w_size": float(g(combo, "w_size", "w_size", default=0.0)),
+        "day_link_w_gap": float(g(combo, "w_gap", "w_gap", default=0.15)),
+        "day_link_pass1_min_reid": float(g(p1, "min_reid", "pass1_min_reid", default=0.94)),
+        "day_link_pass1_min_score": float(g(p1, "min_score", "pass1_min_score", default=0.85)),
+        "day_link_pass2_min_score": float(g(p2, "min_score", "pass2_min_score", default=0.80)),
+        "day_link_pass4_max_overlap_sec": float(
+            g(p4, "max_overlap_sec", "pass4_max_overlap_sec", "max_overlap_sec", default=20.0)
+        ),
+        "day_link_pass4_min_reid": float(g(p4, "min_reid", "pass4_min_reid", default=0.90)),
+        "day_link_pass4_min_score": float(g(p4, "min_score", "pass4_min_score", default=0.70)),
+    }
+
+
 def _parse_tracklet_link_cfg(link_cfg: dict[str, Any]) -> dict[str, Any]:
     """Nested link.candidates / combo / passN + fallback на плоские ключи."""
     cand = _link_section(link_cfg, "candidates")
@@ -539,64 +581,7 @@ def settings_from_sources(args: argparse.Namespace | None = None) -> Settings:
         camera_link_min_combo_score=float((cfg.get("camera_link") or {}).get("min_combo_score", 0.55)),
         camera_link_solver=str((cfg.get("camera_link") or {}).get("solver", "hungarian")).lower(),
         # Global Day Link (day_link)
-        day_link_enabled=bool((cfg.get("day_link") or {}).get("enabled", True)),
-        day_link_face_models=tuple(
-            str(m)
-            for m in (
-                (cfg.get("day_link") or {}).get("face_models")
-                or [(cfg.get("camera_link") or {}).get("face_model", "buffalo_l")]
-            )
-            if str(m).strip()
-        ),
-        day_link_min_face_score=float((cfg.get("day_link") or {}).get("min_face_score", 0.60)),
-        day_link_min_reid_score=float((cfg.get("day_link") or {}).get("min_reid_score", 0.85)),
-        day_link_max_gap_sec=float((cfg.get("day_link") or {}).get("max_gap_sec", 300.0)),
-        day_link_max_overlap_sec=float((cfg.get("day_link") or {}).get("max_overlap_sec", 20.0)),
-        day_link_max_speed_mps=float((cfg.get("day_link") or {}).get("max_speed_mps", 3.5)),
-        day_link_motion_sigma_m=float((cfg.get("day_link") or {}).get("motion_sigma_m", 3.0)),
-        day_link_w_face=float((cfg.get("day_link") or {}).get("w_face", 0.45)),
-        day_link_w_reid=float((cfg.get("day_link") or {}).get("w_reid", 0.30)),
-        day_link_w_motion=float((cfg.get("day_link") or {}).get("w_motion", 0.20)),
-        day_link_w_gap=float((cfg.get("day_link") or {}).get("w_gap", 0.05)),
-        day_link_min_combo_score=float((cfg.get("day_link") or {}).get("min_combo_score", 0.70)),
-        day_link_window_sec=float((cfg.get("day_link") or {}).get("window_sec", 180.0)),
-        day_link_window_overlap_sec=float((cfg.get("day_link") or {}).get("window_overlap_sec", 30.0)),
-        day_link_solver=str((cfg.get("day_link") or {}).get("solver", "hungarian")).lower(),
-        day_link_pass0_min_face=float(
-            (cfg.get("day_link") or {}).get("pass0", {}).get("min_face", 0.75)
-            if isinstance((cfg.get("day_link") or {}).get("pass0"), dict)
-            else 0.75
-        ),
-        day_link_pass0_min_reid=float(
-            (cfg.get("day_link") or {}).get("pass0", {}).get("min_reid", 0.94)
-            if isinstance((cfg.get("day_link") or {}).get("pass0"), dict)
-            else 0.94
-        ),
-        day_link_pass0_min_score=float(
-            (cfg.get("day_link") or {}).get("pass0", {}).get("min_score", 0.85)
-            if isinstance((cfg.get("day_link") or {}).get("pass0"), dict)
-            else 0.85
-        ),
-        day_link_pass1_min_score=float(
-            (cfg.get("day_link") or {}).get("pass1", {}).get("min_score", 0.75)
-            if isinstance((cfg.get("day_link") or {}).get("pass1"), dict)
-            else 0.75
-        ),
-        day_link_pass2_min_score=float(
-            (cfg.get("day_link") or {}).get("pass2", {}).get("min_score", 0.80)
-            if isinstance((cfg.get("day_link") or {}).get("pass2"), dict)
-            else 0.80
-        ),
-        day_link_pass4_max_overlap_sec=float(
-            (cfg.get("day_link") or {}).get("pass4", {}).get("max_overlap_sec", 20.0)
-            if isinstance((cfg.get("day_link") or {}).get("pass4"), dict)
-            else 20.0
-        ),
-        day_link_pass4_min_score=float(
-            (cfg.get("day_link") or {}).get("pass4", {}).get("min_score", 0.70)
-            if isinstance((cfg.get("day_link") or {}).get("pass4"), dict)
-            else 0.70
-        ),
+        **_parse_day_link_cfg(cfg.get("day_link") or {}),
         input_path=_resolve_input_path(
             (
                 f"day:{args.day}"
