@@ -100,12 +100,16 @@ tracklet_pipeline:
     with_reid: false
   # Stage 2b: эмбеддинги кропов треклетов (tracklet_reid.json + .npz)
   reid:
-    top_k: 10
+    top_k: 5
     pick: spread
     batch_size: 8
     # JPG на диск не нужны для 2c (эмбеддинги в npz). true — только для отладки
     save_crops: false
     crops_dir: tracklet_crops
+    # TrackBestFramesPicker: отбор идеальных кадров по скелету и чистоте от других людей
+    pose_weight: 0.40
+    crowd_penalty: 0.50
+    min_completeness: 0.20
   # Stage 2c tracklet_link → tracklet_links.json (вкладка «Склейки»)
   # Pose на f0/f1 уточняет ноги (p0/p1 → map_p0/map_p1); motion экстраполирует конец A к t0(B).
   # Пять проходов: Pass 0 — ReID; Pass 1 — combo в окнах; Pass 2 — стык; Pass 3 — дырка; Pass 4 — handover.
@@ -132,16 +136,17 @@ tracklet_pipeline:
       w_size: 0.0
       w_gap: 0.15
 
-    # Pass 0: досклейка только по ReID (без combo). min_reid 0 = выкл.
+    # Pass 0: досклейка по ReID и combo score.
     pass0:
       min_reid: 0.96
+      min_score: 0.75
     # Pass 1: цепочки во времени (combo ≥ min_score в окнах).
     pass1:
       min_score: 0.90
       window_sec: 60
       window_overlap_sec: 15
       solver: hungarian
-    # Pass 2: стык готовых цепочек; Pass 3 (вставка в дырку) — тот же min_score.
+    # Pass 2: стык готовых цепочек (выход A → вход B).
     pass2:
       min_score: 0.85
     # Pass 4: ID-switch — B стартует в хвосте A. max_overlap_sec 0 = выкл.
@@ -184,11 +189,7 @@ camera_link:
   # Параллельно извлекаем лица всеми моделями; оценки сравнения — отдельно в face_scores.
   face_models: [buffalo_l, antelopev2]
   face_top_k: 5
-  face_max_attempts: 7
-  face_min_gap_sec: 0.5
-  face_dup_cos: 0.97
   min_face_score: 0.60
-  min_pose_face_score: 0.35
   face_crops_dir: face_crops
   max_gap_sec: 120.0
   max_speed_mps: 3.5

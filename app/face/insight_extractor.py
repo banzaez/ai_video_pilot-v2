@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import warnings
-from collections import Counter, defaultdict, deque
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Sequence
@@ -17,10 +17,10 @@ import numpy as np
 warnings.filterwarnings("ignore", category=FutureWarning, module="insightface")
 warnings.filterwarnings("ignore", category=FutureWarning, module="skimage")
 
-from app.config import Settings, face_crops_dir, video_work_dir
-from app.global_id.stage_pose import load_pose_lookup
+from app.config import Settings, face_crops_dir, tracklet_pose_cache_path
+from app.crops import TrackBestFramesPicker, TrackFrameCandidate, crop_person
 from app.pose import get_pose_service
-from app.pose.types import PoseResult, pose_completeness
+from app.pose.types import PoseResult
 from app.progress import make_pbar
 
 logger = logging.getLogger(__name__)
@@ -29,7 +29,6 @@ _FACE_APP_CACHE: dict[str, Any] = {}
 
 _FACE_IOU_MIN = 0.05
 _FACE_MIN_DET = 0.45
-_POSE_CACHE_COMPLETE = 0.5
 
 
 def l2_normalize(vec: np.ndarray) -> np.ndarray:
@@ -111,45 +110,6 @@ def _face_center_in_bbox(face_bbox: tuple[float, float, float, float], person_bb
     return px1 <= cx <= px2 and py1 <= cy <= py2
 
 
-def _pose_from_lookup(rec: dict[str, Any]) -> PoseResult | None:
-    kxy = rec.get("kxy")
-    kcf = rec.get("kcf")
-    if not isinstance(kxy, list) or not isinstance(kcf, list) or not kxy:
-        return None
-    bbox = rec.get("bbox") or [0.0, 0.0, 0.0, 0.0]
-    return PoseResult(
-        bbox=[float(v) for v in bbox[:4]],
-        confidence=float(rec.get("confidence", 0.5)),
-        kxy=kxy,
-        kcf=[float(c) for c in kcf],
-    )
-
-
-def _pose_completeness_in_lookup(
-    pose_lookup: dict[int, dict[int, dict[str, Any]]],
-    track_id: int,
-    frame_index: int,
-    min_conf: float,
-) -> float:
-    rec = pose_lookup.get(track_id, {}).get(frame_index)
-    if not rec:
-        return 0.0
-    kcf = rec.get("kcf")
-    if not isinstance(kcf, list):
-        return 0.0
-    return pose_completeness(kcf, min_conf)
-
-
-@dataclass
-class FaceCandidate:
-    group_id: int
-    track_id: int
-    frame_index: int
-    bbox: list[float]  # [x1, y1, x2, y2]
-    height: float
-    is_solo: bool
-
-
 @dataclass
 class _DetectedFace:
     det_score: float
@@ -171,133 +131,6 @@ class _BufferedFace:
     model: str
     is_solo: bool
     jpeg_bytes: bytes | None
-
-
-def _pick_spaced_candidates(
-    cands: list[FaceCandidate],
-    *,
-    pose_lookup: dict[int, dict[int, dict[str, Any]]],
-    min_gap_frames: int,
-    kpt_min: float,
-) -> list[FaceCandidate]:
-    """Сортирует по полноте позы/высоте и жадно отбирает кадры с минимальным зазором."""
-    ordered = sorted(
-        cands,
-        key=lambda c: (
-            -_pose_completeness_in_lookup(pose_lookup, c.group_id, c.frame_index, kpt_min),
-            -c.height,
-        ),
-    )
-    picked: list[FaceCandidate] = []
-    gap = max(1, int(min_gap_frames))
-    for cand in ordered:
-        if all(abs(cand.frame_index - p.frame_index) >= gap for p in picked):
-            picked.append(cand)
-    return picked
-
-
-def _round_robin_quota(queues: list[list[FaceCandidate]], max_attempts: int) -> list[FaceCandidate]:
-    """По одному кандидату из каждого трека по кругу; остаток уходит живым очередям."""
-    live = [deque(q) for q in queues if q]
-    out: list[FaceCandidate] = []
-    qi = 0
-    while len(out) < max_attempts and live:
-        q = live[qi]
-        out.append(q.popleft())
-        if not q:
-            live.pop(qi)
-            if not live:
-                break
-            qi %= len(live)
-        else:
-            qi = (qi + 1) % len(live)
-    return out
-
-
-def _collect_group_candidates(
-    frames_data: list[dict[str, Any]],
-    *,
-    solo_global_ids: set[int],
-    max_attempts: int,
-    pose_lookup: dict[int, dict[int, dict[str, Any]]] | None = None,
-    min_gap_frames: int = 1,
-    use_tracklet_ids: bool = False,
-    tracklet_to_global: dict[int, int] | None = None,
-    kpt_min: float = 0.25,
-) -> dict[int, list[FaceCandidate]]:
-    """Собирает кандидатов по global track_id; квота round-robin по трекам группы."""
-    mapping = tracklet_to_global or {}
-    lookup = pose_lookup or {}
-    group_dets: dict[int, list[FaceCandidate]] = {}
-
-    for f in frames_data:
-        fi = int(f.get("frame_index", 0))
-        for d in f.get("detections", []):
-            tid = int(d.get("track_id") or d.get("tracklet_id") or 0)
-            if tid <= 0:
-                continue
-            if use_tracklet_ids:
-                gid = mapping.get(tid, tid)
-                frag_id = tid
-            else:
-                gid = int(d.get("track_id") or tid)
-                frag_id = int(d.get("tracklet_id") or gid)
-            bbox = d.get("bbox")
-            if not bbox or len(bbox) < 4:
-                continue
-            x1, y1, x2, y2 = [float(v) for v in bbox[:4]]
-            h = max(0.0, y2 - y1)
-            if h <= 20.0:
-                continue
-            cand = FaceCandidate(
-                group_id=gid,
-                track_id=frag_id,
-                frame_index=fi,
-                bbox=[x1, y1, x2, y2],
-                height=h,
-                is_solo=gid in solo_global_ids,
-            )
-            group_dets.setdefault(gid, []).append(cand)
-
-    selected: dict[int, list[FaceCandidate]] = {}
-    for gid, cands in group_dets.items():
-        by_track: dict[int, list[FaceCandidate]] = defaultdict(list)
-        for cand in cands:
-            by_track[cand.track_id].append(cand)
-        queues = [
-            _pick_spaced_candidates(
-                track_cands,
-                pose_lookup=lookup,
-                min_gap_frames=min_gap_frames,
-                kpt_min=kpt_min,
-            )
-            for track_cands in by_track.values()
-        ]
-        selected[gid] = _round_robin_quota(queues, max_attempts)
-    return selected
-
-
-def _person_head_crop(
-    frame_img: np.ndarray,
-    cand: FaceCandidate,
-) -> tuple[np.ndarray, int, int] | None:
-    img_h, img_w = frame_img.shape[:2]
-    x1, y1, x2, y2 = cand.bbox
-    bw = x2 - x1
-    bh = y2 - y1
-    head_y2 = y1 + bh * 0.65
-    px = bw * 0.15
-    py = bh * 0.10
-    ix1 = max(0, int(round(x1 - px)))
-    iy1 = max(0, int(round(y1 - py)))
-    ix2 = min(img_w, int(round(x2 + px)))
-    iy2 = min(img_h, int(round(head_y2 + py)))
-    if ix2 <= ix1 or iy2 <= iy1:
-        return None
-    person_crop = frame_img[iy1:iy2, ix1:ix2]
-    if person_crop.size == 0 or person_crop.shape[0] < 20 or person_crop.shape[1] < 20:
-        return None
-    return person_crop, ix1, iy1
 
 
 def _pick_face_for_person(
@@ -422,78 +255,6 @@ def _buffer_key(is_solo: bool, group_id: int, model: str) -> tuple[bool, int, st
     return (is_solo, group_id, model)
 
 
-def _buffer_push(buf: list[_BufferedFace], slot: _BufferedFace, top_k: int, dup_cos: float) -> None:
-    """Дедуп по косинусу эмбеддинга + покрытие всех треков в top_k."""
-    for i, ex in enumerate(buf):
-        if float(np.dot(ex.embedding, slot.embedding)) >= dup_cos:
-            if slot.quality > ex.quality:
-                buf[i] = slot
-            return
-
-    if len(buf) < top_k:
-        buf.append(slot)
-        return
-
-    counts = Counter(s.track_id for s in buf)
-    over = [i for i, s in enumerate(buf) if counts[s.track_id] > 1]
-
-    if slot.track_id not in counts and over:
-        buf[min(over, key=lambda i: buf[i].quality)] = slot
-        return
-
-    pool = over or list(range(len(buf)))
-    worst_i = min(pool, key=lambda i: buf[i].quality)
-    if slot.quality > buf[worst_i].quality:
-        buf[worst_i] = slot
-
-
-def _resolve_pose_for_candidates(
-    pose_service: Any,
-    frame_img: np.ndarray,
-    cands: list[FaceCandidate],
-    pose_lookup: dict[int, dict[int, dict[str, Any]]],
-    kpt_min: float,
-) -> list[tuple[FaceCandidate, PoseResult | None, float]]:
-    """Сначала самая полная поза, затем face_confidence."""
-    out: list[tuple[FaceCandidate, PoseResult | None, float]] = []
-    need_yolo: list[FaceCandidate] = []
-    need_indices: list[int] = []
-    cached_poses: dict[int, PoseResult] = {}
-
-    for cand in cands:
-        cached = pose_lookup.get(cand.group_id, {}).get(cand.frame_index)
-        pose = _pose_from_lookup(cached) if cached else None
-        if pose is not None and pose.completeness(min_conf=kpt_min) >= _POSE_CACHE_COMPLETE:
-            out.append((cand, pose, pose.face_confidence(min_conf=kpt_min)))
-            continue
-        if pose is not None:
-            cached_poses[len(out)] = pose
-        need_yolo.append(cand)
-        need_indices.append(len(out))
-        out.append((cand, pose, pose.face_confidence(min_conf=kpt_min) if pose is not None else 0.0))
-
-    if need_yolo:
-        rows = pose_service.pose_faces_for_bboxes(
-            frame_img,
-            [c.bbox for c in need_yolo],
-            kpt_min=kpt_min,
-        )
-        for idx, (yolo_pose, yolo_score) in zip(need_indices, rows):
-            cand = out[idx][0]
-            cached = cached_poses.get(idx)
-            best = yolo_pose
-            score = yolo_score
-            if cached is not None:
-                if yolo_pose is None or cached.completeness(min_conf=kpt_min) >= yolo_pose.completeness(
-                    min_conf=kpt_min
-                ):
-                    best = cached
-                    score = cached.face_confidence(min_conf=kpt_min)
-            out[idx] = (cand, best, score)
-
-    return out
-
-
 def extract_faces_for_groups(
     settings: Settings,
     *,
@@ -513,17 +274,11 @@ def extract_faces_for_groups(
     face_apps = {m: get_face_analysis(m) for m in models}
     pose_service = get_pose_service(settings)
     top_k = max(1, int(settings.camera_link_face_top_k))
-    max_attempts = max(1, int(settings.camera_link_face_max_attempts))
     save_crops = bool(settings.camera_link_save_face_crops)
     crops_dir = face_crops_dir(settings)
     multi_model = len(models) > 1
     solo_ids = solo_global_ids or set()
     kpt_min = float(settings.pose_kpt_min)
-    min_gap_sec = float(settings.camera_link_face_min_gap_sec)
-    min_gap_frames = max(1, int(round(min_gap_sec * max(1.0, fps))))
-    dup_cos = float(settings.camera_link_face_dup_cos)
-
-    pose_lookup = load_pose_lookup(video_work_dir(settings))
 
     if save_crops:
         if os.path.isdir(crops_dir):
@@ -535,21 +290,61 @@ def extract_faces_for_groups(
                         pass
         os.makedirs(crops_dir, exist_ok=True)
 
-    candidates_by_group = _collect_group_candidates(
-        frames_data,
-        solo_global_ids=solo_ids,
-        max_attempts=max_attempts,
-        pose_lookup=pose_lookup,
-        min_gap_frames=min_gap_frames,
-        use_tracklet_ids=use_tracklet_ids,
-        tracklet_to_global=tracklet_to_global,
+    # 1. Группировка детекций по (is_solo, group_id, track_id) для TrackBestFramesPicker
+    mapping = tracklet_to_global or {}
+    group_candidates: dict[tuple[bool, int], dict[int, list[TrackFrameCandidate]]] = defaultdict(lambda: defaultdict(list))
+
+    for f in frames_data:
+        fi = int(f.get("frame_index", 0))
+        all_dets = f.get("detections", [])
+        for d in all_dets:
+            tid = int(d.get("track_id") or d.get("tracklet_id") or 0)
+            if tid <= 0:
+                continue
+            if use_tracklet_ids:
+                gid = mapping.get(tid, tid)
+                frag_id = tid
+            else:
+                gid = int(d.get("track_id") or tid)
+                frag_id = int(d.get("tracklet_id") or gid)
+            bbox = d.get("bbox")
+            if not bbox or len(bbox) < 4:
+                continue
+            x1, y1, x2, y2 = [float(v) for v in bbox[:4]]
+            h = max(0.0, y2 - y1)
+            if h <= 20.0:
+                continue
+            is_solo = gid in solo_ids
+            other_dets = [other for other in all_dets if other is not d]
+            cand = TrackFrameCandidate(
+                frame_index=fi,
+                target_det=d,
+                all_dets=other_dets,
+                tracklet_id=frag_id,
+            )
+            group_candidates[(is_solo, gid)][frag_id].append(cand)
+
+    # 2. Интеллектуальный отбор лучших кадров лиц через TrackBestFramesPicker с дисковым кэшем
+    picker = TrackBestFramesPicker(
+        pose_service=pose_service,
         kpt_min=kpt_min,
     )
+    cache_path = tracklet_pose_cache_path(settings)
 
-    cands_by_frame: dict[int, list[FaceCandidate]] = {}
-    for _gid, cands in candidates_by_group.items():
-        for c in cands:
-            cands_by_frame.setdefault(c.frame_index, []).append(c)
+    # Собираем отобранные лучшие кадры лиц для каждой группы
+    picked_faces_by_group: dict[tuple[bool, int], list[ScoredTrackFrame]] = {}
+    cands_by_frame: dict[int, list[tuple[bool, int, ScoredTrackFrame]]] = defaultdict(list)
+
+    for (is_solo, gid), by_track in group_candidates.items():
+        best_faces = picker.pick_best_faces_for_group(
+            by_track,
+            top_k=top_k,
+            cache_path=cache_path,
+        )
+        if best_faces:
+            picked_faces_by_group[(is_solo, gid)] = best_faces
+            for sc in best_faces:
+                cands_by_frame[sc.frame_index].append((is_solo, gid, sc))
 
     face_buffers: dict[tuple[bool, int, str], list[_BufferedFace]] = {}
 
@@ -607,63 +402,48 @@ def extract_faces_for_groups(
             if frame_img is None or frame_img.size == 0:
                 continue
 
-            # Дешёвая проверка head-crop до позы
-            head_ok: list[tuple[FaceCandidate, np.ndarray, int, int]] = []
-            for cand in cands_on_frame:
-                head = _person_head_crop(frame_img, cand)
-                if head is None:
-                    continue
-                person_crop, ix1, iy1 = head
-                head_ok.append((cand, person_crop, ix1, iy1))
+            img_h, img_w = frame_img.shape[:2]
 
-            if not head_ok:
-                continue
-
-            pose_rows = _resolve_pose_for_candidates(
-                pose_service,
-                frame_img,
-                [c for c, _, _, _ in head_ok],
-                pose_lookup,
-                kpt_min,
-            )
-
-            for (cand, person_crop, ix1, iy1), (cand2, pose, pose_face_score) in zip(head_ok, pose_rows):
-                if cand is not cand2:
+            for is_solo, gid, sc in cands_on_frame:
+                tb = sc.target_det.get("bbox") or [0, 0, 1, 1]
+                person_crop, roi = crop_person(frame_img, tb, pad=0.10)
+                if person_crop.size == 0:
                     continue
-                if pose is None or pose_face_score <= 0.0:
-                    continue
+                rx1, ry1 = roi[0], roi[1]
 
                 detected = _detect_faces_parallel(
                     face_apps,
                     person_crop,
-                    cand.bbox,
-                    offset_x=ix1,
-                    offset_y=iy1,
+                    tb,
+                    offset_x=rx1,
+                    offset_y=ry1,
                     executor=executor,
                 )
                 if not detected:
                     continue
 
+                pose_face_score = max(0.1, float(sc.face_conf))
+                pose_conf = float(sc.pose_result.confidence) if sc.pose_result else 0.5
+
                 for model_name, hit in detected.items():
-                    quality = float(hit.det_score) * float(pose_face_score)
+                    quality = float(hit.det_score) * pose_face_score
                     jpeg_bytes = _encode_face_jpeg(frame_img, hit.face_bbox) if save_crops else None
                     slot = _BufferedFace(
                         quality=quality,
-                        group_id=cand.group_id,
-                        track_id=cand.track_id,
-                        frame_index=cand.frame_index,
+                        group_id=gid,
+                        track_id=sc.tracklet_id or gid,
+                        frame_index=sc.frame_index,
                         det_score=float(hit.det_score),
-                        pose_face_score=float(pose_face_score),
-                        pose_conf=round(float(pose.confidence), 4),
+                        pose_face_score=round(pose_face_score, 4),
+                        pose_conf=round(pose_conf, 4),
                         face_bbox=hit.face_bbox,
                         embedding=hit.embedding,
                         model=model_name,
-                        is_solo=cand.is_solo,
+                        is_solo=is_solo,
                         jpeg_bytes=jpeg_bytes,
                     )
-                    key = _buffer_key(cand.is_solo, cand.group_id, model_name)
-                    face_buffers.setdefault(key, [])
-                    _buffer_push(face_buffers[key], slot, top_k, dup_cos)
+                    key = _buffer_key(is_solo, gid, model_name)
+                    face_buffers.setdefault(key, []).append(slot)
 
     finally:
         if session_reader is not None:
@@ -681,6 +461,7 @@ def extract_faces_for_groups(
 
     for (is_solo, gid, model_name), slots in face_buffers.items():
         slots.sort(key=lambda s: -s.quality)
+        slots = slots[:top_k]
         key_str = str(gid)
         prefix = "t" if is_solo else "g"
         suffix = f"_{model_name}" if multi_model else ""

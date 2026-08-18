@@ -74,6 +74,9 @@ def _parse_tracklet_link_cfg(link_cfg: dict[str, Any]) -> dict[str, Any]:
         "w_size": float(g(combo, "w_size", "w_size", default=0.10)),
         "w_gap": float(g(combo, "w_gap", "w_gap", default=0.10)),
         "pass0_min_reid": float(g(p0, "min_reid", "pass0_min_reid", default=0.0)),
+        "pass0_min_score": float(
+            g(p0, "min_score", "pass0_min_score", "min_combo", default=0.0)
+        ),
         "pass1_min_score": float(
             g(p1, "min_score", "pass1_min_score", "auto_min_score", default=0.70)
         ),
@@ -440,11 +443,15 @@ def settings_from_sources(args: argparse.Namespace | None = None) -> Settings:
         tracklet_reid_solider_image_size=tracklet_reid["solider_image_size"],
         tracklet_reid_solider_transformer=tracklet_reid["solider_transformer"],
         tracklet_reid_pad=float(tracklet_reid_cfg.get("pad", 0.04)),
+        tracklet_reid_pose_weight=float(tracklet_reid_cfg.get("pose_weight", 0.40)),
+        tracklet_reid_crowd_penalty=float(tracklet_reid_cfg.get("crowd_penalty", 0.50)),
+        tracklet_reid_min_completeness=float(tracklet_reid_cfg.get("min_completeness", 0.20)),
         tracklet_crops_dir=str(tracklet_reid_cfg.get("crops_dir") or "tracklet_crops"),
         tracklet_link_max_gap_sec=float(link["max_gap_sec"]),
         tracklet_link_min_reid_score=float(link["min_reid_score"]),
         tracklet_link_pass1_min_score=float(link["pass1_min_score"]),
         tracklet_link_pass0_min_reid=float(link["pass0_min_reid"]),
+        tracklet_link_pass0_min_score=float(link.get("pass0_min_score", 0.0)),
         tracklet_link_max_spatial_px=float(link["max_spatial_px"]),
         tracklet_link_max_spatial_m=float(link["max_spatial_m"]),
         tracklet_link_motion_sigma_px=float(link["motion_sigma_px"]),

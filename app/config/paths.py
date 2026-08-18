@@ -61,6 +61,10 @@ def tracklet_reid_json_path(settings: Settings) -> str:
     return os.path.join(video_work_dir(settings), "tracklet_reid.json")
 
 
+def tracklet_pose_cache_path(settings: Settings) -> str:
+    return os.path.join(video_work_dir(settings), "tracklet_pose_cache.json")
+
+
 def tracklet_reid_npz_path(settings: Settings) -> str:
     return os.path.join(video_work_dir(settings), "tracklet_reid.npz")
 

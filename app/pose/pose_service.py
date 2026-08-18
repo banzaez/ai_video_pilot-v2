@@ -10,6 +10,7 @@ import numpy as np
 from app.config import Settings
 from app.model_cache import get_model_cache, predict_batch_size, resolve_pt_path
 from app.pose.types import PoseResult, select_pose_by_completeness
+from app.progress import make_pbar
 
 logger = logging.getLogger(__name__)
 
@@ -126,6 +127,8 @@ class PoseService:
         *,
         conf: float | None = None,
         batch_size: int | None = None,
+        show_pbar: bool = False,
+        pbar_desc: str = "[Pose batch]",
     ) -> list[list[PoseResult]]:
         """
         Батчевый инференс списка изображений/кадров с автоматическим чанкованием.
@@ -137,11 +140,22 @@ class PoseService:
         eff_batch = self.effective_batch_size(batch_size)
 
         out: list[list[PoseResult]] = []
-        for i in range(0, len(images), eff_batch):
-            chunk = list(images[i : i + eff_batch])
-            raw_res = model.predict(source=chunk, **kw)
-            parsed = _parse_pose_results(raw_res)
-            out.extend(parsed)
+        pbar = (
+            make_pbar(total=len(images), desc=pbar_desc, unit="crop")
+            if show_pbar
+            else None
+        )
+        try:
+            for i in range(0, len(images), eff_batch):
+                chunk = list(images[i : i + eff_batch])
+                raw_res = model.predict(source=chunk, **kw)
+                parsed = _parse_pose_results(raw_res)
+                out.extend(parsed)
+                if pbar is not None:
+                    pbar.update(len(chunk))
+        finally:
+            if pbar is not None:
+                pbar.close()
         return out
 
     def pose_faces_for_bboxes(

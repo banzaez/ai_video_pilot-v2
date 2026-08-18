@@ -687,10 +687,11 @@ def _pass0_merge_groups(
     *,
     spans: dict[int, tuple[float, float]],
     min_reid: float,
+    min_score: float = 0.0,
     tracklets: list[dict[str, Any]] | None = None,
 ) -> tuple[list[list[int]], set[tuple[int, int]]]:
-    """Pass 0: склеить готовые цепочки только по ReID ≥ min_reid (выход A → вход B), 1-1, без overlap."""
-    if min_reid <= 0 or len(groups) < 2:
+    """Pass 0: склеить готовые цепочки по ReID ≥ min_reid и combo score ≥ min_score (выход A → вход B), 1-1, без overlap."""
+    if (min_reid <= 0 and min_score <= 0) or len(groups) < 2:
         return groups, set()
 
     ends = _ends_from_tracklets(tracklets)
@@ -698,10 +699,17 @@ def _pass0_merge_groups(
     for e in edges:
         a, b = int(e["from"]), int(e["to"])
         reid = float(e.get("reid") or 0)
-        if reid < min_reid:
+        score = float(e.get("score") or 0)
+        if min_reid > 0 and reid < min_reid:
+            continue
+        if min_score > 0 and score < min_score:
             continue
         prev = by_pair.get((a, b))
-        if prev is None or reid > float(prev.get("reid") or 0):
+        metric = score if min_score > 0 else reid
+        prev_metric = (
+            float(prev.get("score") or 0) if min_score > 0 else float(prev.get("reid") or 0)
+        ) if prev is not None else -1.0
+        if prev is None or metric > prev_metric:
             by_pair[(a, b)] = e
 
     best: dict[tuple[int, int], tuple[float, int, int]] = {}
@@ -722,16 +730,17 @@ def _pass0_merge_groups(
             rec = by_pair.get((exit_id, entry_id))
             if rec is None:
                 continue
-            reid = float(rec.get("reid") or 0)
-            best[(ga, gb)] = (reid, exit_id, entry_id)
+            score_val = float(rec.get("score") if min_score > 0 else rec.get("reid") or 0)
+            best[(ga, gb)] = (score_val, exit_id, entry_id)
 
     if not best:
         return groups, set()
 
     group_ids = list(range(len(groups)))
     t0_g = {gi: _group_span(groups[gi], spans)[0] for gi in group_ids if groups[gi]}
-    fake_edges = [(ga, gb, reid) for (ga, gb), (reid, _, _) in best.items()]
-    chains = link_hungarian_chains(group_ids, fake_edges, min_score=min_reid, t0=t0_g)
+    threshold = min_score if min_score > 0 else min_reid
+    fake_edges = [(ga, gb, val) for (ga, gb), (val, _, _) in best.items()]
+    chains = link_hungarian_chains(group_ids, fake_edges, min_score=threshold, t0=t0_g)
 
     used: set[tuple[int, int]] = set()
     new_groups: list[list[int]] = []
@@ -1088,6 +1097,7 @@ def link_tracklets(
     w_size: float = 0.10,
     w_gap: float = 0.10,
     pass0_min_reid: float = 0.0,
+    pass0_min_score: float = 0.0,
     pass2_min_score: float = 0.0,
     pass4_max_overlap_sec: float = 0.0,
     pass4_min_reid: float = 0.95,
@@ -1190,12 +1200,13 @@ def link_tracklets(
     pass2_used: set[tuple[int, int]] = set()
     pass3_used: set[tuple[int, int]] = set()
     pass4_used: set[tuple[int, int]] = set()
-    if pass0_min_reid > 0:
+    if pass0_min_reid > 0 or pass0_min_score > 0:
         groups, pass0_used = _pass0_merge_groups(
             groups,
             all_edges,
             spans=spans,
             min_reid=pass0_min_reid,
+            min_score=pass0_min_score,
             tracklets=tracklets,
         )
     if pass2_min_score > 0:
@@ -1205,12 +1216,6 @@ def link_tracklets(
             spans=spans,
             min_combo=pass2_min_score,
             tracklets=tracklets,
-        )
-        groups, pass3_used = _pass3_splice_gaps(
-            groups,
-            all_edges,
-            spans=spans,
-            min_combo=pass2_min_score,
         )
     if pass4_max_overlap_sec > 0:
         groups, pass4_edges, pass4_used = _pass4_handover_groups(

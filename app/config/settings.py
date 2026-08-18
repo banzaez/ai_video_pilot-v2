@@ -94,11 +94,15 @@ class Settings:
     tracklet_reid_solider_image_size: tuple[int, int] = (384, 128)
     tracklet_reid_solider_transformer: str = "swin_base_patch4_window7_224"
     tracklet_reid_pad: float = 0.04
+    tracklet_reid_pose_weight: float = 0.40
+    tracklet_reid_crowd_penalty: float = 0.50
+    tracklet_reid_min_completeness: float = 0.20
     tracklet_crops_dir: str = "tracklet_crops"
     tracklet_link_max_gap_sec: float = 20.0
     tracklet_link_min_reid_score: float = 0.55
     tracklet_link_pass1_min_score: float = 0.70
     tracklet_link_pass0_min_reid: float = 0.0
+    tracklet_link_pass0_min_score: float = 0.0
     tracklet_link_max_spatial_px: float = 700.0
     tracklet_link_max_spatial_m: float = 4.0
     tracklet_link_motion_sigma_px: float = 180.0
