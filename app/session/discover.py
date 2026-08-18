@@ -1,0 +1,245 @@
+"""Discovery camera-day sessions из плоских prod-имён в data/video/."""
+
+from __future__ import annotations
+
+import logging
+import os
+import re
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Any
+
+from app.info import VIDEO_EXTS, list_video_files
+
+logger = logging.getLogger(__name__)
+
+SESSION_PREFIX = "session:"
+
+# Camera_01_<source>_<started>_<ended>_<seg>
+# source: nvr_local | 10.12.0.35_10.12.0.235 | любое другое без обязательного формата
+# seg: tid1401s… | 3084159 | любой хвост
+_PROD_STEM = re.compile(
+    r"^Camera_(?P<idx>\d+)_(?P<source>.+)_"
+    r"(?P<started>\d{14})_(?P<ended>\d{14})_"
+    r"(?P<seg>.+)$",
+    re.IGNORECASE,
+)
+
+_SESSION_KEY = re.compile(r"^\d{2}_\d{8}$")
+
+
+def parse_session_input(raw: str) -> str | None:
+    raw = str(raw or "").strip()
+    if raw.startswith(SESSION_PREFIX):
+        key = raw[len(SESSION_PREFIX) :].strip()
+        return key if key else None
+    if _SESSION_KEY.match(raw):
+        return raw
+    return None
+
+
+def is_lite_subdir(path: str) -> bool:
+    norm = os.path.normpath(str(path))
+    return os.path.basename(norm) == "lite" or norm.endswith(f"{os.sep}lite")
+
+
+def _iso_from_nvr(raw: str) -> str | None:
+    try:
+        return datetime.strptime(raw, "%Y%m%d%H%M%S").isoformat(timespec="seconds")
+    except ValueError:
+        return None
+
+
+def _day_from_started(started_raw: str) -> str | None:
+    try:
+        return datetime.strptime(started_raw[:8], "%Y%m%d").strftime("%Y-%m-%d")
+    except ValueError:
+        return None
+
+
+@dataclass(frozen=True)
+class ParsedPart:
+    path: str
+    stem: str
+    name: str
+    camera_index: int
+    started_raw: str
+    ended_raw: str
+    started_at: str
+    ended_at: str
+    day: str
+    session_key: str
+
+
+def session_key_from_part(camera_index: int, started_raw: str) -> str:
+    day = started_raw[:8]
+    return f"{int(camera_index):02d}_{day}"
+
+
+def parse_prod_stem(stem: str) -> ParsedPart | None:
+    m = _PROD_STEM.match(stem)
+    if not m:
+        return None
+    gd = m.groupdict()
+    idx = int(gd["idx"])
+    started_raw = gd["started"]
+    ended_raw = gd["ended"]
+    started_at = _iso_from_nvr(started_raw)
+    ended_at = _iso_from_nvr(ended_raw)
+    day = _day_from_started(started_raw)
+    if not started_at or not ended_at or not day:
+        return None
+    name = f"{stem}.mp4"
+    return ParsedPart(
+        path="",
+        stem=stem,
+        name=name,
+        camera_index=idx,
+        started_raw=started_raw,
+        ended_raw=ended_raw,
+        started_at=started_at,
+        ended_at=ended_at,
+        day=day,
+        session_key=session_key_from_part(idx, started_raw),
+    )
+
+
+def discover_prod_parts(video_dir: str) -> list[ParsedPart]:
+    """Только файлы в корне video_dir (без lite/ и без рекурсии)."""
+    if not video_dir or not os.path.isdir(video_dir):
+        return []
+    out: list[ParsedPart] = []
+    for path in list_video_files(video_dir):
+        stem = os.path.splitext(os.path.basename(path))[0]
+        parsed = parse_prod_stem(stem)
+        if not parsed:
+            continue
+        abs_path = os.path.abspath(path)
+        try:
+            stored = os.path.relpath(abs_path, os.getcwd()).replace("\\", "/")
+        except ValueError:
+            stored = os.path.basename(path)
+        if os.path.isabs(stored) or stored.startswith(".."):
+            candidate = os.path.join("data", "video", os.path.basename(path)).replace("\\", "/")
+            stored = candidate if os.path.isfile(candidate) else os.path.basename(path)
+        out.append(
+            ParsedPart(
+                path=stored,
+                stem=parsed.stem,
+                name=parsed.name,
+                camera_index=parsed.camera_index,
+                started_raw=parsed.started_raw,
+                ended_raw=parsed.ended_raw,
+                started_at=parsed.started_at,
+                ended_at=parsed.ended_at,
+                day=parsed.day,
+                session_key=parsed.session_key,
+            )
+        )
+    return out
+
+
+@dataclass
+class Session:
+    key: str
+    camera_index: int
+    day: str
+    parts: list[ParsedPart] = field(default_factory=list)
+
+
+def group_by_session_key(parts: list[ParsedPart]) -> list[Session]:
+    by_key: dict[str, list[ParsedPart]] = {}
+    for p in parts:
+        by_key.setdefault(p.session_key, []).append(p)
+    sessions: list[Session] = []
+    for key in sorted(by_key):
+        group = sorted(by_key[key], key=lambda p: p.started_raw)
+        for i in range(1, len(group)):
+            prev, cur = group[i - 1], group[i]
+            if prev.ended_raw != cur.started_raw:
+                logger.warning(
+                    "Session %s: gap между частями %s → %s (ended=%s started=%s)",
+                    key,
+                    prev.stem,
+                    cur.stem,
+                    prev.ended_raw,
+                    cur.started_raw,
+                )
+        first = group[0]
+        sessions.append(
+            Session(
+                key=key,
+                camera_index=first.camera_index,
+                day=first.day,
+                parts=group,
+            )
+        )
+    return sessions
+
+
+def discover_sessions(video_dir: str) -> list[Session]:
+    return group_by_session_key(discover_prod_parts(video_dir))
+
+
+def frame_to_part(manifest: dict[str, Any], global_frame: int) -> tuple[dict[str, Any], int]:
+    """global_frame 0-based → (part dict, local_frame 0-based)."""
+    parts = manifest.get("parts") or []
+    gf = int(global_frame)
+    for part in parts:
+        offset = int(part.get("frame_offset") or 0)
+        count = int(part.get("frame_count") or 0)
+        if offset <= gf < offset + count:
+            return part, gf - offset
+    if parts:
+        last = parts[-1]
+        offset = int(last.get("frame_offset") or 0)
+        count = int(last.get("frame_count") or 0)
+        local = max(0, min(gf - offset, max(0, count - 1)))
+        return last, local
+    raise ValueError(f"frame {global_frame} вне session manifest")
+
+
+def resolve_sessions_for_input(raw: str, search_dir: str | None = None) -> tuple[str, list[Session], list[str]]:
+    """(mode, sessions, legacy_files).
+
+    mode: 'session' | 'legacy'
+    """
+    raw = str(raw or "").strip()
+    sk = parse_session_input(raw)
+    if sk:
+        video_dir = search_dir or "data/video"
+        all_sessions = discover_sessions(video_dir)
+        hit = [s for s in all_sessions if s.key == sk]
+        if not hit:
+            raise ValueError(f"Session не найдена: {sk}")
+        return "session", hit, []
+
+    if os.path.isfile(raw):
+        if is_lite_subdir(os.path.dirname(raw)) or parse_prod_stem(os.path.splitext(os.path.basename(raw))[0]):
+            # prod single file still goes legacy unless explicitly session:
+            if parse_prod_stem(os.path.splitext(os.path.basename(raw))[0]):
+                part = parse_prod_stem(os.path.splitext(os.path.basename(raw))[0])
+                if part:
+                    video_dir = search_dir or os.path.dirname(os.path.abspath(raw)) or "data/video"
+                    sessions = discover_sessions(video_dir)
+                    if sessions:
+                        hit = [s for s in sessions if any(p.stem == part.stem for p in s.parts)]
+                        if hit:
+                            return "session", hit, []
+            return "legacy", [], [raw]
+        return "legacy", [], [raw]
+
+    if os.path.isdir(raw):
+        if is_lite_subdir(raw):
+            return "legacy", [], list_video_files(raw)
+        sessions = discover_sessions(raw)
+        if sessions:
+            return "session", sessions, []
+        return "legacy", [], list_video_files(raw)
+
+    if search_dir and os.path.isdir(search_dir):
+        cand = os.path.join(search_dir, os.path.basename(raw))
+        if os.path.isfile(cand):
+            return resolve_sessions_for_input(cand, search_dir)
+
+    raise ValueError(f"Видео не найдено: {raw}")

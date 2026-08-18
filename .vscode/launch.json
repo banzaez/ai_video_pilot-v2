@@ -1,0 +1,49 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Python: Pipeline (app.main)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "app.main",
+      "python": "${workspaceFolder}/venv/bin/python",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "args": []
+    },
+    {
+      "name": "Python: Jobs API (app.jobs)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "app.jobs",
+      "python": "${workspaceFolder}/venv/bin/python",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/vendor"
+      }
+    },
+    {
+      "name": "Admin: Vite Dev",
+      "type": "node",
+      "request": "launch",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": [
+        "run",
+        "dev"
+      ],
+      "cwd": "${workspaceFolder}/admin",
+      "console": "integratedTerminal"
+    }
+  ],
+  "compounds": [
+    {
+      "name": "Jobs API + Admin",
+      "configurations": [
+        "Python: Jobs API (app.jobs)",
+        "Admin: Vite Dev"
+      ],
+      "stopAll": true
+    }
+  ]
+}

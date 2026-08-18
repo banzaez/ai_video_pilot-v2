@@ -216,3 +216,20 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Vendored Python deps (ставятся через pip install -r requirements.txt)
+vendor/
+
+# Локальные данные пайплайна (основные каталоги — через .gitkeep)
+data/**
+!data/*/
+!data/*/.gitkeep
+!data/maps/**
+!data/models/detect/
+!data/models/detect/.gitkeep
+# Веса моделей — только локально
+data/models/**/*.pt
+data/models/**/*.pth
+data/models/**/*.onnx
+data/models/**/*.mlpackage
+data/models/**/*.zip

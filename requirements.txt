@@ -1,0 +1,17 @@
+# Минимальные версии. Для воспроизводимости: pip freeze > requirements.lock
+ultralytics>=8.4.120,<9
+opencv-python>=5.0.0.93
+numpy>=2.5.2,<3
+lapx>=0.9.4,<1
+pyyaml>=6.0.3,<7
+tqdm>=4.70.0,<5
+orjson>=3.12.0,<4
+torch>=2.13.0,<3
+torchreid>=0.2.5,<1
+# Job API (admin pipeline tab)
+fastapi>=0.141.1,<1
+uvicorn>=0.52.3,<1
+pydantic>=2.13.0,<3  # 2.14 пока нет в PyPI (макс. 2.13.x)
+
+# RT-DETRv2 (detection.backend: rtdetr_v2), Hugging Face:
+transformers>=5.15.0,<6

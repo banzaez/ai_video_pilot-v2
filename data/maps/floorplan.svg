@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="4800" height="3200" viewBox="0 0 4800 3200">
+  <!--
+    Масштаб: 1 клетка = 0.5 м = 80 px → 1 м = 160 px
+    Внутренний пол: 4560×2960 px ≈ 28.5 × 18.5 м
+  -->
+  <defs>
+    <pattern id="tiles05" width="80" height="80" patternUnits="userSpaceOnUse">
+      <rect width="80" height="80" fill="#f4f6f2"/>
+      <path d="M 80 0 L 0 0 0 80" fill="none" stroke="#aeb8af" stroke-width="2"/>
+      <path d="M 40 0 L 40 80 M 0 40 L 80 40" fill="none" stroke="#d5ddd6" stroke-width="1"/>
+    </pattern>
+  </defs>
+
+  <rect width="4800" height="3200" fill="#e8ece7"/>
+
+  <!-- стены -->
+  <rect x="48" y="48" width="4704" height="3104" fill="#2a3832"/>
+  <!-- пол -->
+  <rect x="120" y="120" width="4560" height="2960" fill="url(#tiles05)" stroke="#152018" stroke-width="4"/>
+
+  <text x="2400" y="72" text-anchor="middle" font-family="IBM Plex Mono, ui-monospace, monospace" font-size="36" fill="#0f6e56">ROOM — tiles 0.5 m (80 px) · ≈ 28.5 × 18.5 m</text>
+
+  <g transform="translate(4520 280)">
+    <circle r="72" fill="#fff" stroke="#0f6e56" stroke-width="4"/>
+    <path d="M0 44 L0 -44 L-14 -18 L0 -44 L14 -18" fill="none" stroke="#0f6e56" stroke-width="4"/>
+    <text y="12" text-anchor="middle" font-family="IBM Plex Mono, ui-monospace, monospace" font-size="28" fill="#0f6e56">N</text>
+  </g>
+
+  <g transform="translate(200 3120)">
+    <line x1="0" y1="-32" x2="80" y2="-32" stroke="#152018" stroke-width="6"/>
+    <line x1="0" y1="-48" x2="0" y2="-16" stroke="#152018" stroke-width="4"/>
+    <line x1="80" y1="-48" x2="80" y2="-16" stroke="#152018" stroke-width="4"/>
+    <text x="40" y="10" text-anchor="middle" font-family="IBM Plex Mono, ui-monospace, monospace" font-size="28" fill="#5a675e">0.5 m</text>
+  </g>
+</svg>
