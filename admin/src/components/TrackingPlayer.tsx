@@ -38,6 +38,8 @@ type Props = {
    * остальные рисуются серым. null = без приглушения.
    */
   focusTrackIds?: number[] | null;
+  /** Если true и задан focusTrackIds, не рисовать невыбранные треки вовсе */
+  hideUnfocused?: boolean;
   compact?: boolean;
 };
 
@@ -312,6 +314,7 @@ export const TrackingPlayer = forwardRef<TrackingPlayerHandle, Props>(function T
     groupByTrack = {},
     mergeTimeline = null,
     focusTrackIds = null,
+    hideUnfocused = false,
     compact = false,
   },
   ref,
@@ -326,6 +329,8 @@ export const TrackingPlayer = forwardRef<TrackingPlayerHandle, Props>(function T
   const [globalSec, setGlobalSec] = useState(0);
   const [activePartIdx, setActivePartIdx] = useState(0);
   const scrubbingRef = useRef(false);
+  const hideUnfocusedRef = useRef(hideUnfocused);
+  hideUnfocusedRef.current = hideUnfocused;
 
   const isSession = !!(sessionParts && sessionParts.length > 0);
   const fps = tracking?.fps ?? 25;
@@ -641,6 +646,7 @@ export const TrackingPlayer = forwardRef<TrackingPlayerHandle, Props>(function T
         }
 
         const dimmed = focus != null && !focus.has(det.track_id) && !focus.has(fragTrackId);
+        if (dimmed && hideUnfocusedRef.current) continue;
         const highlighted = !dimmed && (highlightRef.current.has(det.track_id) || highlightRef.current.has(fragTrackId));
         const color = dimmed ? DIM : colorForTrackId(fragTrackId);
         const bc: [number, number] = [Math.round((x1 + x2) / 2), y2];

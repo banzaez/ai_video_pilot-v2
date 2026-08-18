@@ -18,6 +18,7 @@ import { cropUrlsFor, findTrackletBbox, videoLocalFrame } from "./crops.js";
 import { hitsByTrack, mergeHitsFor, mergeTimelineFor, similarFromTrackletLinks } from "./merges.js";
 import { cameraHomoPath, mapsConfig } from "./maps.js";
 import { discoverSessionsFromVideoDir } from "./sessions.js";
+import { discoverDays, getDayLinksMeta, runDayLinkProcess } from "./day.js";
 
 // Re-exports for backwards compatibility
 export { readArtifact, refMatches, readJsonFile, workFile };
@@ -25,6 +26,7 @@ export { staleStagesReport } from "./stale.js";
 export { faceGalleryFor, cameraLinkFor } from "./faces.js";
 export { cropUrlsFor } from "./crops.js";
 export { mergeHitsFor, mergeTimelineFor, similarFromTrackletLinks } from "./merges.js";
+export { discoverDays, getDayLinksMeta, runDayLinkProcess } from "./day.js";
 
 export function mediaLibraryPlugin(): Plugin {
   return {
@@ -32,6 +34,61 @@ export function mediaLibraryPlugin(): Plugin {
     configureServer(server) {
       server.middlewares.use(async (req, res, next) => {
         const url = req.url ?? "";
+
+        if (url.startsWith("/api/day/list")) {
+          try {
+            const days = discoverDays();
+            res.setHeader("Content-Type", "application/json");
+            res.end(JSON.stringify({ days }));
+          } catch (err) {
+            res.statusCode = 500;
+            res.end(JSON.stringify({ error: String(err) }));
+          }
+          return;
+        }
+
+        if (url.startsWith("/api/day/meta")) {
+          try {
+            const u = new URL(url, "http://local");
+            const dayParam = (u.searchParams.get("day") ?? "").trim();
+            if (!dayParam) {
+              res.statusCode = 400;
+              res.end(JSON.stringify({ error: "Missing ?day= param" }));
+              return;
+            }
+            const data = getDayLinksMeta(dayParam);
+            res.setHeader("Content-Type", "application/json");
+            res.end(JSON.stringify(data));
+          } catch (err) {
+            res.statusCode = 500;
+            res.end(JSON.stringify({ error: String(err) }));
+          }
+          return;
+        }
+
+        if (url.startsWith("/api/day/run")) {
+          if (req.method !== "POST") {
+            res.statusCode = 405;
+            res.end(JSON.stringify({ error: "Method not allowed" }));
+            return;
+          }
+          try {
+            const raw = await readRequestBody(req);
+            const body = JSON.parse(raw || "{}") as { day?: string };
+            if (!body.day) {
+              res.statusCode = 400;
+              res.end(JSON.stringify({ error: "Missing { day } in request body" }));
+              return;
+            }
+            const result = await runDayLinkProcess(body.day);
+            res.setHeader("Content-Type", "application/json");
+            res.end(JSON.stringify(result));
+          } catch (err) {
+            res.statusCode = 500;
+            res.end(JSON.stringify({ error: String(err) }));
+          }
+          return;
+        }
 
         if (url.startsWith("/api/media/sessions")) {
           try {

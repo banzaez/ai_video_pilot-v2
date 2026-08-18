@@ -14,6 +14,7 @@ from app.info import VIDEO_EXTS, list_video_files
 logger = logging.getLogger(__name__)
 
 SESSION_PREFIX = "session:"
+DAY_PREFIX = "day:"
 
 # Camera_01_<source>_<started>_<ended>_<seg>
 # source: nvr_local | 10.12.0.35_10.12.0.235 | любое другое без обязательного формата
@@ -26,6 +27,7 @@ _PROD_STEM = re.compile(
 )
 
 _SESSION_KEY = re.compile(r"^\d{2}_\d{8}$")
+_DAY_KEY = re.compile(r"^(\d{8}|\d{4}-\d{2}-\d{2})$")
 
 
 def parse_session_input(raw: str) -> str | None:
@@ -35,6 +37,20 @@ def parse_session_input(raw: str) -> str | None:
         return key if key else None
     if _SESSION_KEY.match(raw):
         return raw
+    return None
+
+
+def parse_day_input(raw: str) -> str | None:
+    raw = str(raw or "").strip()
+    if raw.startswith(DAY_PREFIX):
+        val = raw[len(DAY_PREFIX) :].strip()
+        clean = val.replace("-", "")
+        if len(clean) == 8 and clean.isdigit():
+            return clean
+    if _DAY_KEY.match(raw):
+        clean = raw.replace("-", "")
+        if len(clean) == 8 and clean.isdigit():
+            return clean
     return None
 
 
@@ -181,6 +197,16 @@ def discover_sessions(video_dir: str) -> list[Session]:
     return group_by_session_key(discover_prod_parts(video_dir))
 
 
+def discover_days(video_dir: str) -> dict[str, list[Session]]:
+    """Группирует сессии по дням (день = '20260401' или '2026-04-01')."""
+    sessions = discover_sessions(video_dir)
+    by_day: dict[str, list[Session]] = {}
+    for s in sessions:
+        clean = s.day.replace("-", "")
+        by_day.setdefault(clean, []).append(s)
+    return by_day
+
+
 def frame_to_part(manifest: dict[str, Any], global_frame: int) -> tuple[dict[str, Any], int]:
     """global_frame 0-based → (part dict, local_frame 0-based)."""
     parts = manifest.get("parts") or []
@@ -202,9 +228,43 @@ def frame_to_part(manifest: dict[str, Any], global_frame: int) -> tuple[dict[str
 def resolve_sessions_for_input(raw: str, search_dir: str | None = None) -> tuple[str, list[Session], list[str]]:
     """(mode, sessions, legacy_files).
 
-    mode: 'session' | 'legacy'
+    mode: 'session' | 'day' | 'legacy'
     """
     raw = str(raw or "").strip()
+
+    # Проверяем день: day:20260401 или 20260401
+    day_key = parse_day_input(raw)
+    if day_key:
+        video_dir = search_dir or "data/video"
+        all_sessions = discover_sessions(video_dir)
+        hit = [s for s in all_sessions if s.day.replace("-", "") == day_key]
+        if hit:
+            return "day", sorted(hit, key=lambda s: s.camera_index), [day_key]
+        # Если в video_dir нет файлов, но есть сохраненные сессии в data/results:
+        from app.io.json_util import load_tracking_json
+        results_root = "data/results"
+        if os.path.isdir(results_root):
+            recovered = []
+            for name in os.listdir(results_root):
+                info_path = os.path.join(results_root, name, "info.json")
+                if os.path.isfile(info_path):
+                    try:
+                        info = load_tracking_json(info_path)
+                        sess_day = str(info.get("day") or "").replace("-", "")
+                        if sess_day == day_key:
+                            cam_idx = int(info.get("camera_index") or 0)
+                            recovered.append(Session(
+                                key=name,
+                                camera_index=cam_idx,
+                                day=str(info.get("day")),
+                                parts=[],
+                            ))
+                    except Exception:
+                        pass
+            if recovered:
+                return "day", sorted(recovered, key=lambda s: s.camera_index), [day_key]
+        raise ValueError(f"Сессии за день {day_key} не найдены")
+
     sk = parse_session_input(raw)
     if sk:
         video_dir = search_dir or "data/video"
@@ -243,3 +303,4 @@ def resolve_sessions_for_input(raw: str, search_dir: str | None = None) -> tuple
             return resolve_sessions_for_input(cand, search_dir)
 
     raise ValueError(f"Видео не найдено: {raw}")
+

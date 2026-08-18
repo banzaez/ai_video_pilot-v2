@@ -47,6 +47,7 @@ from app.tracklet.remap import remap_tracklet_frames
 from app.global_id.stage_feet import run_feet
 from app.global_id.stage_pose import run_pose
 from app.global_id.stage_camera_link import run_camera_link
+from app.global_id.stage_day_link import run_day_link
 
 _SESSION_KEY_RE = re.compile(r"^\d{2}_\d{8}$")
 
@@ -452,7 +453,8 @@ PER_VIDEO_STAGES = (
     "feet",
     "camera_link",
 )
-PIPELINE_STAGES = PER_VIDEO_STAGES
+GLOBAL_DAY_STAGES = ("day_link",)
+PIPELINE_STAGES = (*PER_VIDEO_STAGES, *GLOBAL_DAY_STAGES)
 TRACKLET_SUBSTAGES = ("tracklets", "tracklet_reid", "tracklet_link")
 
 
@@ -499,13 +501,16 @@ def stages_to_run(settings: Settings) -> list[str]:
 
 def run(settings: Settings) -> None:
     mode, sessions, legacy_jobs = resolve_sessions_for_input(str(settings.input_path))
-    run_info(settings)
+    if mode != "day" or settings.stage != "day_link":
+        run_info(settings)
     wanted = stages_to_run(settings)
     if not wanted:
         return
     per_video = [s for s in wanted if s in PER_VIDEO_STAGES]
+    day_stages = [s for s in wanted if s in GLOBAL_DAY_STAGES]
+
     if per_video:
-        if mode == "session":
+        if mode in ("session", "day"):
             if not sessions:
                 raise ValueError("Нет sessions для обработки")
         elif not legacy_jobs:
@@ -516,7 +521,7 @@ def run(settings: Settings) -> None:
     else:
         how = "stage"
         rng = settings.stage
-    n_jobs = len(sessions) if mode == "session" else len(legacy_jobs)
+    n_jobs = len(sessions) if mode in ("session", "day") else len(legacy_jobs)
     logger.info("Обработка %s job(s), %s=%s → %s", n_jobs, how, rng, ",".join(wanted))
     cache = ModelCache()
     set_model_cache(cache)
@@ -533,7 +538,7 @@ def run(settings: Settings) -> None:
     fail_fast = os.environ.get("PIPELINE_FAIL_FAST", "").strip().lower() in ("1", "true", "yes")
     errors: list[str] = []
     if per_video:
-        if mode == "session":
+        if mode in ("session", "day"):
             for sess in sessions:
                 job = replace(settings, input_path=f"{SESSION_PREFIX}{sess.key}")
                 logger.info("=== session %s ===", sess.key)
@@ -564,3 +569,15 @@ def run(settings: Settings) -> None:
             f"Пайплайн завершился с ошибками ({len(errors)}):\n"
             + "\n".join(f"  - {e}" for e in errors)
         )
+
+    # Выполнение глобальных стадий дня (day_link)
+    if "day_link" in day_stages:
+        if mode == "day" and sessions:
+            day_str = sessions[0].day.replace("-", "")
+            run_day_link(settings, target_day=day_str)
+        elif mode == "session" and sessions:
+            day_str = sessions[0].day.replace("-", "")
+            run_day_link(settings, target_day=day_str)
+        else:
+            run_day_link(settings)
+

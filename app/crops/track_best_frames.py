@@ -11,7 +11,11 @@ from typing import Any, Sequence
 import cv2
 import numpy as np
 
-from app.crops.geometry import crop_person
+from app.crops.geometry import (
+    apply_gaussian_feathering,
+    create_pose_alpha_mask,
+    crop_person,
+)
 from app.entity_id import tracklet as tracklet_eid
 from app.pose.pose_service import PoseService
 from app.pose.types import PoseResult, select_pose_index_by_completeness
@@ -366,6 +370,11 @@ class TrackBestFramesPicker:
         w_completeness: float = 0.65,
         w_face: float = 0.35,
         crop_pad: float = 0.04,
+        feathering_enabled: bool = False,
+        feathering_mode: str = "pose",
+        feathering_sigma: float = 15.0,
+        feathering_bone_thickness: float = 0.18,
+        feathering_bg_color: Sequence[int] | tuple[int, int, int] = (128, 128, 128),
     ) -> None:
         self.pose_service = pose_service
         self.pose_weight = max(0.0, min(1.0, float(pose_weight)))
@@ -374,6 +383,11 @@ class TrackBestFramesPicker:
         self.w_completeness = float(w_completeness)
         self.w_face = float(w_face)
         self.crop_pad = float(crop_pad)
+        self.feathering_enabled = bool(feathering_enabled)
+        self.feathering_mode = str(feathering_mode or "pose")
+        self.feathering_sigma = max(1.0, float(feathering_sigma))
+        self.feathering_bone_thickness = float(feathering_bone_thickness)
+        self.feathering_bg_color = tuple(int(v) for v in feathering_bg_color[:3])
 
     def score_candidates_batch(
         self,
@@ -578,6 +592,23 @@ class TrackBestFramesPicker:
                     kpt_min=self.kpt_min,
                 )
 
+            final_crop = crops[i]
+            if self.feathering_enabled and final_crop is not None and final_crop.size > 0:
+                alpha_mask = create_pose_alpha_mask(
+                    final_crop.shape[:2],
+                    best_pose,
+                    crop_roi=crop_roi,
+                    kpt_min=self.kpt_min,
+                    sigma=self.feathering_sigma,
+                    bone_thickness_ratio=self.feathering_bone_thickness,
+                    mode=self.feathering_mode,
+                )
+                final_crop = apply_gaussian_feathering(
+                    final_crop,
+                    alpha_mask,
+                    bg_color=self.feathering_bg_color,
+                )
+
             scored_list.append(
                 ScoredTrackFrame(
                     frame_index=cand.frame_index,
@@ -590,7 +621,7 @@ class TrackBestFramesPicker:
                     crowd_penalty=total_crowd_penalty,
                     n_poses_in_crop=n_poses_in_crop,
                     pose_result=best_pose,
-                    crop_image=crops[i],
+                    crop_image=final_crop,
                     face_crop=face_crop_arr,
                     face_bbox=face_bbox_arr,
                     tracklet_id=cand.tracklet_id,

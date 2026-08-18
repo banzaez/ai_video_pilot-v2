@@ -264,6 +264,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Папка с видео или один файл (путь или имя). Без файла — все ролики в папке",
     )
+    parser.add_argument(
+        "--day",
+        type=str,
+        default=None,
+        help="День для обработки (формат YYYYMMDD или YYYY-MM-DD)",
+    )
     parser.add_argument("--model", type=str, default=None)
     parser.add_argument(
         "--detection-backend",
@@ -447,6 +453,31 @@ def settings_from_sources(args: argparse.Namespace | None = None) -> Settings:
         tracklet_reid_pose_weight=float(best_frames_cfg.get("pose_weight", tracklet_reid_cfg.get("pose_weight", 0.40))),
         tracklet_reid_crowd_penalty=float(best_frames_cfg.get("crowd_penalty", tracklet_reid_cfg.get("crowd_penalty", 0.50))),
         tracklet_reid_min_completeness=float(best_frames_cfg.get("min_completeness", tracklet_reid_cfg.get("min_completeness", 0.20))),
+        tracklet_reid_feathering_enabled=bool(
+            best_frames_cfg.get("feathering", {}).get("enabled", False)
+            if isinstance(best_frames_cfg.get("feathering"), dict)
+            else best_frames_cfg.get("feathering_enabled", False)
+        ),
+        tracklet_reid_feathering_mode=str(
+            best_frames_cfg.get("feathering", {}).get("mode", "pose")
+            if isinstance(best_frames_cfg.get("feathering"), dict)
+            else best_frames_cfg.get("feathering_mode", "pose")
+        ),
+        tracklet_reid_feathering_sigma=float(
+            best_frames_cfg.get("feathering", {}).get("sigma", 15.0)
+            if isinstance(best_frames_cfg.get("feathering"), dict)
+            else best_frames_cfg.get("feathering_sigma", 15.0)
+        ),
+        tracklet_reid_feathering_bone_thickness=float(
+            best_frames_cfg.get("feathering", {}).get("bone_thickness", 0.18)
+            if isinstance(best_frames_cfg.get("feathering"), dict)
+            else best_frames_cfg.get("feathering_bone_thickness", 0.18)
+        ),
+        tracklet_reid_feathering_bg_color=tuple(
+            best_frames_cfg.get("feathering", {}).get("bg_color", [128, 128, 128])
+            if isinstance(best_frames_cfg.get("feathering"), dict)
+            else [128, 128, 128]
+        ),
         tracklet_crops_dir=str(tracklet_reid_cfg.get("crops_dir") or "tracklet_crops"),
         tracklet_link_max_gap_sec=float(link["max_gap_sec"]),
         tracklet_link_min_reid_score=float(link["min_reid_score"]),
@@ -507,7 +538,73 @@ def settings_from_sources(args: argparse.Namespace | None = None) -> Settings:
         camera_link_w_motion=float((cfg.get("camera_link") or {}).get("w_motion", 0.20)),
         camera_link_min_combo_score=float((cfg.get("camera_link") or {}).get("min_combo_score", 0.55)),
         camera_link_solver=str((cfg.get("camera_link") or {}).get("solver", "hungarian")).lower(),
-        input_path=_resolve_input_path(args.input, video_cfg.get("input_path", "data/video")),
+        # Global Day Link (day_link)
+        day_link_enabled=bool((cfg.get("day_link") or {}).get("enabled", True)),
+        day_link_face_models=tuple(
+            str(m)
+            for m in (
+                (cfg.get("day_link") or {}).get("face_models")
+                or [(cfg.get("camera_link") or {}).get("face_model", "buffalo_l")]
+            )
+            if str(m).strip()
+        ),
+        day_link_min_face_score=float((cfg.get("day_link") or {}).get("min_face_score", 0.60)),
+        day_link_min_reid_score=float((cfg.get("day_link") or {}).get("min_reid_score", 0.85)),
+        day_link_max_gap_sec=float((cfg.get("day_link") or {}).get("max_gap_sec", 300.0)),
+        day_link_max_overlap_sec=float((cfg.get("day_link") or {}).get("max_overlap_sec", 20.0)),
+        day_link_max_speed_mps=float((cfg.get("day_link") or {}).get("max_speed_mps", 3.5)),
+        day_link_motion_sigma_m=float((cfg.get("day_link") or {}).get("motion_sigma_m", 3.0)),
+        day_link_w_face=float((cfg.get("day_link") or {}).get("w_face", 0.45)),
+        day_link_w_reid=float((cfg.get("day_link") or {}).get("w_reid", 0.30)),
+        day_link_w_motion=float((cfg.get("day_link") or {}).get("w_motion", 0.20)),
+        day_link_w_gap=float((cfg.get("day_link") or {}).get("w_gap", 0.05)),
+        day_link_min_combo_score=float((cfg.get("day_link") or {}).get("min_combo_score", 0.70)),
+        day_link_window_sec=float((cfg.get("day_link") or {}).get("window_sec", 180.0)),
+        day_link_window_overlap_sec=float((cfg.get("day_link") or {}).get("window_overlap_sec", 30.0)),
+        day_link_solver=str((cfg.get("day_link") or {}).get("solver", "hungarian")).lower(),
+        day_link_pass0_min_face=float(
+            (cfg.get("day_link") or {}).get("pass0", {}).get("min_face", 0.75)
+            if isinstance((cfg.get("day_link") or {}).get("pass0"), dict)
+            else 0.75
+        ),
+        day_link_pass0_min_reid=float(
+            (cfg.get("day_link") or {}).get("pass0", {}).get("min_reid", 0.94)
+            if isinstance((cfg.get("day_link") or {}).get("pass0"), dict)
+            else 0.94
+        ),
+        day_link_pass0_min_score=float(
+            (cfg.get("day_link") or {}).get("pass0", {}).get("min_score", 0.85)
+            if isinstance((cfg.get("day_link") or {}).get("pass0"), dict)
+            else 0.85
+        ),
+        day_link_pass1_min_score=float(
+            (cfg.get("day_link") or {}).get("pass1", {}).get("min_score", 0.75)
+            if isinstance((cfg.get("day_link") or {}).get("pass1"), dict)
+            else 0.75
+        ),
+        day_link_pass2_min_score=float(
+            (cfg.get("day_link") or {}).get("pass2", {}).get("min_score", 0.80)
+            if isinstance((cfg.get("day_link") or {}).get("pass2"), dict)
+            else 0.80
+        ),
+        day_link_pass4_max_overlap_sec=float(
+            (cfg.get("day_link") or {}).get("pass4", {}).get("max_overlap_sec", 20.0)
+            if isinstance((cfg.get("day_link") or {}).get("pass4"), dict)
+            else 20.0
+        ),
+        day_link_pass4_min_score=float(
+            (cfg.get("day_link") or {}).get("pass4", {}).get("min_score", 0.70)
+            if isinstance((cfg.get("day_link") or {}).get("pass4"), dict)
+            else 0.70
+        ),
+        input_path=_resolve_input_path(
+            (
+                f"day:{args.day}"
+                if getattr(args, "day", None) and not getattr(args, "input", None)
+                else getattr(args, "input", None)
+            ),
+            video_cfg.get("input_path", "data/video"),
+        ),
         json_output_dir=video_cfg.get("json_output_dir", "data/results"),
         workers=workers,
         stage=(

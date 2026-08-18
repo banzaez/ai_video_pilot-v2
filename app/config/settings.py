@@ -32,6 +32,7 @@ STAGE_CHOICES = (
     "pose",
     "feet",
     "camera_link",
+    "day_link",
     "all",
     "no_merge",  # алиас all (раньше: без финального link)
 )
@@ -97,6 +98,11 @@ class Settings:
     tracklet_reid_pose_weight: float = 0.40
     tracklet_reid_crowd_penalty: float = 0.50
     tracklet_reid_min_completeness: float = 0.20
+    tracklet_reid_feathering_enabled: bool = False
+    tracklet_reid_feathering_mode: str = "pose"
+    tracklet_reid_feathering_sigma: float = 15.0
+    tracklet_reid_feathering_bone_thickness: float = 0.18
+    tracklet_reid_feathering_bg_color: tuple[int, int, int] = (128, 128, 128)
     tracklet_crops_dir: str = "tracklet_crops"
     tracklet_link_max_gap_sec: float = 20.0
     tracklet_link_min_reid_score: float = 0.55
@@ -148,6 +154,31 @@ class Settings:
     camera_link_w_motion: float = 0.20
     camera_link_min_combo_score: float = 0.55
     camera_link_solver: str = "hungarian"
+
+    # --- Global Day Link Settings (day_link) ---
+    day_link_enabled: bool = True
+    day_link_face_models: tuple[str, ...] = ("buffalo_l", "antelopev2")
+    day_link_min_face_score: float = 0.60
+    day_link_min_reid_score: float = 0.85
+    day_link_max_gap_sec: float = 300.0
+    day_link_max_overlap_sec: float = 20.0
+    day_link_max_speed_mps: float = 3.5
+    day_link_motion_sigma_m: float = 3.0
+    day_link_w_face: float = 0.45
+    day_link_w_reid: float = 0.30
+    day_link_w_motion: float = 0.20
+    day_link_w_gap: float = 0.05
+    day_link_min_combo_score: float = 0.70
+    day_link_window_sec: float = 180.0
+    day_link_window_overlap_sec: float = 30.0
+    day_link_solver: str = "hungarian"
+    day_link_pass0_min_face: float = 0.75
+    day_link_pass0_min_reid: float = 0.94
+    day_link_pass0_min_score: float = 0.85
+    day_link_pass1_min_score: float = 0.75
+    day_link_pass2_min_score: float = 0.80
+    day_link_pass4_max_overlap_sec: float = 20.0
+    day_link_pass4_min_score: float = 0.70
 
     input_path: str = "data/video"
     json_output_dir: str | None = "data/results"

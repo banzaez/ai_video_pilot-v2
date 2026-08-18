@@ -21,6 +21,7 @@ VIDEO_STAGE_ORDER = (
     "feet",
     "camera_face",
     "camera_link",
+    "day_link",
 )
 STAGE_ORDER = VIDEO_STAGE_ORDER
 
@@ -36,6 +37,7 @@ STAGE_FILES: dict[str, str] = {
     "feet": "feet.json",
     "camera_face": "camera_face.json",
     "camera_link": "camera_links.json",
+    "day_link": "day_links.json",
 }
 
 # Прямой родитель (для inputs). info и detect — корни цепочки обработки.
@@ -50,6 +52,7 @@ STAGE_PARENT: dict[str, str | None] = {
     "feet": "pose",
     "camera_face": "track",
     "camera_link": "feet",
+    "day_link": "camera_link",
 }
 
 # Версия формата файла стадии (поднять при несовместимом изменении JSON)

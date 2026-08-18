@@ -46,7 +46,14 @@ best_frames:
   # Минимальная уверенность (confidence) ключевой точки скелета, чтобы считать её видимой (порог полноты)
   min_completeness: 0.20
   # Отступ (padding) вокруг bbox при формировании кропа человека (доля от размера)
-  pad: 0.04
+  pad: 0.00
+  # Мягкое гауссово затухание краев кропа на основе позы / силуэта человека (Alpha / Gaussian Feathering)
+  feathering:
+    enabled: false # Включение гауссова затухания краев кропа
+    mode: "pose" # "pose" (анатомический силуэт по скелету) или "ellipse" (радиальный фокус)
+    sigma: 12.0 # Радиус мягкого размытия границы
+    bone_thickness: 0.18 # Толщина костей скелета относительно ширины кропа (доля 0.05..0.40)
+    bg_color: [128, 128, 128] # Нейтральный цвет фона для блендинга [R, G, B]
 
 # --- Stage 1: detect → detections.json ---
 detection:
@@ -144,7 +151,7 @@ tracklet_pipeline:
     # Веса combo = w_reid·reid + w_motion·motion + w_size·size + w_gap·gap (сумма ≈ 1).
     combo:
       w_reid: 0.65
-      w_motion: 0.30
+      w_motion: 0.20
       w_size: 0.0
       w_gap: 0.15
 
@@ -213,6 +220,38 @@ camera_link:
   face_crops_dir: face_crops
   save_face_crops: true
 
+# --- Stage day_link: глобальная межкамерная склейка дня (Pass 0–4) ---
+day_link:
+  enabled: true
+  face_models: [buffalo_l, antelopev2]
+  min_face_score: 0.60
+  min_reid_score: 0.85
+  max_gap_sec: 300.0
+  max_overlap_sec: 20.0
+  max_speed_mps: 3.5
+  motion_sigma_m: 3.0
+  w_face: 0.45
+  w_reid: 0.30
+  w_motion: 0.20
+  w_gap: 0.05
+  min_combo_score: 0.70
+  window_sec: 180
+  window_overlap_sec: 30
+  solver: hungarian
+  pass0:
+    min_face: 0.75
+    min_reid: 0.94
+    min_score: 0.85
+  pass1:
+    min_score: 0.75
+    window_sec: 180
+    window_overlap_sec: 30
+  pass2:
+    min_score: 0.80
+  pass4:
+    max_overlap_sec: 20.0
+    min_score: 0.70
+
 nvr:
   enabled: true
   host: "183.88.220.86"
@@ -225,3 +264,4 @@ nvr:
   connect_timeout_sec: 30
   read_timeout_search_sec: 120
   read_timeout_download_sec: 900
+

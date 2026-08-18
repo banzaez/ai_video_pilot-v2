@@ -13,6 +13,8 @@ from app.config.paths import (
     camera_face_npz_path,
     camera_links_json_path,
     cameras_dir,
+    day_links_json_path,
+    day_results_dir,
     detections_json_path,
     face_crops_dir,
     feet_json_path,
@@ -46,6 +48,8 @@ __all__ = [
     "camera_face_npz_path",
     "camera_links_json_path",
     "cameras_dir",
+    "day_links_json_path",
+    "day_results_dir",
     "detections_json_path",
     "face_crops_dir",
     "feet_json_path",
@@ -71,3 +75,4 @@ __all__ = [
     "video_stem",
     "video_work_dir",
 ]
+

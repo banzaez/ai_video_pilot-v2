@@ -156,6 +156,11 @@ def run_tracklet_reid(settings: Settings) -> None:
         crowd_crop_penalty=settings.tracklet_reid_crowd_penalty,
         kpt_min=settings.tracklet_reid_min_completeness,
         crop_pad=settings.tracklet_reid_pad,
+        feathering_enabled=settings.tracklet_reid_feathering_enabled,
+        feathering_mode=settings.tracklet_reid_feathering_mode,
+        feathering_sigma=settings.tracklet_reid_feathering_sigma,
+        feathering_bone_thickness=settings.tracklet_reid_feathering_bone_thickness,
+        feathering_bg_color=settings.tracklet_reid_feathering_bg_color,
     )
 
     # 3. Индексация детекций по кадрам и треклетам

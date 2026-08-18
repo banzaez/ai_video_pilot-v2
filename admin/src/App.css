@@ -5153,3 +5153,83 @@ body {
   }
 }
 
+/* =========================================================
+   UNIFIED PASS PILLS & BADGES (FOR MERGE & DAY TABS)
+   ========================================================= */
+
+.pass-pill {
+  font-size: 10px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: var(--surface, #fff);
+  border: 1px solid var(--line);
+  color: var(--muted);
+  font-family: var(--mono);
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.pass-pill.pass0 {
+  background: #e8f5e9;
+  border-color: #a5d6a7;
+  color: #2e7d32;
+  font-weight: 600;
+}
+
+.pass-pill.pass1 {
+  background: #e3f2fd;
+  border-color: #90caf9;
+  color: #1565c0;
+  font-weight: 600;
+}
+
+.pass-pill.pass2 {
+  background: #fff3e0;
+  border-color: #ffcc80;
+  color: #e65100;
+  font-weight: 600;
+}
+
+.pass-pill.pass4 {
+  background: #f3e5f5;
+  border-color: #ce93d8;
+  color: #6a1b9a;
+  font-weight: 600;
+}
+
+/* Стили фона для видеокарт в панели анализа дня */
+.day-camera-card {
+  display: flex;
+  flex-direction: column;
+  background: var(--surface, #ffffff);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.day-camera-card.has-person {
+  border-color: var(--accent, #0d6efd);
+}
+
+.day-camera-card .stage,
+.merge-inspect-center .stage {
+  background: var(--surface, #ffffff);
+  border-radius: 0;
+}
+
+.day-camera-card .stage video,
+.merge-inspect-center .stage video {
+  background: var(--surface, #ffffff);
+}
+
+.day-camera-card .player.empty,
+.merge-inspect-center .player.empty {
+  background: var(--surface, #ffffff);
+  color: var(--muted);
+  border: none;
+  min-height: 180px;
+}
+
+
+

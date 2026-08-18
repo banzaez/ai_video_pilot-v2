@@ -3,6 +3,7 @@ import { FloatingVideoWindow } from "./components/FloatingVideoWindow";
 import { MapCalibratePanel } from "./components/MapCalibratePanel";
 import { MapFloorView } from "./components/MapFloorView";
 import { MergeInspectPanel } from "./components/MergeInspectPanel";
+import { DayAnalysisPanel } from "./components/DayAnalysisPanel";
 import { PipelineJobsPanel } from "./components/PipelineJobsPanel";
 import { TrackingPlayer, type TrackingPlayerHandle } from "./components/TrackingPlayer";
 import { TrackingSidebar } from "./components/TrackingSidebar";
@@ -45,7 +46,7 @@ import type { CountersDoc } from "./counters";
 import { emptyCountersDoc, normalizeCountersDoc } from "./counters";
 import { normalizePlacement } from "./homography";
 
-type AppTab = "tracks" | "merge" | "map" | "pipeline";
+type AppTab = "tracks" | "merge" | "day" | "map" | "pipeline";
 
 export default function App() {
   const initial = useMemo(() => loadPrefs(), []);
@@ -610,6 +611,9 @@ export default function App() {
             Склейки
             {mergeTimeline?.groups.length ? <em>{mergeTimeline.groups.length}</em> : null}
           </button>
+          <button type="button" className={tab === "day" ? "on" : ""} onClick={() => requestTab("day")}>
+            ДЕНЬ
+          </button>
           <button type="button" className={tab === "map" ? "on" : ""} onClick={() => requestTab("map")}>
             Карта
             {homography?.H ? <em>H</em> : null}
@@ -653,6 +657,8 @@ export default function App() {
               onSeekToSec={handleSeekToSec}
               onFocusTracks={setMergeFocusIds}
             />
+          ) : tab === "day" ? (
+            <DayAnalysisPanel selectedDay={selectedDay} />
           ) : tab === "pipeline" ? (
             <PipelineJobsPanel
               librarySession={librarySession}

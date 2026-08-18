@@ -97,6 +97,16 @@ def face_crops_dir(settings: Settings) -> str:
     return os.path.join(video_work_dir(settings), getattr(settings, "camera_link_face_crops_dir", "face_crops"))
 
 
+def day_results_dir(settings: Settings, day_str: str) -> str:
+    root = str(settings.json_output_dir or "data/results")
+    clean_day = day_str.replace("-", "").strip()
+    return os.path.join(root, f"day_{clean_day}")
+
+
+def day_links_json_path(settings: Settings, day_str: str) -> str:
+    return os.path.join(day_results_dir(settings, day_str), "day_links.json")
+
+
 def json_output_path(settings: Settings) -> str:
     path = tracking_json_path(settings)
     parent = os.path.dirname(path)
@@ -117,3 +127,4 @@ def cameras_dir(settings: Settings) -> str:
     else:
         project_root = cfg_dir
     return os.path.join(project_root, "data", "maps", "cameras")
+
