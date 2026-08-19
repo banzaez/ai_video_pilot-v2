@@ -106,7 +106,7 @@ export function mediaLibraryPlugin(): Plugin {
           try {
             const files = fs.existsSync(videoDir) ? fs.readdirSync(videoDir) : [];
             const videos = files
-              .filter((f) => /\.(mp4|webm|mov|mkv)$/i.test(f))
+              .filter((f) => /\.(mp4|webm|mov|mkv)$/i.test(f) && !f.startsWith("_") && !f.startsWith("."))
               .sort()
               .map((video) => {
                 const base = video.replace(/\.[^.]+$/, "");
