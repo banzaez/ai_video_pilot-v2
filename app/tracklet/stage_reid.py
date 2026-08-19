@@ -171,6 +171,7 @@ def run_tracklet_reid(settings: Settings) -> None:
         kinematic_max_area_ratio=settings.tracklet_reid_kinematic_max_area_ratio,
         color_consistency_enabled=settings.tracklet_reid_color_enabled,
         color_min_similarity=settings.tracklet_reid_color_min_similarity,
+        color_min_candidates=settings.tracklet_reid_color_min_candidates,
     )
 
     # 3. Индексация детекций по кадрам и треклетам

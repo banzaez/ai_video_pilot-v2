@@ -128,6 +128,41 @@ class TestTrackBestFramesFilters(unittest.TestCase):
         self.assertIn(1, filtered_frames)
         self.assertIn(7, filtered_frames)
 
+    def test_color_consistency_filter_3_frames(self):
+        # 3 кадра: кадр 0 (красный), кадр 1 (синий), кадр 2 (синий)
+        red_crop = np.zeros((100, 50, 3), dtype=np.uint8)
+        red_crop[:, :] = [0, 0, 255]
+        blue_crop = np.zeros((100, 50, 3), dtype=np.uint8)
+        blue_crop[:, :] = [255, 0, 0]
+
+        cands = [
+            TrackFrameCandidate(
+                frame_index=0,
+                target_det={"bbox": [100, 100, 150, 200], "confidence": 0.9},
+                all_dets=[],
+                crop_image=red_crop,
+                tracklet_id=1,
+            ),
+            TrackFrameCandidate(
+                frame_index=1,
+                target_det={"bbox": [100, 100, 150, 200], "confidence": 0.9},
+                all_dets=[],
+                crop_image=blue_crop.copy(),
+                tracklet_id=1,
+            ),
+            TrackFrameCandidate(
+                frame_index=2,
+                target_det={"bbox": [100, 100, 150, 200], "confidence": 0.9},
+                all_dets=[],
+                crop_image=blue_crop.copy(),
+                tracklet_id=1,
+            ),
+        ]
+
+        filtered = filter_color_outliers(cands, min_similarity=0.50, min_candidates=3, edge_only=True)
+        filtered_frames = [c.frame_index for c in filtered]
+        self.assertEqual(filtered_frames, [1, 2])
+
     def test_picker_filter_candidates_integration(self):
         picker = TrackBestFramesPicker(
             pose_service=None,

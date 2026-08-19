@@ -550,6 +550,11 @@ def settings_from_sources(args: argparse.Namespace | None = None) -> Settings:
             if isinstance(best_frames_cfg.get("color_consistency"), dict)
             else best_frames_cfg.get("color_min_similarity", 0.50)
         ),
+        tracklet_reid_color_min_candidates=int(
+            best_frames_cfg.get("color_consistency", {}).get("min_candidates", 3)
+            if isinstance(best_frames_cfg.get("color_consistency"), dict)
+            else best_frames_cfg.get("color_min_candidates", 3)
+        ),
         tracklet_crops_dir=str(tracklet_reid_cfg.get("crops_dir") or "tracklet_crops"),
         tracklet_link_max_gap_sec=float(link["max_gap_sec"]),
         tracklet_link_max_overlap_sec=float(link.get("max_overlap_sec", 2.0)),

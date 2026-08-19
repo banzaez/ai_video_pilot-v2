@@ -392,6 +392,7 @@ class TrackBestFramesPicker:
         color_min_similarity: float = 0.50,
         color_edge_only: bool = True,
         color_edge_window: int = 2,
+        color_min_candidates: int = 3,
         outlier_filter_config: OutlierFilterConfig | None = None,
     ) -> None:
         self.pose_service = pose_service
@@ -423,6 +424,7 @@ class TrackBestFramesPicker:
                 color_min_similarity=float(color_min_similarity),
                 color_edge_only=bool(color_edge_only),
                 color_edge_window=int(color_edge_window),
+                color_min_candidates=int(color_min_candidates),
             )
 
     def filter_candidates(

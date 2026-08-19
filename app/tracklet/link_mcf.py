@@ -473,7 +473,7 @@ def link_tracklets(
         combo, reid = float(edge[2]), float(edge[3])
         gap = float(edge[4]) if len(edge) > 4 else None
 
-        parts = [f"ReID={reid:.2f}"]
+        parts = [f"ReID={reid:.4f}"]
         if gap is not None:
             parts.append(f"Δt={gap:.1f}с")
         reason_str = "Pass 0: " + ", ".join(parts)

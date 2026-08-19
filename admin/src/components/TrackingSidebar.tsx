@@ -275,8 +275,8 @@ export function TrackingSidebar({
   );
 }
 
-function formatScore(score: number | null): string {
-  return score == null || !Number.isFinite(score) ? "—" : score.toFixed(2);
+function formatScore(score: number | null, digits: number = 4): string {
+  return score == null || !Number.isFinite(score) ? "—" : score.toFixed(digits);
 }
 
 function PopMetrics({ hit, hideOverall }: { hit: SimilarHit; hideOverall?: boolean }) {

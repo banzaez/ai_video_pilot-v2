@@ -181,9 +181,9 @@ function cropSrc(crop: string | CropRef | null | undefined, sessionKey?: string)
   return groupCropUrl(crop.session_key, crop.file);
 }
 
-function formatScore(v: number | null | undefined): string {
+function formatScore(v: number | null | undefined, digits: number = 4): string {
   if (v == null || !Number.isFinite(v)) return "—";
-  return v.toFixed(2);
+  return v.toFixed(digits);
 }
 
 function scoreClass(score: number): string {

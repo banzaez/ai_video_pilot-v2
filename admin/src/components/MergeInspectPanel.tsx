@@ -69,9 +69,9 @@ type Props = {
 
 type MergeSeg = { trackId: number; t0: number };
 
-function formatScore(v: number | null | undefined): string {
+function formatScore(v: number | null | undefined, digits: number = 4): string {
   if (v == null || !Number.isFinite(v)) return "—";
-  return v.toFixed(2);
+  return v.toFixed(digits);
 }
 
 function copyText(text: string) {
@@ -1304,8 +1304,6 @@ export function MergeInspectPanel({
                         <th>A↔B</th>
                         <th title="Комбинированный общий скор">Combo</th>
                         <th title="ReID сходство внешности">ReID</th>
-                        <th title="Оценка непрерывности движения и расстояние">Motion / Дист.</th>
-                        <th title="Похожесть размера bbox">Size</th>
                         <th title="Временной разрыв между фрагментами">Δt</th>
                         <th>Pass</th>
                       </tr>
@@ -1324,8 +1322,6 @@ export function MergeInspectPanel({
                           </td>
                           <td><strong>{formatScore(p.score)}</strong></td>
                           <td>{formatScore(p.reid)}</td>
-                          <td>{motionLabel(p)}</td>
-                          <td>{formatScore(p.size)}</td>
                           <td>{gapLabel(p.gap)}</td>
                           <td><PassBadge pass={pairPass(p)} /></td>
                         </tr>
@@ -1345,8 +1341,6 @@ export function MergeInspectPanel({
                         <th>A↔B</th>
                         <th title="Комбинированный общий скор">Combo</th>
                         <th title="ReID сходство внешности">ReID</th>
-                        <th title="Оценка непрерывности движения и расстояние">Motion / Дист.</th>
-                        <th title="Похожесть размера bbox">Size</th>
                         <th title="Временной разрыв между фрагментами">Δt</th>
                         <th>Pass</th>
                       </tr>
@@ -1363,8 +1357,6 @@ export function MergeInspectPanel({
                             </td>
                             <td><strong>{formatScore(h.score)}</strong></td>
                             <td>{formatScore(h.reid)}</td>
-                            <td>{motionLabel(h)}</td>
-                            <td>{formatScore(h.size)}</td>
                             <td>{gapLabel(h.gap)}</td>
                             <td><PassBadge pass={h.pass ?? pairPassFromReason(h.reason)} /></td>
                           </tr>

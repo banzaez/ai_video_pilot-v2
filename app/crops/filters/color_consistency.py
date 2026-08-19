@@ -85,7 +85,7 @@ def filter_color_outliers(
     min_similarity: float = 0.50,
     edge_only: bool = True,
     edge_window: int = 2,
-    min_candidates: int = 4,
+    min_candidates: int = 3,
 ) -> list[T]:
     """Фильтрует кандидатов, цвет одежды которых сильно отличается от медианного цвета трека.
 
@@ -118,7 +118,7 @@ def filter_color_outliers(
             valid_hists.append(h)
 
     # Если для трека недостаточно валидных гистограмм, не фильтруем
-    if len(valid_hists) < max(3, n // 2):
+    if len(valid_hists) < max(2, n // 2):
         return list(candidates)
 
     # 1. Построение медианной / центроидной гистограммы трека

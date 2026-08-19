@@ -110,6 +110,7 @@ class Settings:
     tracklet_reid_kinematic_max_area_ratio: float = 2.2
     tracklet_reid_color_enabled: bool = True
     tracklet_reid_color_min_similarity: float = 0.50
+    tracklet_reid_color_min_candidates: int = 3
     tracklet_crops_dir: str = "tracklet_crops"
     tracklet_link_max_gap_sec: float = 20.0
     tracklet_link_max_overlap_sec: float = 2.0

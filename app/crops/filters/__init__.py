@@ -37,7 +37,7 @@ class OutlierFilterConfig:
     color_min_similarity: float = 0.50
     color_edge_only: bool = True
     color_edge_window: int = 2
-    color_min_candidates: int = 4
+    color_min_candidates: int = 3
 
 
 def filter_track_outlier_candidates(
