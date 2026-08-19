@@ -121,28 +121,33 @@ def parse_prod_stem(stem: str) -> ParsedPart | None:
 
 
 def discover_prod_parts(video_dir: str) -> list[ParsedPart]:
-    """Только файлы в корне video_dir (без lite/ и без рекурсии)."""
+    """Сканирование video_dir, включая подпапки по датам (data/video/20260817/...)."""
     if not video_dir or not os.path.isdir(video_dir):
         return []
     out: list[ParsedPart] = []
-    for path in list_video_files(video_dir):
+    video_dir_abs = os.path.abspath(video_dir)
+    for path in list_video_files(video_dir, recursive=True):
         stem = os.path.splitext(os.path.basename(path))[0]
         parsed = parse_prod_stem(stem)
         if not parsed:
             continue
         abs_path = os.path.abspath(path)
         try:
-            stored = os.path.relpath(abs_path, os.getcwd()).replace("\\", "/")
+            rel_to_root = os.path.relpath(abs_path, os.getcwd()).replace("\\", "/")
         except ValueError:
-            stored = os.path.basename(path)
-        if os.path.isabs(stored) or stored.startswith(".."):
-            candidate = os.path.join("data", "video", os.path.basename(path)).replace("\\", "/")
-            stored = candidate if os.path.isfile(candidate) else os.path.basename(path)
+            rel_to_root = path
+        
+        # Относительный путь от videoDir для URL в админке (/media/<rel_path>)
+        try:
+            rel_to_video = os.path.relpath(abs_path, video_dir_abs).replace("\\", "/")
+        except ValueError:
+            rel_to_video = os.path.basename(path)
+
         out.append(
             ParsedPart(
-                path=stored,
+                path=rel_to_root,
                 stem=parsed.stem,
-                name=parsed.name,
+                name=rel_to_video,
                 camera_index=parsed.camera_index,
                 started_raw=parsed.started_raw,
                 ended_raw=parsed.ended_raw,

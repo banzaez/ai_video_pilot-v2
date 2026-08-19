@@ -66,7 +66,7 @@ detection:
   # NMS IoU похожих боксов. Вложенные (торс в полном росте) — IoS; широкий бокс на двоих выкидывается
   iou: 0.5
   # Каждый N-й кадр (1 = все). Трекер получает только эти наблюдения; fps видео ему не нужен.
-  detect_every_n: 3
+  detect_every_n: 1
   # Устройство инференса: mps | cuda | cpu | auto
   device: "auto"
 
@@ -193,7 +193,7 @@ pose:
   model: yolo26s-pose.pt
   conf: 0.55
   kpt_min: 0.25
-  every_n: 4
+  every_n: 1
 
 # --- Stage feet: проекция ног → feet.json ---
 feet:

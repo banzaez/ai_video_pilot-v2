@@ -3,6 +3,7 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import type { Plugin } from "vite";
 import { camerasDir, mapsDir, projectRoot, resultsDir, videoDir } from "./config.js";
+import { isIncompleteMp4 } from "./mp4.js";
 import {
   isInside,
   readArtifact,
@@ -565,6 +566,11 @@ export function mediaLibraryPlugin(): Plugin {
           }
           const size = stat.size;
           const ext = path.extname(filePath).toLowerCase();
+          if (ext === ".mp4" && isIncompleteMp4(filePath)) {
+            res.statusCode = 404;
+            res.end("Incomplete mp4 (still encoding)");
+            return;
+          }
           const types: Record<string, string> = {
             ".mp4": "video/mp4",
             ".webm": "video/webm",

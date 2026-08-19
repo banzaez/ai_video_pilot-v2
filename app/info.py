@@ -53,17 +53,31 @@ def _fourcc_name(cap: cv2.VideoCapture) -> str | None:
     return name or None
 
 
-def list_video_files(directory: str) -> list[str]:
-    """Видеофайлы в папке, по имени (файлы, начинающиеся с '_' или '.', игнорируются)."""
+def list_video_files(directory: str, *, recursive: bool = True) -> list[str]:
+    """Видеофайлы в папке и её подпапках (например, data/video/20260817).
+    
+    Файлы и папки, начинающиеся с '_' или '.', а также папки 'lite' игнорируются.
+    """
     if not directory or not os.path.isdir(directory):
         return []
     out: list[str] = []
-    for name in sorted(os.listdir(directory)):
-        if name.startswith(("_", ".")):
-            continue
-        path = os.path.join(directory, name)
-        if os.path.isfile(path) and os.path.splitext(name)[1].lower() in VIDEO_EXTS:
-            out.append(path)
+    if recursive:
+        for root, dirs, files in os.walk(directory):
+            # Исключаем скрытые папки, папки с '_' и 'lite'
+            dirs[:] = [d for d in sorted(dirs) if not d.startswith(("_", ".")) and d.lower() != "lite"]
+            for name in sorted(files):
+                if name.startswith(("_", ".")):
+                    continue
+                path = os.path.join(root, name)
+                if os.path.isfile(path) and os.path.splitext(name)[1].lower() in VIDEO_EXTS:
+                    out.append(path)
+    else:
+        for name in sorted(os.listdir(directory)):
+            if name.startswith(("_", ".")):
+                continue
+            path = os.path.join(directory, name)
+            if os.path.isfile(path) and os.path.splitext(name)[1].lower() in VIDEO_EXTS:
+                out.append(path)
     return out
 
 

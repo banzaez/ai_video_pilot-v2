@@ -3,19 +3,50 @@ import path from "node:path";
 import { resultsDir, videoDir } from "./config.js";
 import { groupBySessionKey, parseProdStem, type MediaSession, type SessionPart } from "../src/session.js";
 import { readJsonFile, resultsUrl, workFile } from "./common.js";
+import { mp4HasMoov } from "./mp4.js";
+
+/** Если в data/video/convert лежит готовый H.264 — играем его вместо MPEG/HEVC исходника. */
+function playbackRelPath(relPath: string): string {
+  const base = path.basename(relPath);
+  const converted = path.join(videoDir, "convert", base);
+  if (fs.existsSync(converted) && mp4HasMoov(converted)) {
+    return `convert/${base}`;
+  }
+  return relPath;
+}
+
+function scanVideoFilesRecursive(dir: string, baseDir: string = dir): { absPath: string; relPath: string }[] {
+  if (!fs.existsSync(dir)) return [];
+  const entries = fs.readdirSync(dir, { withFileTypes: true });
+  const list: { absPath: string; relPath: string }[] = [];
+  for (const entry of entries) {
+    const lower = entry.name.toLowerCase();
+    if (entry.name.startsWith("_") || entry.name.startsWith(".") || lower === "lite" || lower === "convert") {
+      continue;
+    }
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      list.push(...scanVideoFilesRecursive(full, baseDir));
+    } else if (entry.isFile() && /\.(mp4|webm|mov|mkv)$/i.test(entry.name)) {
+      list.push({ absPath: full, relPath: path.relative(baseDir, full).replace(/\\/g, "/") });
+    }
+  }
+  return list;
+}
 
 export function discoverSessionsFromVideoDir(): MediaSession[] {
   if (!fs.existsSync(videoDir)) return [];
-  const files = fs.readdirSync(videoDir);
-  const parts = files
-    .filter(
-      (f) =>
-        /\.(mp4|webm|mov|mkv)$/i.test(f) &&
-        f !== "lite" &&
-        !f.startsWith("_") &&
-        !f.startsWith("."),
-    )
-    .map((f) => parseProdStem(f.replace(/\.[^.]+$/, "")))
+  const videoFiles = scanVideoFilesRecursive(videoDir);
+  const parts = videoFiles
+    .map(({ relPath }) => {
+      const base = path.basename(relPath, path.extname(relPath));
+      const parsed = parseProdStem(base);
+      if (!parsed) return null;
+      return {
+        ...parsed,
+        name: relPath,
+      };
+    })
     .filter((p): p is NonNullable<typeof p> => p != null);
   const grouped = groupBySessionKey(parts);
   const sessions: MediaSession[] = [];
@@ -32,7 +63,7 @@ export function discoverSessionsFromVideoDir(): MediaSession[] {
       return {
         name: p.name,
         stem: p.stem,
-        videoUrl: `/media/${encodeURIComponent(p.name)}`,
+        videoUrl: `/media/${encodeURIComponent(playbackRelPath(p.name))}`,
         started_at: p.started_at,
         ended_at: p.ended_at,
         frame_offset: mp?.frame_offset ?? 0,
