@@ -233,3 +233,11 @@ data/models/**/*.pth
 data/models/**/*.onnx
 data/models/**/*.mlpackage
 data/models/**/*.zip
+
+# macOS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+**/.DS_Store

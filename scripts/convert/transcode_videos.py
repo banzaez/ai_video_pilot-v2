@@ -115,9 +115,11 @@ def _frame_step_args(every: int) -> list[str]:
 
 
 def _mux_args() -> list[str]:
+    # pcm_mulaw и прочее с NVR нельзя copy в MP4 — берём только видео.
     return [
-        "-c:a",
-        "copy",
+        "-map",
+        "0:v:0",
+        "-an",
         "-avoid_negative_ts",
         "make_zero",
         "-movflags",
