@@ -1,7 +1,7 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { colorForTrackId, fetchTrackingJson, formatDuration } from "../utils";
 import { TrackingPlayer, type TrackingPlayerHandle } from "./TrackingPlayer";
-import type { MediaSession } from "../session";
+import { sessionDurationSec, type MediaSession } from "../session";
 import type { TrackingData } from "../types";
 import {
   PlaybackToolbar,
@@ -128,21 +128,20 @@ type SortMode = "person_id" | "tracks" | "span" | "time";
 type RightTab = "edges" | "tracks" | "inspector";
 type DayCameraSession = MediaSession & { t0_abs?: number };
 
+function sessionFileDuration(sess: DayCameraSession): number {
+  if (typeof sess.duration_sec === "number" && sess.duration_sec > 0) return sess.duration_sec;
+  if (sess.parts?.length) {
+    const d = sessionDurationSec(sess.parts, sess.fps ?? 25);
+    if (d > 0) return d;
+  }
+  return 0;
+}
+
 function sessionCoverage(sess: DayCameraSession): { t0: number; t1: number } | undefined {
   const t0 = sess.t0_abs;
   if (t0 == null || !Number.isFinite(t0)) return undefined;
-  if (typeof sess.duration_sec === "number" && sess.duration_sec > 0) {
-    return { t0, t1: t0 + sess.duration_sec };
-  }
-  const first = sess.parts?.[0]?.started_at;
-  const last = sess.parts?.[sess.parts.length - 1]?.ended_at;
-  if (first && last) {
-    const a = Date.parse(first);
-    const b = Date.parse(last);
-    if (Number.isFinite(a) && Number.isFinite(b) && b > a) {
-      return { t0, t1: t0 + (b - a) / 1000 };
-    }
-  }
+  const dur = sessionFileDuration(sess);
+  if (dur > 0) return { t0, t1: t0 + dur };
   return undefined;
 }
 type DaySeg = { personId: number; sessionKey: string; trackId: number; t0: number };
@@ -629,22 +628,26 @@ export function DayAnalysisPanel({
   const startedKeysRef = useRef<Set<string>>(new Set());
 
   const timeBounds = useMemo((): TimeBounds => {
-    if (!dayData?.persons?.length) return makeTimeBounds(0, 300);
     let minT = Infinity;
     let maxT = -Infinity;
-    for (const p of dayData.persons) {
+    const bump = (a: number, b: number) => {
+      if (a < minT) minT = a;
+      if (b > maxT) maxT = b;
+    };
+    for (const p of dayData?.persons ?? []) {
       if (p.tracks?.length) {
-        for (const t of p.tracks) {
-          if (t.t0 < minT) minT = t.t0;
-          if (t.t1 > maxT) maxT = t.t1;
-        }
+        for (const t of p.tracks) bump(t.t0, t.t1);
       } else {
-        if (p.t0 < minT) minT = p.t0;
-        if (p.t1 > maxT) maxT = p.t1;
+        bump(p.t0, p.t1);
       }
     }
+    for (const sess of dayData?.camera_sessions ?? []) {
+      const cov = sessionCoverage(sess);
+      if (cov) bump(cov.t0, cov.t1);
+    }
+    if (!Number.isFinite(minT) || !Number.isFinite(maxT)) return makeTimeBounds(0, 300);
     return makeTimeBounds(minT, maxT);
-  }, [dayData?.persons]);
+  }, [dayData?.persons, dayData?.camera_sessions]);
 
   timeBoundsRef.current = timeBounds;
   cameraSessionsRef.current = dayData?.camera_sessions ?? [];
@@ -654,23 +657,38 @@ export function DayAnalysisPanel({
       playerRefs.current[key] = r;
     });
 
+  const lastSampleRef = useRef<number | null>(null);
   const sampleDaySecFromPlayers = () => {
     const sessions = cameraSessionsRef.current;
     const minT = timeBoundsRef.current.minT;
     let fallback: number | null = null;
+    let seekingInRange = false;
     for (const sess of sessions) {
       const handle = playerRefs.current[sess.key];
       if (!handle) continue;
       const t0Abs = sess.t0_abs ?? minT;
-      const duration = sess.duration_sec ?? 300;
+      const duration = sessionFileDuration(sess);
+      if (handle.seeking()) {
+        seekingInRange = true;
+        continue;
+      }
       const g = handle.getGlobalSec();
       if (g == null) continue;
       const daySec = t0Abs + g;
-      if (daySec < t0Abs - 0.05 || daySec > t0Abs + duration + 0.05) continue;
-      if (!handle.paused()) return daySec;
+      if (daySec < t0Abs - 0.05) continue;
+      if (duration > 0 && daySec > t0Abs + duration + 0.05) continue;
+      if (!handle.paused()) {
+        lastSampleRef.current = daySec;
+        return daySec;
+      }
       fallback = daySec;
     }
-    return fallback;
+    if (fallback != null) {
+      lastSampleRef.current = fallback;
+      return fallback;
+    }
+    if (seekingInRange) return lastSampleRef.current;
+    return null;
   };
   const sampleDaySecRef = useRef(sampleDaySecFromPlayers);
   sampleDaySecRef.current = sampleDaySecFromPlayers;
@@ -678,33 +696,37 @@ export function DayAnalysisPanel({
   const syncPlayersToTime = useCallback((tDay: number, playAfter = false, hard = true) => {
     const sessions = cameraSessionsRef.current;
     if (!sessions.length) return;
+    if (hard) lastSampleRef.current = tDay;
     const minT = timeBoundsRef.current.minT;
     const nextStarted = new Set<string>();
     for (const sess of sessions) {
       const handle = playerRefs.current[sess.key];
       if (!handle) continue;
       const t0Abs = sess.t0_abs ?? minT;
-      const duration = sess.duration_sec ?? 300;
-      if (tDay < t0Abs || tDay > t0Abs + duration) {
+      const duration = sessionFileDuration(sess);
+      const local = tDay - t0Abs;
+      if (local < -0.05 || (duration > 0 && local > duration + 0.05)) {
         handle.pause();
         continue;
       }
       nextStarted.add(sess.key);
       handle.setPlaybackRate(playbackSpeedRef.current);
-      const local = Math.max(0, tDay - t0Abs);
+      const seekLocal = Math.max(0, local);
       const already = startedKeysRef.current.has(sess.key);
       if (hard || !already) {
         if (!playAfter) handle.pause();
-        handle.seekToGlobal(local, playAfter);
+        handle.seekToGlobal(seekLocal, playAfter);
         continue;
       }
       if (!playAfter) {
         handle.pause();
         continue;
       }
+      if (handle.seeking()) continue;
       const g = handle.getGlobalSec();
-      if (g == null || Math.abs(g - local) > DRIFT_SEC) {
-        handle.seekToGlobal(local, true);
+      if (g == null) continue;
+      if (Math.abs(g - seekLocal) > DRIFT_SEC) {
+        handle.seekToGlobal(seekLocal, true);
       } else if (handle.paused()) {
         handle.play();
       }
@@ -1106,7 +1128,7 @@ export function DayAnalysisPanel({
             >
               {cameraSessionsList.map((sess) => {
                 const t0Abs = sess.t0_abs ?? timeBounds.minT;
-                const duration = sess.duration_sec ?? 300;
+                const duration = sessionFileDuration(sess) || 300;
                 const isActiveNow = currentDaySec >= t0Abs && currentDaySec <= t0Abs + duration;
                 const localSec = Math.max(0, currentDaySec - t0Abs);
                 const focusIds = focusTrackIdsByCamera[sess.camera] ?? EMPTY_FOCUS;

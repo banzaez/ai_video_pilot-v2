@@ -8,6 +8,7 @@ export type PlaybackPlayer = {
   pause: () => void;
   getGlobalSec: () => number | null;
   paused: () => boolean;
+  seeking?: () => boolean;
 };
 
 const DEFAULT_DRIFT_SEC = 0.45;
@@ -59,8 +60,10 @@ export function createPlayerSink(
           player.pause();
           return;
         }
+        if (player.seeking?.()) return;
         const g = player.getGlobalSec();
-        if (g == null || Math.abs(g - t) > drift) {
+        if (g == null) return;
+        if (Math.abs(g - t) > drift) {
           player.seekToGlobal(t, true);
         } else if (player.paused()) {
           player.play();

@@ -53,6 +53,7 @@ export type TrackingPlayerHandle = {
   pause: () => void;
   getGlobalSec: () => number | null;
   paused: () => boolean;
+  seeking: () => boolean;
 };
 
 type JogStripProps = {
@@ -395,56 +396,75 @@ export const TrackingPlayer = memo(forwardRef<TrackingPlayerHandle, Props>(funct
   }, [currentFrame]);
 
   const activePartRef = useRef<SessionPart | null>(null);
+  const pendingSeekRef = useRef<{ tSec: number; playAfter: boolean } | null>(null);
+  const seekingRef = useRef(false);
+  const playAfterSeekRef = useRef(false);
+  const seekToGlobalRef = useRef<(tSec: number, playAfter?: boolean) => void>(() => {});
 
   const seekToGlobal = useCallback(
     (tSec: number, playAfter = false) => {
       const video = videoRef.current;
       if (!video) return;
+      if (seekingRef.current || video.seeking) {
+        pendingSeekRef.current = { tSec, playAfter };
+        playAfterSeekRef.current = playAfter;
+        return;
+      }
       const t = Math.max(0, tSec);
       const sameFrame = 0.5 / Math.max(fps, 1);
+      const clampLocal = (local: number) => {
+        const dur = video.duration;
+        if (Number.isFinite(dur) && dur > 0) {
+          return Math.min(Math.max(0, local), Math.max(0, dur - 0.04));
+        }
+        return Math.max(0, local);
+      };
+      const applyLocal = (local: number, wantPlay: boolean) => {
+        const dest = clampLocal(local);
+        if (Math.abs(video.currentTime - dest) <= sameFrame) {
+          if (wantPlay) video.play().catch(() => {});
+          else video.pause();
+          return;
+        }
+        seekingRef.current = true;
+        playAfterSeekRef.current = wantPlay;
+        pendingSeekRef.current = null;
+        video.currentTime = dest;
+      };
       if (!isSession || !sessionParts?.length) {
         setGlobalSec(t);
-        if (Math.abs(video.currentTime - t) > sameFrame) {
-          video.currentTime = t;
-        }
-        if (playAfter) video.play().catch(() => {});
+        applyLocal(t, playAfter);
         return;
       }
       const hit = partAtTime(sessionParts, t, fps);
       if (!hit) return;
-      const wasPlaying = playAfter || !video.paused;
       const same = activePartRef.current?.name === hit.part.name;
       activePartRef.current = hit.part;
       setActivePartIdx(partIndexOf(sessionParts, hit.part));
       setGlobalSec(Math.max(0, Math.min(t, durationSec || t)));
-      if (same && Math.abs(video.currentTime - hit.localTime) <= sameFrame) {
-        if (wasPlaying && video.paused) video.play().catch(() => {});
-        return;
-      }
       if (!same) {
+        pendingSeekRef.current = { tSec: t, playAfter };
+        playAfterSeekRef.current = playAfter;
         video.src = hit.part.videoUrl;
-      }
-      const apply = () => {
-        if (typeof (video as HTMLVideoElement & { fastSeek?: (t: number) => void }).fastSeek === "function") {
-          (video as HTMLVideoElement & { fastSeek: (t: number) => void }).fastSeek(hit.localTime);
-        } else {
-          video.currentTime = hit.localTime;
-        }
-        if (wasPlaying) video.play().catch(() => {});
-      };
-      if (!same) {
         const onReady = () => {
           video.removeEventListener("loadeddata", onReady);
-          apply();
+          const pending = pendingSeekRef.current;
+          pendingSeekRef.current = null;
+          seekingRef.current = false;
+          const next = pending ?? { tSec: t, playAfter };
+          const again = partAtTime(sessionParts, next.tSec, fps);
+          if (!again) return;
+          applyLocal(again.localTime, next.playAfter);
         };
         video.addEventListener("loadeddata", onReady);
         video.load();
-      } else {
-        apply();
+        return;
       }
+      applyLocal(hit.localTime, playAfter);
     },
     [videoRef, isSession, sessionParts, fps, durationSec],
   );
+  seekToGlobalRef.current = seekToGlobal;
 
   const setPlaybackRate = useCallback(
     (rate: number) => {
@@ -470,6 +490,7 @@ export const TrackingPlayer = memo(forwardRef<TrackingPlayerHandle, Props>(funct
   const getGlobalSec = useCallback(() => {
     const video = videoRef.current;
     if (!video) return null;
+    if (seekingRef.current || video.seeking) return null;
     if (isSession) {
       const part = activePartRef.current;
       if (!part) return video.currentTime;
@@ -483,14 +504,46 @@ export const TrackingPlayer = memo(forwardRef<TrackingPlayerHandle, Props>(funct
     return !video || video.paused;
   }, [videoRef]);
 
-  useImperativeHandle(ref, () => ({ seekToGlobal, setPlaybackRate, play, pause, getGlobalSec, paused }), [
+  const seeking = useCallback(() => {
+    const video = videoRef.current;
+    return !!video && (seekingRef.current || video.seeking);
+  }, [videoRef]);
+
+  useImperativeHandle(ref, () => ({ seekToGlobal, setPlaybackRate, play, pause, getGlobalSec, paused, seeking }), [
     seekToGlobal,
     setPlaybackRate,
     play,
     pause,
     getGlobalSec,
     paused,
+    seeking,
   ]);
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    const onSeeking = () => {
+      seekingRef.current = true;
+    };
+    const onSeeked = () => {
+      seekingRef.current = false;
+      const pending = pendingSeekRef.current;
+      if (pending) {
+        pendingSeekRef.current = null;
+        seekToGlobalRef.current(pending.tSec, pending.playAfter);
+        return;
+      }
+      if (playAfterSeekRef.current) {
+        video.play().catch(() => {});
+      }
+    };
+    video.addEventListener("seeking", onSeeking);
+    video.addEventListener("seeked", onSeeked);
+    return () => {
+      video.removeEventListener("seeking", onSeeking);
+      video.removeEventListener("seeked", onSeeked);
+    };
+  }, [videoRef, videoUrl]);
 
   const startAtSecRef = useRef(startAtSec);
   startAtSecRef.current = startAtSec;

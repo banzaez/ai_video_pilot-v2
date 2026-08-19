@@ -100,9 +100,13 @@ export function groupBySessionKey(parts: ParsedPart[]): Map<string, ParsedPart[]
   return byKey;
 }
 
-/** Длительность части в секундах по frame_count / fps. */
+/** Длительность части: frame_count/fps или стенка started_at…ended_at. */
 export function partDurationSec(part: SessionPart, fps: number): number {
-  return part.frame_count / Math.max(fps, 1e-6);
+  if (part.frame_count > 0) return part.frame_count / Math.max(fps, 1e-6);
+  const a = Date.parse(part.started_at);
+  const b = Date.parse(part.ended_at);
+  if (Number.isFinite(a) && Number.isFinite(b) && b > a) return (b - a) / 1000;
+  return 0;
 }
 
 /** Суммарная длительность session (или fallback из tracking). */

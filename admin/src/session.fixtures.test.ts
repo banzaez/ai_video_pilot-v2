@@ -130,4 +130,23 @@ describe("session.ts", () => {
     expect(hit?.part.name).toBe("b.mp4");
     expect(hit?.localTime).toBeCloseTo(0.5, 5);
   });
+
+  it("partAtTime uses wall-clock duration when frame_count is 0", () => {
+    const parts = [
+      {
+        name: "a.mp4",
+        stem: "a",
+        videoUrl: "/media/a.mp4",
+        started_at: "2026-08-17T11:53:56",
+        ended_at: "2026-08-17T12:43:06",
+        frame_offset: 0,
+        frame_count: 0,
+        time_offset_sec: 0,
+      },
+    ];
+    expect(sessionDurationSec(parts, 25)).toBeCloseTo(49 * 60 + 10, 5);
+    const hit = partAtTime(parts, 120, 25);
+    expect(hit?.part.name).toBe("a.mp4");
+    expect(hit?.localTime).toBeCloseTo(120, 5);
+  });
 });
