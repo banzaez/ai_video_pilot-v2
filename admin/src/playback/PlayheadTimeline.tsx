@@ -61,7 +61,7 @@ function PlayheadTimelineInner<T>({
       const dy = Math.abs(e.clientY - downPos.current.y);
       if (dx < 5 && dy < 5 && barHit.current) {
         onSelect?.(barHit.current);
-      } else {
+      } else if (!barHit.current || dx >= 5 || dy >= 5) {
         seekFromClientX(e.clientX);
       }
       barHit.current = null;
@@ -129,7 +129,11 @@ function PlayheadTimelineInner<T>({
           onScrubbing?.(true);
           downPos.current = { x: e.clientX, y: e.clientY };
           barHit.current = seg;
-          seekFromClientX(e.clientX);
+          if (seg) {
+            onSeek(seg.t0);
+          } else {
+            seekFromClientX(e.clientX);
+          }
         }}
         onPointerMove={(e) => {
           if (!dragging.current) return;

@@ -101,11 +101,14 @@ export function groupBySessionKey(parts: ParsedPart[]): Map<string, ParsedPart[]
 }
 
 /** Длительность части: frame_count/fps или стенка started_at…ended_at. */
-export function partDurationSec(part: SessionPart, fps: number): number {
-  if (part.frame_count > 0) return part.frame_count / Math.max(fps, 1e-6);
+export function partDurationSec(part: SessionPart, fps?: number | null): number {
+  if (typeof fps === "number" && fps > 0 && part.frame_count > 0) {
+    return part.frame_count / fps;
+  }
   const a = Date.parse(part.started_at);
   const b = Date.parse(part.ended_at);
   if (Number.isFinite(a) && Number.isFinite(b) && b > a) return (b - a) / 1000;
+  if (part.frame_count > 0 && typeof fps === "number") return part.frame_count / Math.max(fps, 1e-6);
   return 0;
 }
 

@@ -43,6 +43,12 @@ type Props = {
   compact?: boolean;
   /** Восстановить позицию при монтировании (после закрытия окна). */
   startAtSec?: number;
+  /** Если камера не активна в текущее время дня (до начала или после окончания записи) */
+  inactive?: boolean;
+  /** Явный FPS сессии (например, из info.json, если tracking.json еще нет) */
+  fps?: number;
+  /** Явная длительность сессии в секундах */
+  durationSec?: number;
 };
 
 /** Seek по глобальному времени сессии (с учётом кусков). */
@@ -325,6 +331,9 @@ export const TrackingPlayer = memo(forwardRef<TrackingPlayerHandle, Props>(funct
     hideUnfocused = false,
     compact = false,
     startAtSec = 0,
+    inactive = false,
+    fps: propFps,
+    durationSec: propDurationSec,
   },
   ref,
 ) {
@@ -340,9 +349,11 @@ export const TrackingPlayer = memo(forwardRef<TrackingPlayerHandle, Props>(funct
   const scrubbingRef = useRef(false);
   const hideUnfocusedRef = useRef(hideUnfocused);
   hideUnfocusedRef.current = hideUnfocused;
+  const inactiveRef = useRef(inactive);
+  inactiveRef.current = inactive;
 
   const isSession = !!(sessionParts && sessionParts.length > 0);
-  const fps = tracking?.fps ?? 25;
+  const fps = propFps ?? tracking?.fps ?? (sessionParts?.[0] ? partDurationSec(sessionParts[0], null) > 0 && sessionParts[0].frame_count > 0 ? sessionParts[0].frame_count / partDurationSec(sessionParts[0], null) : 25 : 25);
 
   const keyframes = useMemo(
     () => (tracking ? buildTrackKeyframes(tracking) : null),
@@ -354,6 +365,7 @@ export const TrackingPlayer = memo(forwardRef<TrackingPlayerHandle, Props>(funct
   );
 
   const durationSec = useMemo(() => {
+    if (typeof propDurationSec === "number" && propDurationSec > 0) return propDurationSec;
     if (isSession && sessionParts) {
       const fromParts = sessionDurationSec(sessionParts, fps);
       if (fromParts > 0) return fromParts;
@@ -362,7 +374,7 @@ export const TrackingPlayer = memo(forwardRef<TrackingPlayerHandle, Props>(funct
       return tracking.frame_count / tracking.fps;
     }
     return 0;
-  }, [isSession, sessionParts, fps, tracking]);
+  }, [propDurationSec, isSession, sessionParts, fps, tracking]);
 
   const partMarks = useMemo(() => {
     if (!isSession || !sessionParts || durationSec <= 0) return [];
@@ -421,6 +433,14 @@ export const TrackingPlayer = memo(forwardRef<TrackingPlayerHandle, Props>(funct
       };
       const applyLocal = (local: number, wantPlay: boolean) => {
         const dest = clampLocal(local);
+        if (video.readyState < 1) {
+          const onMeta = () => {
+            video.removeEventListener("loadedmetadata", onMeta);
+            applyLocal(local, wantPlay);
+          };
+          video.addEventListener("loadedmetadata", onMeta, { once: true });
+          return;
+        }
         if (Math.abs(video.currentTime - dest) <= sameFrame) {
           if (wantPlay) video.play().catch(() => {});
           else video.pause();
@@ -429,7 +449,11 @@ export const TrackingPlayer = memo(forwardRef<TrackingPlayerHandle, Props>(funct
         seekingRef.current = true;
         playAfterSeekRef.current = wantPlay;
         pendingSeekRef.current = null;
-        video.currentTime = dest;
+        try {
+          video.currentTime = dest;
+        } catch {
+          seekingRef.current = false;
+        }
       };
       if (!isSession || !sessionParts?.length) {
         setGlobalSec(t);
@@ -522,10 +546,30 @@ export const TrackingPlayer = memo(forwardRef<TrackingPlayerHandle, Props>(funct
   useEffect(() => {
     const video = videoRef.current;
     if (!video) return;
+    let seekTimer: number | null = null;
+
+    const clearTimer = () => {
+      if (seekTimer != null) {
+        window.clearTimeout(seekTimer);
+        seekTimer = null;
+      }
+    };
+
     const onSeeking = () => {
       seekingRef.current = true;
+      clearTimer();
+      seekTimer = window.setTimeout(() => {
+        seekingRef.current = false;
+        const pending = pendingSeekRef.current;
+        if (pending) {
+          pendingSeekRef.current = null;
+          seekToGlobalRef.current(pending.tSec, pending.playAfter);
+        }
+      }, 500);
     };
+
     const onSeeked = () => {
+      clearTimer();
       seekingRef.current = false;
       const pending = pendingSeekRef.current;
       if (pending) {
@@ -537,9 +581,11 @@ export const TrackingPlayer = memo(forwardRef<TrackingPlayerHandle, Props>(funct
         video.play().catch(() => {});
       }
     };
+
     video.addEventListener("seeking", onSeeking);
     video.addEventListener("seeked", onSeeked);
     return () => {
+      clearTimer();
       video.removeEventListener("seeking", onSeeking);
       video.removeEventListener("seeked", onSeeked);
     };
@@ -688,7 +734,6 @@ export const TrackingPlayer = memo(forwardRef<TrackingPlayerHandle, Props>(funct
     let lastLayoutAt = 0;
     let layoutDirty = true;
     const MAX_SIDE = 1280;
-    const LAYOUT_MS = 250;
 
     const draw = () => {
       const ctx = canvas.getContext("2d");
@@ -709,19 +754,23 @@ export const TrackingPlayer = memo(forwardRef<TrackingPlayerHandle, Props>(funct
 
       const now = performance.now();
       // object-fit: contain → чёрные поля; canvas должен совпасть с картинкой, не со stage
-      if (stage && (layoutDirty || now - lastLayoutAt >= LAYOUT_MS)) {
+      if (stage && (layoutDirty || now - lastLayoutAt >= 1000)) {
         lastLayoutAt = now;
         layoutDirty = false;
         const videoRect = video.getBoundingClientRect();
         const stageRect = stage.getBoundingClientRect();
         if (videoRect.width > 0 && videoRect.height > 0) {
           const scale = Math.min(videoRect.width / vw, videoRect.height / vh);
-          const dw = vw * scale;
-          const dh = vh * scale;
-          canvas.style.left = `${videoRect.left - stageRect.left + (videoRect.width - dw) / 2}px`;
-          canvas.style.top = `${videoRect.top - stageRect.top + (videoRect.height - dh) / 2}px`;
-          canvas.style.width = `${dw}px`;
-          canvas.style.height = `${dh}px`;
+          const dw = Math.round(vw * scale);
+          const dh = Math.round(vh * scale);
+          const nextLeft = `${Math.round(videoRect.left - stageRect.left + (videoRect.width - dw) / 2)}px`;
+          const nextTop = `${Math.round(videoRect.top - stageRect.top + (videoRect.height - dh) / 2)}px`;
+          const nextWidth = `${dw}px`;
+          const nextHeight = `${dh}px`;
+          if (canvas.style.left !== nextLeft) canvas.style.left = nextLeft;
+          if (canvas.style.top !== nextTop) canvas.style.top = nextTop;
+          if (canvas.style.width !== nextWidth) canvas.style.width = nextWidth;
+          if (canvas.style.height !== nextHeight) canvas.style.height = nextHeight;
         }
       }
 
@@ -729,7 +778,10 @@ export const TrackingPlayer = memo(forwardRef<TrackingPlayerHandle, Props>(funct
       ctx.clearRect(0, 0, cw, ch);
       ctx.setTransform(cw / vw, 0, 0, ch / vh, 0, 0);
 
-      if (!tracking || !keyframes) return;
+      if (inactiveRef.current || !tracking || !keyframes) {
+        trailHistory.current.clear();
+        return;
+      }
 
       const parts = sessionPartsRef.current;
       const gSec = parts?.length

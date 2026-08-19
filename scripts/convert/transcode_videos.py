@@ -1,3 +1,11 @@
+"""
+python3 scripts/convert/transcode_videos.py \
+  --path data/video/20260817 \
+  --out data/video/convert \
+  --codec libx264 \
+  --every 5
+"""
+
 import argparse
 import os
 import platform

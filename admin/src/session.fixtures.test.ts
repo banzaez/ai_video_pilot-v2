@@ -23,7 +23,7 @@ describe("session.ts", () => {
   it("parses prod stem", () => {
     const p = parseProdStem(PROD[0]!);
     expect(p?.camera_index).toBe(1);
-    expect(p?.session_key).toBe("01_20260601");
+    expect(p?.session_key).toBe("001_20260601");
   });
 
   it("parses IP-source stem", () => {
@@ -31,7 +31,7 @@ describe("session.ts", () => {
       "Camera_01_10.12.0.35_10.12.0.235_20260401113050_20260401113550_3084159",
     );
     expect(p?.camera_index).toBe(1);
-    expect(p?.session_key).toBe("01_20260401");
+    expect(p?.session_key).toBe("001_20260401");
     expect(p?.started_raw).toBe("20260401113050");
     expect(p?.day).toBe("2026-04-01");
   });
@@ -42,11 +42,11 @@ describe("session.ts", () => {
     >[];
     const grouped = groupBySessionKey(parts);
     expect(grouped.size).toBe(1);
-    expect(grouped.get("01_20260601")?.length).toBe(3);
+    expect(grouped.get("001_20260601")?.length).toBe(3);
   });
 
   it("session key from part", () => {
-    expect(sessionKeyFromPart(2, "20260601095444")).toBe("02_20260601");
+    expect(sessionKeyFromPart(2, "20260601095444")).toBe("002_20260601");
   });
 
   it("session label", () => {

@@ -38,6 +38,7 @@ export function usePlaybackClock({
   const boundsRef = useRef(bounds);
   const sinkRef = useRef(sink);
   const scrubbingRef = useRef(false);
+  const seekGraceUntilRef = useRef<number>(0);
   const seekRef = useRef<(t: number, playAfter?: boolean) => void>(() => {});
 
   currentSecRef.current = currentSec;
@@ -49,6 +50,7 @@ export function usePlaybackClock({
   const seek = useCallback((targetSec: number, playAfter?: boolean) => {
     const b = boundsRef.current;
     const clamped = clampTime(targetSec, b);
+    seekGraceUntilRef.current = performance.now() + 600;
     currentSecRef.current = clamped;
     setCurrentSec(clamped);
     const play = playAfter ?? isPlayingRef.current;
@@ -59,6 +61,7 @@ export function usePlaybackClock({
 
   const play = useCallback(() => {
     setIsPlaying(true);
+    seekGraceUntilRef.current = performance.now() + 600;
     sinkRef.current.setRate(rateRef.current);
     sinkRef.current.apply(currentSecRef.current, true, "hard");
   }, []);
@@ -89,6 +92,9 @@ export function usePlaybackClock({
 
   const setScrubbing = useCallback((active: boolean) => {
     scrubbingRef.current = active;
+    if (!active) {
+      seekGraceUntilRef.current = performance.now() + 600;
+    }
   }, []);
 
   const noteExternalTime = useCallback((t: number) => {
@@ -116,16 +122,24 @@ export function usePlaybackClock({
         animId = requestAnimationFrame(loop);
         return;
       }
-      const sampled = sinkRef.current.sampleTime();
-      let next: number;
-      if (sampled != null) {
-        next = sampled;
-        lastTs = now;
-      } else {
-        const dt = ((now - lastTs) / 1000) * rateRef.current;
-        lastTs = now;
-        next = currentSecRef.current + dt;
+      const dt = Math.max(0, (now - lastTs) / 1000) * rateRef.current;
+      lastTs = now;
+      let next = currentSecRef.current + dt;
+
+      // Во время и сразу после сика/клика видео еще выполняет перемотку.
+      // Игнорируем устаревшие позиции с плееров, чтобы бегунок не прыгал назад.
+      if (now >= seekGraceUntilRef.current) {
+        const sampled = sinkRef.current.sampleTime();
+        if (sampled != null && Number.isFinite(sampled)) {
+          const drift = sampled - next;
+          if (Math.abs(drift) > 0.15 && Math.abs(drift) < 2.0) {
+            next += drift * 0.12; // Мягкая сходимость без прыжков
+          } else if (Math.abs(drift) >= 2.0) {
+            next = sampled;
+          }
+        }
       }
+
       const b = boundsRef.current;
       if (next >= b.maxT) {
         next = b.maxT;

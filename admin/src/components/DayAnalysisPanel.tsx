@@ -147,7 +147,6 @@ function sessionCoverage(sess: DayCameraSession): { t0: number; t1: number } | u
 type DaySeg = { personId: number; sessionKey: string; trackId: number; t0: number };
 
 const trackingCache = new Map<string, Record<string, TrackingData>>();
-const DRIFT_SEC = 0.45;
 const EMPTY_FOCUS: number[] = [];
 const EMPTY_GROUP: Record<number, number> = {};
 
@@ -657,37 +656,39 @@ export function DayAnalysisPanel({
       playerRefs.current[key] = r;
     });
 
+  const activeDaySecRef = useRef<number>(timeBounds.minT);
   const lastSampleRef = useRef<number | null>(null);
+
   const sampleDaySecFromPlayers = () => {
     const sessions = cameraSessionsRef.current;
     const minT = timeBoundsRef.current.minT;
-    let fallback: number | null = null;
-    let seekingInRange = false;
+    const currentT = activeDaySecRef.current;
+
     for (const sess of sessions) {
       const handle = playerRefs.current[sess.key];
       if (!handle) continue;
       const t0Abs = sess.t0_abs ?? minT;
       const duration = sessionFileDuration(sess);
-      if (handle.seeking()) {
-        seekingInRange = true;
-        continue;
-      }
+
+      // Проверяем, активна ли эта камера в текущее время дня
+      const isActiveNow =
+        currentT >= t0Abs - 0.5 && (duration <= 0 || currentT <= t0Abs + duration + 0.5);
+      if (!isActiveNow) continue;
+
+      if (handle.seeking() || handle.paused()) continue;
+
       const g = handle.getGlobalSec();
       if (g == null) continue;
       const daySec = t0Abs + g;
       if (daySec < t0Abs - 0.05) continue;
       if (duration > 0 && daySec > t0Abs + duration + 0.05) continue;
-      if (!handle.paused()) {
+
+      // Убеждаемся, что время камеры не из старого буфера
+      if (Math.abs(daySec - currentT) <= 2.5) {
         lastSampleRef.current = daySec;
         return daySec;
       }
-      fallback = daySec;
     }
-    if (fallback != null) {
-      lastSampleRef.current = fallback;
-      return fallback;
-    }
-    if (seekingInRange) return lastSampleRef.current;
     return null;
   };
   const sampleDaySecRef = useRef(sampleDaySecFromPlayers);
@@ -698,37 +699,56 @@ export function DayAnalysisPanel({
     if (!sessions.length) return;
     if (hard) lastSampleRef.current = tDay;
     const minT = timeBoundsRef.current.minT;
+    const baseRate = playbackSpeedRef.current;
     const nextStarted = new Set<string>();
+
     for (const sess of sessions) {
       const handle = playerRefs.current[sess.key];
       if (!handle) continue;
       const t0Abs = sess.t0_abs ?? minT;
       const duration = sessionFileDuration(sess);
       const local = tDay - t0Abs;
+
+      // Если текущее время дня вне интервала записи камеры
       if (local < -0.05 || (duration > 0 && local > duration + 0.05)) {
-        handle.pause();
+        if (!handle.paused()) handle.pause();
         continue;
       }
+
       nextStarted.add(sess.key);
-      handle.setPlaybackRate(playbackSpeedRef.current);
       const seekLocal = Math.max(0, local);
       const already = startedKeysRef.current.has(sess.key);
+
       if (hard || !already) {
+        handle.setPlaybackRate(baseRate);
         if (!playAfter) handle.pause();
         handle.seekToGlobal(seekLocal, playAfter);
         continue;
       }
+
       if (!playAfter) {
-        handle.pause();
+        if (!handle.paused()) handle.pause();
         continue;
       }
+
       if (handle.seeking()) continue;
       const g = handle.getGlobalSec();
       if (g == null) continue;
-      if (Math.abs(g - seekLocal) > DRIFT_SEC) {
+
+      const drift = g - seekLocal;
+      // Если расхождение критическое (> 2.5с) — делаем сик
+      if (Math.abs(drift) > 2.5) {
+        handle.setPlaybackRate(baseRate);
         handle.seekToGlobal(seekLocal, true);
-      } else if (handle.paused()) {
-        handle.play();
+      } else if (Math.abs(drift) > 0.35) {
+        // Мягкая подстройка скорости без прерывания декодера
+        const adjRate = drift < 0 ? baseRate * 1.12 : baseRate * 0.88;
+        handle.setPlaybackRate(adjRate);
+        if (handle.paused()) handle.play();
+      } else {
+        // В синхроне — возвращаем стандартную скорость
+        handle.setPlaybackRate(baseRate);
+        if (handle.paused()) handle.play();
       }
     }
     startedKeysRef.current = nextStarted;
@@ -756,6 +776,7 @@ export function DayAnalysisPanel({
   const seekToDaySec = clock.seek;
   const currentDaySec = clock.currentSec;
   const currentDaySecRef = clock.currentSecRef;
+  activeDaySecRef.current = currentDaySec;
 
   useEffect(() => {
     if (!selectedDay) return;
@@ -1129,10 +1150,23 @@ export function DayAnalysisPanel({
               {cameraSessionsList.map((sess) => {
                 const t0Abs = sess.t0_abs ?? timeBounds.minT;
                 const duration = sessionFileDuration(sess) || 300;
-                const isActiveNow = currentDaySec >= t0Abs && currentDaySec <= t0Abs + duration;
-                const localSec = Math.max(0, currentDaySec - t0Abs);
+                const isBefore = currentDaySec < t0Abs - 0.05;
+                const isAfter = duration > 0 && currentDaySec > t0Abs + duration + 0.05;
+                const isActiveNow = !isBefore && !isAfter;
+                const localSec = Math.max(0, Math.min(currentDaySec - t0Abs, duration));
                 const focusIds = focusTrackIdsByCamera[sess.camera] ?? EMPTY_FOCUS;
                 const isPersonInCamera = focusIds.length > 0 && isActiveNow;
+
+                let standbyTitle = "";
+                let standbySub = "";
+                if (isBefore) {
+                  standbyTitle = "Ожидание начала записи";
+                  standbySub = `Старт в ${formatTimeOfDay(t0Abs, false)}`;
+                } else if (isAfter) {
+                  standbyTitle = "Запись завершена";
+                  standbySub = `Конец в ${formatTimeOfDay(t0Abs + duration, false)}`;
+                }
+
                 return (
                   <div
                     key={sess.key}
@@ -1158,6 +1192,8 @@ export function DayAnalysisPanel({
                         videoUrl={sess.parts[0]?.videoUrl ?? null}
                         tracking={cameraTracking[sess.key] ?? null}
                         sessionParts={sess.parts.length ? sess.parts : null}
+                        fps={sess.fps}
+                        durationSec={sess.duration_sec}
                         showLabels={true}
                         showTrails={true}
                         trailLength={25}
@@ -1165,7 +1201,14 @@ export function DayAnalysisPanel({
                         highlightIds={selectedPerson ? focusIds : []}
                         focusTrackIds={selectedPerson ? focusIds : null}
                         compact={true}
+                        inactive={!isActiveNow}
                       />
+                      {!isActiveNow && (
+                        <div className="day-camera-standby-overlay">
+                          <span className="day-camera-standby-title">{standbyTitle}</span>
+                          <span className="day-camera-standby-sub">{standbySub}</span>
+                        </div>
+                      )}
                     </div>
                   </div>
                 );

@@ -6024,6 +6024,36 @@ body {
   color: var(--muted);
 }
 
+.day-camera-standby-overlay {
+  position: absolute;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.72);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  color: #fff;
+  z-index: 5;
+  pointer-events: none;
+  backdrop-filter: blur(2px);
+  text-align: center;
+  padding: 12px;
+}
+
+.day-camera-standby-title {
+  font-size: 11.5px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  color: #e2e8f0;
+}
+
+.day-camera-standby-sub {
+  font-size: 10px;
+  font-family: var(--mono);
+  color: #94a3b8;
+}
+
 .day-inspect-stack {
   display: flex;
   flex-direction: column;
