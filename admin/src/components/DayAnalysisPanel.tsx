@@ -37,6 +37,20 @@ export interface DayTrack {
 
 export type OpenTrackInMerge = (sessionKey: string, trackId: number, t0: number) => void;
 
+const DAY_CAM_COLS_KEY = "ai-video-pilot-day-cam-cols";
+const DAY_CAM_COLS_DEFAULT = 3;
+const DAY_CAM_COLS_MAX = 6;
+
+function readDayCamCols(): number {
+  try {
+    const n = Number(localStorage.getItem(DAY_CAM_COLS_KEY));
+    if (Number.isInteger(n) && n >= 1 && n <= DAY_CAM_COLS_MAX) return n;
+  } catch {
+    /* ignore */
+  }
+  return DAY_CAM_COLS_DEFAULT;
+}
+
 export interface DayTransitionEdge {
   from: string;
   to: string;
@@ -113,6 +127,24 @@ type FilterMode = "all" | "multi_cam" | "pass1" | "pass2" | "pass4" | "solo";
 type SortMode = "person_id" | "tracks" | "span" | "time";
 type RightTab = "edges" | "tracks" | "inspector";
 type DayCameraSession = MediaSession & { t0_abs?: number };
+
+function sessionCoverage(sess: DayCameraSession): { t0: number; t1: number } | undefined {
+  const t0 = sess.t0_abs;
+  if (t0 == null || !Number.isFinite(t0)) return undefined;
+  if (typeof sess.duration_sec === "number" && sess.duration_sec > 0) {
+    return { t0, t1: t0 + sess.duration_sec };
+  }
+  const first = sess.parts?.[0]?.started_at;
+  const last = sess.parts?.[sess.parts.length - 1]?.ended_at;
+  if (first && last) {
+    const a = Date.parse(first);
+    const b = Date.parse(last);
+    if (Number.isFinite(a) && Number.isFinite(b) && b > a) {
+      return { t0, t1: t0 + (b - a) / 1000 };
+    }
+  }
+  return undefined;
+}
 type DaySeg = { personId: number; sessionKey: string; trackId: number; t0: number };
 
 const trackingCache = new Map<string, Record<string, TrackingData>>();
@@ -579,6 +611,15 @@ export function DayAnalysisPanel({
   const [selectedPersonId, setSelectedPersonId] = useState<number | null>(null);
   const [selectedEdge, setSelectedEdge] = useState<DayTransitionEdge | null>(null);
   const [rightTab, setRightTab] = useState<RightTab>("edges");
+  const [cameraCols, setCameraCols] = useState(readDayCamCols);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(DAY_CAM_COLS_KEY, String(cameraCols));
+    } catch {
+      /* ignore */
+    }
+  }, [cameraCols]);
 
   const playerRefs = useRef<Record<string, TrackingPlayerHandle | null>>({});
   const playerRefCbs = useRef<Record<string, (r: TrackingPlayerHandle | null) => void>>({});
@@ -866,7 +907,7 @@ export function DayAnalysisPanel({
           }),
       );
       const highlight = selectedPerson?.tracks.some((t) => t.session_key === sess.key || t.camera === sess.camera);
-      return { id: sess.key, label: sess.camera, highlight, segments };
+      return { id: sess.key, label: sess.camera, highlight, coverage: sessionCoverage(sess), segments };
     });
   }, [cameraSessionsList, timelinePersons, selectedPersonId, selectedPerson]);
 
@@ -996,30 +1037,45 @@ export function DayAnalysisPanel({
               formatCurrent={formatTimeOfDay}
               formatBound={formatShortTime}
               extras={
-                selectedPerson ? (
-                  <>
-                    <button
-                      type="button"
-                      className="playhead-btn"
-                      onClick={() => {
-                        setSelectedPersonId(null);
-                        setSelectedEdge(null);
-                      }}
-                    >
-                      Все персоны
-                    </button>
-                    {personEdges.length > 0 && (
-                      <>
-                        <button type="button" className="playhead-btn" onClick={() => jumpToTransition("prev")}>
-                          ← Склейка
-                        </button>
-                        <button type="button" className="playhead-btn" onClick={() => jumpToTransition("next")}>
-                          Склейка →
-                        </button>
-                      </>
-                    )}
-                  </>
-                ) : null
+                <>
+                  <span className="day-cam-scale" title="Камер в ряду">
+                    <span className="playhead-clock-span">В ряд</span>
+                    {Array.from({ length: DAY_CAM_COLS_MAX }, (_, i) => i + 1).map((n) => (
+                      <button
+                        key={n}
+                        type="button"
+                        className={`playhead-btn ${cameraCols === n ? "on" : ""}`}
+                        onClick={() => setCameraCols(n)}
+                      >
+                        {n}
+                      </button>
+                    ))}
+                  </span>
+                  {selectedPerson ? (
+                    <>
+                      <button
+                        type="button"
+                        className="playhead-btn"
+                        onClick={() => {
+                          setSelectedPersonId(null);
+                          setSelectedEdge(null);
+                        }}
+                      >
+                        Все персоны
+                      </button>
+                      {personEdges.length > 0 && (
+                        <>
+                          <button type="button" className="playhead-btn" onClick={() => jumpToTransition("prev")}>
+                            ← Склейка
+                          </button>
+                          <button type="button" className="playhead-btn" onClick={() => jumpToTransition("next")}>
+                            Склейка →
+                          </button>
+                        </>
+                      )}
+                    </>
+                  ) : null}
+                </>
               }
             />
 
@@ -1045,7 +1101,7 @@ export function DayAnalysisPanel({
             <div
               className="day-cameras"
               style={{
-                gridTemplateColumns: cameraSessionsList.length > 1 ? "repeat(auto-fit, minmax(240px, 1fr))" : "1fr",
+                gridTemplateColumns: `repeat(${Math.max(1, Math.min(cameraCols, Math.max(1, cameraSessionsList.length)))}, minmax(0, 1fr))`,
               }}
             >
               {cameraSessionsList.map((sess) => {

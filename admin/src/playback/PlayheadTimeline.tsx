@@ -177,6 +177,16 @@ function PlayheadTimelineInner<T>({
                 {lane.label}
               </div>
               <div className="playhead-lane-track">
+                {lane.coverage && bounds.span > 0 && lane.coverage.t1 > lane.coverage.t0 && (
+                  <div
+                    className="playhead-lane-cover"
+                    style={{
+                      left: `${((lane.coverage.t0 - bounds.minT) / bounds.span) * 100}%`,
+                      width: `${((lane.coverage.t1 - lane.coverage.t0) / bounds.span) * 100}%`,
+                    }}
+                    title={`${lane.label}: ${formatTick(lane.coverage.t0)}–${formatTick(lane.coverage.t1)}`}
+                  />
+                )}
                 {lane.segments.map((seg) => {
                   const leftPct = ((seg.t0 - bounds.minT) / bounds.span) * 100;
                   const widthPct = Math.max(0.45, ((seg.t1 - seg.t0) / bounds.span) * 100);

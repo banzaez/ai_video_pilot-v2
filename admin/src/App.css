@@ -5805,6 +5805,17 @@ body {
   overflow: hidden;
 }
 
+.playhead-lane-cover {
+  position: absolute;
+  top: 3px;
+  height: 12px;
+  border-radius: 2px;
+  background: rgba(60, 80, 100, 0.12);
+  box-shadow: inset 0 0 0 1px rgba(60, 80, 100, 0.14);
+  pointer-events: none;
+  z-index: 0;
+}
+
 .playhead-bar,
 .day-bar {
   position: absolute;
@@ -5851,12 +5862,22 @@ body {
   z-index: 6;
 }
 
+.day-cam-scale {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
 .day-cameras {
   flex: 1 1 auto;
   min-height: 0;
   display: grid;
   gap: 8px;
-  overflow: auto;
+  overflow-x: hidden;
+  overflow-y: auto;
+  align-content: start;
+  align-items: start;
+  grid-auto-rows: max-content;
 }
 
 .day-camera-card {
@@ -5867,6 +5888,9 @@ body {
   border-radius: 6px;
   overflow: hidden;
   min-height: 0;
+  height: auto;
+  width: 100%;
+  align-self: start;
 }
 
 .day-camera-card.has-person {
@@ -5957,28 +5981,47 @@ body {
 }
 
 .day-camera-body {
-  flex: 1 1 auto;
-  min-height: 160px;
   position: relative;
+  flex: 0 0 auto;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  min-height: 0;
   background: var(--surface, #fff);
+}
+
+.day-camera-card .player {
+  position: absolute;
+  inset: 0;
+  display: block;
+  min-height: 0;
+  height: 100%;
+  border: none;
+  background: transparent;
 }
 
 .day-camera-card .stage,
 .day-camera-card .stage video {
   background: var(--surface, #fff);
   border-radius: 0;
+  max-height: none;
 }
 
-.day-camera-card .player {
-  min-height: 0;
-  border: none;
-  background: transparent;
+.day-camera-card .stage {
+  height: 100%;
+}
+
+.day-camera-card .stage video {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
 }
 
 .day-camera-card .player.empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
   background: var(--surface, #fff);
   color: var(--muted);
-  min-height: 140px;
 }
 
 .day-inspect-stack {

@@ -31,5 +31,7 @@ export type TimelineLane<T = unknown> = {
   id: string;
   label: string;
   highlight?: boolean;
+  /** Интервал, который реально есть на видео этой дорожки. */
+  coverage?: { t0: number; t1: number };
   segments: TimelineSegment<T>[];
 };
