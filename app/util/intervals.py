@@ -23,6 +23,13 @@ def intervals_overlap(a0: float, a1: float, b0: float, b1: float, eps: float = 1
     return a_point or b_point
 
 
+def intervals_overlap_sec(a0: float, a1: float, b0: float, b1: float) -> float:
+    """Длительность пересечения интервалов в секундах."""
+    lo = max(float(a0), float(b0))
+    hi = min(float(a1), float(b1))
+    return max(0.0, float(hi - lo))
+
+
 def pair_embed_score(emb_a: np.ndarray | None, emb_b: np.ndarray | None) -> float | None:
     """Лучшее косинусное сходство среди пар эмбеддингов."""
     if emb_a is None or emb_b is None or len(emb_a) == 0 or len(emb_b) == 0:

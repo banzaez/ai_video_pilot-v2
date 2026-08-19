@@ -11,6 +11,10 @@ from typing import Any, Sequence
 import cv2
 import numpy as np
 
+from app.crops.filters import (
+    OutlierFilterConfig,
+    filter_track_outlier_candidates,
+)
 from app.crops.geometry import (
     apply_gaussian_feathering,
     create_pose_alpha_mask,
@@ -375,6 +379,20 @@ class TrackBestFramesPicker:
         feathering_sigma: float = 15.0,
         feathering_bone_thickness: float = 0.18,
         feathering_bg_color: Sequence[int] | tuple[int, int, int] = (128, 128, 128),
+        # Параметры фильтрации выбросов
+        trim_enabled: bool = True,
+        trim_start: int = 2,
+        trim_end: int = 2,
+        trim_min_len: int = 8,
+        kinematic_enabled: bool = True,
+        kinematic_max_speed_ratio: float = 3.0,
+        kinematic_max_area_ratio: float = 2.2,
+        kinematic_min_candidates: int = 5,
+        color_consistency_enabled: bool = True,
+        color_min_similarity: float = 0.50,
+        color_edge_only: bool = True,
+        color_edge_window: int = 2,
+        outlier_filter_config: OutlierFilterConfig | None = None,
     ) -> None:
         self.pose_service = pose_service
         self.pose_weight = max(0.0, min(1.0, float(pose_weight)))
@@ -389,6 +407,47 @@ class TrackBestFramesPicker:
         self.feathering_bone_thickness = float(feathering_bone_thickness)
         self.feathering_bg_color = tuple(int(v) for v in feathering_bg_color[:3])
 
+        if outlier_filter_config is not None:
+            self.outlier_filter_config = outlier_filter_config
+        else:
+            self.outlier_filter_config = OutlierFilterConfig(
+                trim_enabled=bool(trim_enabled),
+                trim_start=int(trim_start),
+                trim_end=int(trim_end),
+                trim_min_len=int(trim_min_len),
+                kinematic_enabled=bool(kinematic_enabled),
+                kinematic_max_speed_ratio=float(kinematic_max_speed_ratio),
+                kinematic_max_area_ratio=float(kinematic_max_area_ratio),
+                kinematic_min_candidates=int(kinematic_min_candidates),
+                color_enabled=bool(color_consistency_enabled),
+                color_min_similarity=float(color_min_similarity),
+                color_edge_only=bool(color_edge_only),
+                color_edge_window=int(color_edge_window),
+            )
+
+    def filter_candidates(
+        self, candidates: Sequence[TrackFrameCandidate]
+    ) -> list[TrackFrameCandidate]:
+        """Группирует кандидатов по tracklet_id и применяет многоуровневую фильтрацию выбросов."""
+        if not candidates:
+            return []
+
+        cfg = self.outlier_filter_config
+        if not (cfg.trim_enabled or cfg.kinematic_enabled or cfg.color_enabled):
+            return list(candidates)
+
+        by_tid: dict[int, list[TrackFrameCandidate]] = {}
+        for c in candidates:
+            tid = c.tracklet_id if c.tracklet_id is not None else 0
+            by_tid.setdefault(tid, []).append(c)
+
+        cleaned: list[TrackFrameCandidate] = []
+        for tid, cands in by_tid.items():
+            cleaned_t = filter_track_outlier_candidates(cands, cfg)
+            cleaned.extend(cleaned_t)
+
+        return sorted(cleaned, key=lambda c: (c.tracklet_id or 0, c.frame_index))
+
     def score_candidates_batch(
         self,
         candidates: Sequence[TrackFrameCandidate],
@@ -399,14 +458,22 @@ class TrackBestFramesPicker:
         pbar_desc: str = "[STAGE 2b: Pose scoring]",
         cache_path: str | None = None,
         prune_cache: bool = False,
+        preloaded_poses: dict[int, dict[int, dict[str, Any]]] | None = None,
+        filter_outliers: bool = False,
     ) -> list[ScoredTrackFrame]:
         """
         Батчевый скоринг списка кандидатов с поддержкой дискового кэша поз.
         Поддерживает как полные кадры (image), так и предварительно вырезанные кропы (crop_image).
         При extract_faces=True автоматически вырезает face_crop и face_bbox по ключевым точкам позы.
+        При filter_outliers=True предварительно фильтрует аномальные кадры трека.
         """
         if not candidates:
             return []
+
+        if filter_outliers:
+            candidates = self.filter_candidates(candidates)
+            if not candidates:
+                return []
 
         pose_model = self.pose_service.model_name if self.pose_service is not None else ""
         cache_entries: dict[str, dict[str, Any]] = (
@@ -415,6 +482,28 @@ class TrackBestFramesPicker:
             else {}
         )
         cache_updated = False
+
+        if preloaded_poses:
+            for cand in candidates:
+                k = _make_candidate_cache_key(cand)
+                if k in cache_entries:
+                    continue
+                tid = cand.tracklet_id or 0
+                fi_1 = cand.frame_index + 1
+                p_info = preloaded_poses.get(tid, {}).get(fi_1) or preloaded_poses.get(tid, {}).get(cand.frame_index)
+                if p_info and p_info.get("kxy"):
+                    best_pose = PoseResult(
+                        bbox=p_info.get("bbox") or cand.target_det.get("bbox") or [0, 0, 0, 0],
+                        confidence=float(p_info.get("confidence", 0.8)),
+                        kxy=p_info["kxy"],
+                        kcf=p_info.get("kcf") or [1.0] * len(p_info["kxy"]),
+                    )
+                    cache_entries[k] = {
+                        "pose_result": _pose_to_dict(best_pose),
+                        "n_poses_in_crop": 1,
+                        "crop_crowd_penalty": 1.0,
+                    }
+                    cache_updated = True
 
         # 2. Подготовка кропов и геометрии
         crops: list[np.ndarray] = []
@@ -675,14 +764,18 @@ class TrackBestFramesPicker:
         batch_size: int = 16,
         extract_faces: bool = True,
         cache_path: str | None = None,
+        filter_outliers: bool = True,
     ) -> list[ScoredTrackFrame]:
         """
         Выбирает лучшие top_k кадров для одного треклета с равномерным распределением (spread).
         """
         if not candidates:
             return []
+        cands = self.filter_candidates(candidates) if filter_outliers else candidates
+        if not cands:
+            cands = candidates
         scored = self.score_candidates_batch(
-            candidates,
+            cands,
             batch_size=batch_size,
             extract_faces=extract_faces,
             cache_path=cache_path,
@@ -697,6 +790,7 @@ class TrackBestFramesPicker:
         batch_size: int = 16,
         extract_faces: bool = True,
         cache_path: str | None = None,
+        filter_outliers: bool = True,
     ) -> list[ScoredTrackFrame]:
         """
         Выбирает лучшие top_k кадров для группы склеенных треклетов
@@ -707,7 +801,11 @@ class TrackBestFramesPicker:
 
         all_candidates: list[TrackFrameCandidate] = []
         for cands in candidates_by_tid.values():
-            all_candidates.extend(cands)
+            if filter_outliers:
+                cleaned = self.filter_candidates(cands)
+                all_candidates.extend(cleaned if cleaned else cands)
+            else:
+                all_candidates.extend(cands)
 
         if not all_candidates:
             return []
@@ -804,6 +902,7 @@ class TrackBestFramesPicker:
         min_face_conf: float = 0.20,
         batch_size: int = 16,
         cache_path: str | None = None,
+        filter_outliers: bool = True,
     ) -> list[ScoredTrackFrame]:
         """
         Выбирает лучшие top_k кадров лиц для группы склеенных треков (для InsightFace / Stage 10).
@@ -813,7 +912,11 @@ class TrackBestFramesPicker:
 
         all_candidates: list[TrackFrameCandidate] = []
         for cands in candidates_by_tid.values():
-            all_candidates.extend(cands)
+            if filter_outliers:
+                cleaned = self.filter_candidates(cands)
+                all_candidates.extend(cleaned if cleaned else cands)
+            else:
+                all_candidates.extend(cands)
 
         if not all_candidates:
             return []

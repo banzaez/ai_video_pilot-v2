@@ -7,11 +7,16 @@ import os
 import statistics
 
 from app.artifact_meta import attach_artifact_meta
-from app.config import Settings, tracklet_links_json_path, tracklet_reid_json_path, tracklets_json_path
+from app.config import (
+    Settings,
+    tracklet_frames_json_path,
+    tracklet_links_json_path,
+    tracklet_reid_json_path,
+    tracklets_json_path,
+)
 from app.io.json_util import load_tracking_json, save_debug_json
 from app.reid import load_cache
 from app.tracklet.embeddings import build_tracklet_crop_embeddings
-from app.tracklet.endpoint_pose import enrich_tracklet_endpoint_pose
 from app.tracklet.link_mcf import link_tracklets
 from app.tracklet.map_coords import enrich_tracklets_map_coords
 
@@ -32,6 +37,32 @@ def run_tracklet_link(settings: Settings) -> None:
     if not tracklets:
         raise ValueError("tracklets.json пуст")
 
+    # Обогащаем tracklets точками на карте этажа
+    enrich_tracklets_map_coords(
+        tracklets,
+        settings=settings,
+        torso_height_m=settings.feet_torso_height_m,
+        person_height_m=settings.feet_person_height_m,
+        kpt_min=settings.pose_kpt_min,
+    )
+
+    # Загружаем покадровые позиции треклетов
+    frames_pos: dict[int, dict[int, tuple[float, float, str]]] = {}
+    tf_path = tracklet_frames_json_path(settings)
+    if os.path.isfile(tf_path):
+        tf_data = load_tracking_json(tf_path)
+        for fr in tf_data.get("frames") or []:
+            fi = int(fr.get("frame_index", 0))
+            for det in fr.get("detections") or []:
+                tid = int(det.get("tracklet_id") or det.get("track_id") or 0)
+                if tid <= 0:
+                    continue
+                bbox = det.get("bbox")
+                if isinstance(bbox, (list, tuple)) and len(bbox) >= 4:
+                    px = 0.5 * (float(bbox[0]) + float(bbox[2]))
+                    py = float(bbox[3])
+                    frames_pos.setdefault(fi, {})[tid] = (px, py, "image")
+
     npz_path = str(reid_data.get("npz_path") or "")
     if not npz_path or not os.path.isfile(npz_path):
         from app.config import tracklet_reid_npz_path
@@ -44,45 +75,24 @@ def run_tracklet_link(settings: Settings) -> None:
     if not embeddings:
         raise ValueError("Нет ReID-эмбеддингов для tracklet_link")
 
-    n_pose = enrich_tracklet_endpoint_pose(tracklets, settings)
-    if n_pose:
-        logger.info("STAGE 2c: pose на концах %s точек", n_pose)
-
-    n_map = enrich_tracklets_map_coords(
-        tracklets,
-        settings=settings,
-        torso_height_m=settings.tracklet_link_torso_height_m,
-        person_height_m=settings.feet_person_height_m,
-        kpt_min=settings.pose_kpt_min,
-    )
-    if n_map:
-        logger.info("STAGE 2c: map-координаты для %s/%s треклетов", n_map, len(tracklets))
-
-    logger.info("STAGE 2c: link %s треклетов (solver=%s)", len(tracklets), settings.tracklet_link_solver)
+    logger.info("STAGE 2c: link %s треклетов", len(tracklets))
     result = link_tracklets(
         tracklets,
         embeddings,
         max_gap_sec=settings.tracklet_link_max_gap_sec,
+        max_overlap_sec=settings.tracklet_link_max_overlap_sec,
         min_reid_score=settings.tracklet_link_min_reid_score,
-        pass1_min_score=settings.tracklet_link_pass1_min_score,
-        max_spatial_px=settings.tracklet_link_max_spatial_px,
-        max_spatial_m=settings.tracklet_link_max_spatial_m,
-        window_sec=settings.tracklet_link_window_sec,
-        window_overlap_sec=settings.tracklet_link_window_overlap_sec,
-        solver=settings.tracklet_link_solver,
-        motion_sigma_px=settings.tracklet_link_motion_sigma_px,
-        motion_sigma_m=settings.tracklet_link_motion_sigma_m,
-        size_log_scale=settings.tracklet_link_size_log_scale,
         w_reid=settings.tracklet_link_w_reid,
-        w_motion=settings.tracklet_link_w_motion,
-        w_size=settings.tracklet_link_w_size,
         w_gap=settings.tracklet_link_w_gap,
         pass0_min_reid=settings.tracklet_link_pass0_min_reid,
         pass0_min_score=settings.tracklet_link_pass0_min_score,
-        pass2_min_score=settings.tracklet_link_pass2_min_score,
-        pass4_max_overlap_sec=settings.tracklet_link_pass4_max_overlap_sec,
-        pass4_min_reid=settings.tracklet_link_pass4_min_reid,
-        pass4_min_score=settings.tracklet_link_pass4_min_score,
+        pass_alone_enabled=settings.tracklet_link_pass_alone_enabled,
+        pass_alone_radius_m=settings.tracklet_link_pass_alone_radius_m,
+        pass_alone_max_gap_sec=settings.tracklet_link_pass_alone_max_gap_sec,
+        pass_alone_max_dist_m=settings.tracklet_link_pass_alone_max_dist_m,
+        pass_alone_max_speed_mps=settings.tracklet_link_pass_alone_max_speed_mps,
+        pass_alone_min_reid=settings.tracklet_link_pass_alone_min_reid,
+        frames_pos=frames_pos if frames_pos else None,
     )
 
     groups = result["groups"]
@@ -105,31 +115,24 @@ def run_tracklet_link(settings: Settings) -> None:
         "solver": result["solver"],
         "pass0_min_reid": settings.tracklet_link_pass0_min_reid,
         "pass0_min_score": settings.tracklet_link_pass0_min_score,
-        "pass1_min_score": settings.tracklet_link_pass1_min_score,
-        "pass2_min_score": settings.tracklet_link_pass2_min_score,
-        "pass4_max_overlap_sec": settings.tracklet_link_pass4_max_overlap_sec,
-        "pass4_min_reid": settings.tracklet_link_pass4_min_reid,
-        "pass4_min_score": settings.tracklet_link_pass4_min_score,
+        "pass_alone_enabled": settings.tracklet_link_pass_alone_enabled,
+        "pass_alone_radius_m": settings.tracklet_link_pass_alone_radius_m,
         "n_groups": len(groups),
         "groups": groups,
         "edges": edges,
         "tracklet_to_global": mapping,
         "pass0_merged": int(result.get("pass0_merged") or 0),
-        "pass2_merged": int(result.get("pass2_merged") or 0),
-        "pass3_spliced": int(result.get("pass3_spliced") or 0),
-        "pass4_merged": int(result.get("pass4_merged") or 0),
+        "pass_alone_merged": int(result.get("pass_alone_merged") or 0),
     }
     attach_artifact_meta(payload, stage="tracklet_link", path=out_path)
     save_debug_json(out_path, payload)
     logger.info(
-        "STAGE 2c: групп=%s (склеено %s, median_chain=%.1f), рёбер=%s, reid>=0.95 не взяты=%s, pass0=%s, pass2=%s, pass3=%s, pass4=%s",
+        "STAGE 2c: групп=%s (склеено %s, median_chain=%.1f), рёбер=%s, reid>=0.95 не взяты=%s, pass0=%s, pass_alone_geo=%s",
         payload["n_groups"],
         n_multi,
         float(median_chain),
         len(edges),
         len(missed_high),
         int(result.get("pass0_merged") or 0),
-        int(result.get("pass2_merged") or 0),
-        int(result.get("pass3_spliced") or 0),
-        int(result.get("pass4_merged") or 0),
+        int(result.get("pass_alone_merged") or 0),
     )

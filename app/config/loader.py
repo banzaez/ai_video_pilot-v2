@@ -90,48 +90,31 @@ def _parse_day_link_cfg(dl: dict[str, Any]) -> dict[str, Any]:
 
 
 def _parse_tracklet_link_cfg(link_cfg: dict[str, Any]) -> dict[str, Any]:
-    """Nested link.candidates / combo / passN + fallback на плоские ключи."""
+    """Nested link.candidates / combo / pass0 / pass_alone_geo + fallback на плоские ключи."""
     cand = _link_section(link_cfg, "candidates")
     combo = _link_section(link_cfg, "combo")
     p0 = _link_section(link_cfg, "pass0")
-    p1 = _link_section(link_cfg, "pass1")
-    p2 = _link_section(link_cfg, "pass2")
-    p4 = _link_section(link_cfg, "pass4")
+    p_alone = _link_section(link_cfg, "pass_alone_geo")
 
     def g(section: dict[str, Any], key: str, *flat: str, default: Any) -> Any:
         return _link_value(link_cfg, section, key, *flat, default=default)
 
-    pass2_min = float(g(p2, "min_score", "pass2_min_score", default=0.0))
-
     return {
         "max_gap_sec": float(g(cand, "max_gap_sec", "max_gap_sec", default=20.0)),
+        "max_overlap_sec": float(g(cand, "max_overlap_sec", "max_overlap_sec", default=2.0)),
         "min_reid_score": float(g(cand, "min_reid_score", "min_reid_score", default=0.55)),
-        "max_spatial_px": float(g(cand, "max_spatial_px", "max_spatial_px", default=700)),
-        "max_spatial_m": float(g(cand, "max_spatial_m", "max_spatial_m", default=4.0)),
-        "motion_sigma_px": float(g(cand, "motion_sigma_px", "motion_sigma_px", default=180)),
-        "motion_sigma_m": float(g(cand, "motion_sigma_m", "motion_sigma_m", default=1.5)),
-        "size_log_scale": float(g(cand, "size_log_scale", "size_log_scale", default=0.45)),
-        "w_reid": float(g(combo, "w_reid", "w_reid", default=0.55)),
-        "w_motion": float(g(combo, "w_motion", "w_motion", default=0.25)),
-        "w_size": float(g(combo, "w_size", "w_size", default=0.10)),
-        "w_gap": float(g(combo, "w_gap", "w_gap", default=0.10)),
+        "w_reid": float(g(combo, "w_reid", "w_reid", default=0.85)),
+        "w_gap": float(g(combo, "w_gap", "w_gap", default=0.15)),
         "pass0_min_reid": float(g(p0, "min_reid", "pass0_min_reid", default=0.0)),
         "pass0_min_score": float(
             g(p0, "min_score", "pass0_min_score", "min_combo", default=0.0)
         ),
-        "pass1_min_score": float(
-            g(p1, "min_score", "pass1_min_score", "auto_min_score", default=0.70)
-        ),
-        "pass2_min_score": pass2_min,
-        "pass4_max_overlap_sec": float(
-            g(p4, "max_overlap_sec", "pass4_max_overlap_sec", default=2.0)
-        ),
-        "pass4_min_reid": float(g(p4, "min_reid", "pass4_min_reid", default=0.95)),
-        "pass4_min_score": float(g(p4, "min_score", "pass4_min_score", default=0.85)),
-        "window_sec": float(g(p1, "window_sec", "window_sec", default=120)),
-        "window_overlap_sec": float(g(p1, "window_overlap_sec", "window_overlap_sec", default=15)),
-        "solver": str(g(p1, "solver", "solver", default="hungarian") or "hungarian").lower(),
-        "torso_height_m": float(link_cfg.get("torso_height_m", 0.0)),
+        "pass_alone_enabled": bool(p_alone.get("enabled", True)),
+        "pass_alone_radius_m": float(g(p_alone, "radius_m", "pass_alone_radius_m", default=2.0)),
+        "pass_alone_max_gap_sec": float(g(p_alone, "max_gap_sec", "pass_alone_max_gap_sec", default=15.0)),
+        "pass_alone_max_dist_m": float(g(p_alone, "max_dist_m", "pass_alone_max_dist_m", default=3.0)),
+        "pass_alone_max_speed_mps": float(g(p_alone, "max_speed_mps", "pass_alone_max_speed_mps", default=2.0)),
+        "pass_alone_min_reid": float(g(p_alone, "min_reid", "pass_alone_min_reid", default=0.0)),
     }
 
 
@@ -383,6 +366,8 @@ def settings_from_sources(args: argparse.Namespace | None = None) -> Settings:
     tracklet_reid_cfg = tracklet_cfg.get("reid") or {}
     tracklet_link_cfg = tracklet_cfg.get("link") or {}
     best_frames_cfg = cfg.get("best_frames") or tracklet_cfg.get("best_frames") or {}
+    pose_cfg = tracklet_cfg.get("pose") if isinstance(tracklet_cfg.get("pose"), dict) else (cfg.get("pose") or {})
+    feet_cfg = tracklet_cfg.get("feet") if isinstance(tracklet_cfg.get("feet"), dict) else (cfg.get("feet") or {})
     link = _parse_tracklet_link_cfg(tracklet_link_cfg)
     reid_models_dir = str(cfg.get("reid_models_dir") or REID_MODELS_DIR).strip() or REID_MODELS_DIR
     tracklet_reid = _resolve_reid_settings(
@@ -520,38 +505,74 @@ def settings_from_sources(args: argparse.Namespace | None = None) -> Settings:
             if isinstance(best_frames_cfg.get("feathering"), dict)
             else [128, 128, 128]
         ),
+        tracklet_reid_trim_enabled=bool(
+            best_frames_cfg.get("trim", {}).get("enabled", True)
+            if isinstance(best_frames_cfg.get("trim"), dict)
+            else best_frames_cfg.get("trim_enabled", True)
+        ),
+        tracklet_reid_trim_start=int(
+            best_frames_cfg.get("trim", {}).get("start_frames", best_frames_cfg.get("trim", {}).get("start", 2))
+            if isinstance(best_frames_cfg.get("trim"), dict)
+            else best_frames_cfg.get("trim_start", 2)
+        ),
+        tracklet_reid_trim_end=int(
+            best_frames_cfg.get("trim", {}).get("end_frames", best_frames_cfg.get("trim", {}).get("end", 2))
+            if isinstance(best_frames_cfg.get("trim"), dict)
+            else best_frames_cfg.get("trim_end", 2)
+        ),
+        tracklet_reid_trim_min_len=int(
+            best_frames_cfg.get("trim", {}).get("min_track_len", best_frames_cfg.get("trim", {}).get("min_len", 8))
+            if isinstance(best_frames_cfg.get("trim"), dict)
+            else best_frames_cfg.get("trim_min_len", 8)
+        ),
+        tracklet_reid_kinematic_enabled=bool(
+            best_frames_cfg.get("kinematic", {}).get("enabled", True)
+            if isinstance(best_frames_cfg.get("kinematic"), dict)
+            else best_frames_cfg.get("kinematic_enabled", True)
+        ),
+        tracklet_reid_kinematic_max_speed_ratio=float(
+            best_frames_cfg.get("kinematic", {}).get("max_speed_ratio", 3.0)
+            if isinstance(best_frames_cfg.get("kinematic"), dict)
+            else best_frames_cfg.get("kinematic_max_speed_ratio", 3.0)
+        ),
+        tracklet_reid_kinematic_max_area_ratio=float(
+            best_frames_cfg.get("kinematic", {}).get("max_area_ratio", 2.2)
+            if isinstance(best_frames_cfg.get("kinematic"), dict)
+            else best_frames_cfg.get("kinematic_max_area_ratio", 2.2)
+        ),
+        tracklet_reid_color_enabled=bool(
+            best_frames_cfg.get("color_consistency", {}).get("enabled", True)
+            if isinstance(best_frames_cfg.get("color_consistency"), dict)
+            else best_frames_cfg.get("color_consistency_enabled", True)
+        ),
+        tracklet_reid_color_min_similarity=float(
+            best_frames_cfg.get("color_consistency", {}).get("min_similarity", 0.50)
+            if isinstance(best_frames_cfg.get("color_consistency"), dict)
+            else best_frames_cfg.get("color_min_similarity", 0.50)
+        ),
         tracklet_crops_dir=str(tracklet_reid_cfg.get("crops_dir") or "tracklet_crops"),
         tracklet_link_max_gap_sec=float(link["max_gap_sec"]),
+        tracklet_link_max_overlap_sec=float(link.get("max_overlap_sec", 2.0)),
         tracklet_link_min_reid_score=float(link["min_reid_score"]),
-        tracklet_link_pass1_min_score=float(link["pass1_min_score"]),
         tracklet_link_pass0_min_reid=float(link["pass0_min_reid"]),
         tracklet_link_pass0_min_score=float(link.get("pass0_min_score", 0.0)),
-        tracklet_link_max_spatial_px=float(link["max_spatial_px"]),
-        tracklet_link_max_spatial_m=float(link["max_spatial_m"]),
-        tracklet_link_motion_sigma_px=float(link["motion_sigma_px"]),
-        tracklet_link_motion_sigma_m=float(link["motion_sigma_m"]),
-        tracklet_link_size_log_scale=float(link["size_log_scale"]),
+        tracklet_link_pass_alone_enabled=bool(link.get("pass_alone_enabled", True)),
+        tracklet_link_pass_alone_radius_m=float(link.get("pass_alone_radius_m", 2.0)),
+        tracklet_link_pass_alone_max_gap_sec=float(link.get("pass_alone_max_gap_sec", 15.0)),
+        tracklet_link_pass_alone_max_dist_m=float(link.get("pass_alone_max_dist_m", 3.0)),
+        tracklet_link_pass_alone_max_speed_mps=float(link.get("pass_alone_max_speed_mps", 2.0)),
+        tracklet_link_pass_alone_min_reid=float(link.get("pass_alone_min_reid", 0.0)),
         tracklet_link_w_reid=float(link["w_reid"]),
-        tracklet_link_w_motion=float(link["w_motion"]),
-        tracklet_link_w_size=float(link["w_size"]),
         tracklet_link_w_gap=float(link["w_gap"]),
-        tracklet_link_pass2_min_score=float(link["pass2_min_score"]),
-        tracklet_link_pass4_max_overlap_sec=float(link["pass4_max_overlap_sec"]),
-        tracklet_link_pass4_min_reid=float(link["pass4_min_reid"]),
-        tracklet_link_pass4_min_score=float(link["pass4_min_score"]),
-        tracklet_link_window_sec=float(link["window_sec"]),
-        tracklet_link_window_overlap_sec=float(link["window_overlap_sec"]),
-        tracklet_link_solver=str(link["solver"]),
-        tracklet_link_torso_height_m=float(link["torso_height_m"]),
-        feet_torso_height_m=float((cfg.get("feet") or {}).get("torso_height_m", 0.0)),
-        feet_person_height_m=float((cfg.get("feet") or {}).get("person_height_m", 1.70)),
-        feet_smooth_window=max(1, int((cfg.get("feet") or {}).get("smooth_window", 5))),
-        feet_max_speed_mps=float((cfg.get("feet") or {}).get("max_speed_mps", 2.0)),
-        pose_model=str((cfg.get("pose") or {}).get("model") or "yolo26s-pose.pt"),
-        pose_conf=float((cfg.get("pose") or {}).get("conf", 0.25)),
-        pose_kpt_min=float((cfg.get("pose") or {}).get("kpt_min", 0.25)),
-        pose_every_n=max(1, int((cfg.get("pose") or {}).get("every_n", 4))),
-        camera_link_enabled=bool((cfg.get("camera_link") or {}).get("enabled", True)),
+        feet_torso_height_m=float(feet_cfg.get("torso_height_m", 0.0)),
+        feet_person_height_m=float(feet_cfg.get("person_height_m", 1.70)),
+        feet_smooth_window=max(1, int(feet_cfg.get("smooth_window", 5))),
+        feet_max_speed_mps=float(feet_cfg.get("max_speed_mps", 2.0)),
+        pose_model=str(pose_cfg.get("model") or "yolo26s-pose.pt"),
+        pose_conf=float(pose_cfg.get("conf", 0.25)),
+        pose_kpt_min=float(pose_cfg.get("kpt_min", 0.25)),
+        pose_every_n=max(1, int(pose_cfg.get("every_n", 4))),
+        camera_link_enabled=bool((cfg.get("camera_link") or {}).get("enabled", False)),
         camera_link_model=str(
             ((cfg.get("camera_link") or {}).get("face_models") or [None])[0]
             or (cfg.get("camera_link") or {}).get("face_model", "buffalo_l")

@@ -143,7 +143,7 @@ def _face_embs_for_group(
 
 def run_camera_link(settings: Settings) -> None:
     """Точка входа стадии camera_link (Pass 10)."""
-    if not settings.camera_link_enabled:
+    if not getattr(settings, "camera_link_enabled", False):
         logger.info("STAGE camera_link: отключена в настройках")
         return
 

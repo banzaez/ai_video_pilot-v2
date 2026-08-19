@@ -8,7 +8,15 @@ import statistics
 from typing import Any
 
 from app.artifact_meta import attach_artifact_meta
-from app.config import Settings, cameras_dir, feet_json_path, info_json_path, tracking_json_path
+from app.config import (
+    Settings,
+    cameras_dir,
+    feet_json_path,
+    info_json_path,
+    tracking_json_path,
+    tracklet_frames_json_path,
+    tracklets_json_path,
+)
 from app.io.json_util import load_tracking_json, save_debug_json
 from app.global_id.calib_fingerprint import calib_fingerprint
 from app.global_id.camera_pose import (
@@ -152,12 +160,85 @@ def smooth_track_xy(
     return out
 
 
+def _enrich_tracklets_json(
+    settings: Settings,
+    raw_feet: dict[int, dict[int, dict[str, Any]]],
+    pose_lookup: dict[int, dict[int, dict[str, Any]]],
+    kpt_min: float,
+) -> None:
+    tl_path = tracklets_json_path(settings)
+    if not os.path.isfile(tl_path):
+        return
+    tl_data = load_tracking_json(tl_path)
+    tracklets = tl_data.get("tracklets") or []
+    if not tracklets:
+        return
+
+    n_enriched = 0
+    for t in tracklets:
+        try:
+            tid = int(t["tracklet_id"])
+            f0 = int(t["f0"])
+            f1 = int(t["f1"])
+        except (KeyError, TypeError, ValueError):
+            continue
+
+        feet_by_f = raw_feet.get(tid, {})
+        pose_by_f = pose_lookup.get(tid, {})
+
+        # 1. Точные точки ног p0 и p1 по лодыжкам
+        k0 = pose_by_f.get(f0)
+        if k0 and k0.get("kxy"):
+            ft0 = image_feet_from_kpts(k0["kxy"], k0.get("kcf"), kpt_min)
+            if ft0 is not None:
+                t["p0"] = [round(float(ft0[0]), 1), round(float(ft0[1]), 1)]
+                t["kxy0"] = k0["kxy"]
+                t["kcf0"] = k0.get("kcf")
+
+        k1 = pose_by_f.get(f1)
+        if k1 and k1.get("kxy"):
+            ft1 = image_feet_from_kpts(k1["kxy"], k1.get("kcf"), kpt_min)
+            if ft1 is not None:
+                t["p1"] = [round(float(ft1[0]), 1), round(float(ft1[1]), 1)]
+                t["kxy1"] = k1["kxy"]
+                t["kcf1"] = k1.get("kcf")
+
+        # 2. Map точки map_p0 и map_p1
+        p0_map_rec = feet_by_f.get(f0)
+        if p0_map_rec and p0_map_rec.get("map"):
+            t["map_p0"] = p0_map_rec["map"]
+            t["map_src0"] = p0_map_rec.get("source", "")
+        p1_map_rec = feet_by_f.get(f1)
+        if p1_map_rec and p1_map_rec.get("map"):
+            t["map_p1"] = p1_map_rec["map"]
+            t["map_src1"] = p1_map_rec.get("source", "")
+
+        # 3. Оценка полноты позы (completeness)
+        all_kcf = [rec["kcf"] for rec in pose_by_f.values() if rec.get("kcf")]
+        if all_kcf:
+            comps = [sum(1 for c in cfs if float(c) >= kpt_min) / max(1, len(cfs)) for cfs in all_kcf]
+            t["completeness"] = round(float(statistics.median(comps)), 3)
+
+        n_enriched += 1
+
+    attach_artifact_meta(tl_data, stage="tracklets", path=tl_path)
+    save_debug_json(tl_path, tl_data)
+    logger.info("STAGE feet: обогащено %s треклетов в tracklets.json", n_enriched)
+
+
 def run_feet(settings: Settings) -> None:
     track_path = tracking_json_path(settings)
-    if not os.path.isfile(track_path):
-        raise ValueError(f"Нет tracking JSON: {track_path}. Сначала --stage track")
+    tl_frames_path = tracklet_frames_json_path(settings)
+    if os.path.isfile(track_path):
+        tracking = load_tracking_json(track_path)
+    elif os.path.isfile(tl_frames_path):
+        tracking = load_tracking_json(tl_frames_path)
+    else:
+        raise ValueError(
+            f"Нет tracking JSON ({track_path}) и нет tracklet_frames JSON ({tl_frames_path}). "
+            "Сначала --stage tracklets или --stage track"
+        )
 
-    tracking = load_tracking_json(track_path)
     frames_in = tracking.get("frames") or []
     tw = int(tracking.get("width") or 0)
     th = int(tracking.get("height") or 0)
@@ -211,8 +292,9 @@ def run_feet(settings: Settings) -> None:
         for det in fr.get("detections") or []:
             if not isinstance(det, dict):
                 continue
+            raw_tid = det.get("track_id") if det.get("track_id") is not None else det.get("tracklet_id")
             try:
-                tid = int(det["track_id"])
+                tid = int(raw_tid)
             except (KeyError, TypeError, ValueError):
                 continue
             kpt = pose_lookup.get(tid, {}).get(frame_index)
@@ -249,40 +331,45 @@ def run_feet(settings: Settings) -> None:
                     if off is not None:
                         offsets.setdefault(tid, []).append((frame_index, off[0], off[1]))
 
-    # Второй проход: интерполяция смещения на кадры без позы
-    if pose is not None and image_size is not None:
-        for fr in frames_in:
-            try:
-                frame_index = int(fr.get("frame_index"))
-            except (TypeError, ValueError):
+    # Второй проход: интерполяция смещений для кадров без позы
+    for fr in frames_in:
+        try:
+            frame_index = int(fr.get("frame_index"))
+        except (TypeError, ValueError):
+            continue
+        for det in fr.get("detections") or []:
+            if not isinstance(det, dict):
                 continue
-            for det in fr.get("detections") or []:
-                if not isinstance(det, dict):
-                    continue
-                try:
-                    tid = int(det["track_id"])
-                except (KeyError, TypeError, ValueError):
-                    continue
-                existing = raw.get(tid, {}).get(frame_index)
-                if existing and str(existing.get("source") or "").startswith("kpt"):
-                    continue
-                off = _interp_offset(offsets.get(tid) or [], frame_index)
-                if off is None:
-                    continue
-                img_pt = apply_bbox_rel_offset(det.get("bbox"), off[0], off[1])
-                if img_pt is None:
-                    continue
-                mapped = ray_to_ground_map(img_pt[0], img_pt[1], pose, image_size, torso_height_m=0.0)
-                if mapped is None:
-                    continue
-                rec = {
-                    "track_id": tid,
-                    "map": [float(mapped[0]), float(mapped[1])],
-                    "source": "kpt_interp",
-                    "confidence": 0.74,
-                    "bbox": det.get("bbox"),
-                }
-                raw.setdefault(tid, {})[frame_index] = rec
+            raw_tid = det.get("track_id") if det.get("track_id") is not None else det.get("tracklet_id")
+            try:
+                tid = int(raw_tid)
+            except (KeyError, TypeError, ValueError):
+                continue
+            if frame_index in raw.get(tid, {}):
+                continue
+            kpt = pose_lookup.get(tid, {}).get(frame_index)
+            if kpt:
+                continue
+            samples = offsets.get(tid)
+            if not samples:
+                continue
+            off = _interp_offset(samples, frame_index)
+            if off is None:
+                continue
+            img_pt = apply_bbox_rel_offset(det.get("bbox"), off[0], off[1])
+            if img_pt is None:
+                continue
+            mapped = ray_to_ground_map(img_pt[0], img_pt[1], pose, image_size, torso_height_m=0.0)
+            if mapped is None:
+                continue
+            rec = {
+                "track_id": tid,
+                "map": [float(mapped[0]), float(mapped[1])],
+                "source": "kpt_interp",
+                "confidence": 0.74,
+                "bbox": det.get("bbox"),
+            }
+            raw.setdefault(tid, {})[frame_index] = rec
 
     # Сглаживание по трекам
     try:
@@ -310,8 +397,9 @@ def run_feet(settings: Settings) -> None:
         for det in fr.get("detections") or []:
             if not isinstance(det, dict):
                 continue
+            raw_tid = det.get("track_id") if det.get("track_id") is not None else det.get("tracklet_id")
             try:
-                tid = int(det["track_id"])
+                tid = int(raw_tid)
             except (KeyError, TypeError, ValueError):
                 continue
             rec = raw.get(tid, {}).get(frame_index)
@@ -344,6 +432,9 @@ def run_feet(settings: Settings) -> None:
     attach_artifact_meta(payload, stage="feet", path=out_path)
     save_debug_json(out_path, payload)
     logger.info("STAGE feet: %s точек, %s кадров → %s", n_points, len(frames_out), out_path)
+
+    # Обогащаем tracklets.json точными точками ног и оценкой позы
+    _enrich_tracklets_json(settings, raw, pose_lookup, kpt_min)
 
 
 def load_feet_lookup(work_dir: str) -> tuple[dict[int, dict[int, dict[str, Any]]], dict[str, Any] | None]:

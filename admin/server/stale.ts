@@ -8,12 +8,11 @@ export const STAGE_ORDER = [
   "info",
   "detect",
   "tracklets",
+  "pose",
+  "feet",
   "tracklet_reid",
   "tracklet_link",
   "track",
-  "pose",
-  "feet",
-  "camera_link",
 ] as const;
 
 export type StageName = (typeof STAGE_ORDER)[number];
@@ -22,24 +21,22 @@ export const STAGE_FILES: Record<StageName, string> = {
   info: "info.json",
   detect: "detections.json",
   tracklets: "tracklet_frames.json",
+  pose: "poses.json",
+  feet: "feet.json",
   tracklet_reid: "tracklet_reid.json",
   tracklet_link: "tracklet_links.json",
   track: "tracking.json",
-  pose: "poses.json",
-  feet: "feet.json",
-  camera_link: "camera_links.json",
 };
 
 export const STAGE_PARENT: Record<StageName, StageName | null> = {
   info: null,
   detect: null,
   tracklets: "detect",
+  pose: "tracklets",
+  feet: "pose",
   tracklet_reid: "tracklets",
   tracklet_link: "tracklet_reid",
   track: "tracklet_link",
-  pose: "track",
-  feet: "pose",
-  camera_link: "feet",
 };
 
 export type ExtraArtifact = {

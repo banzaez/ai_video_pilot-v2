@@ -22,6 +22,7 @@ from app.config import (
     tracklets_json_path,
 )
 from app.crops import TrackBestFramesPicker, TrackFrameCandidate, crop_person
+from app.global_id.stage_pose import load_pose_lookup
 from app.io.json_util import load_tracking_json, save_debug_json
 from app.pose.pose_service import PoseService
 from app.progress import make_pbar
@@ -161,6 +162,15 @@ def run_tracklet_reid(settings: Settings) -> None:
         feathering_sigma=settings.tracklet_reid_feathering_sigma,
         feathering_bone_thickness=settings.tracklet_reid_feathering_bone_thickness,
         feathering_bg_color=settings.tracklet_reid_feathering_bg_color,
+        trim_enabled=settings.tracklet_reid_trim_enabled,
+        trim_start=settings.tracklet_reid_trim_start,
+        trim_end=settings.tracklet_reid_trim_end,
+        trim_min_len=settings.tracklet_reid_trim_min_len,
+        kinematic_enabled=settings.tracklet_reid_kinematic_enabled,
+        kinematic_max_speed_ratio=settings.tracklet_reid_kinematic_max_speed_ratio,
+        kinematic_max_area_ratio=settings.tracklet_reid_kinematic_max_area_ratio,
+        color_consistency_enabled=settings.tracklet_reid_color_enabled,
+        color_min_similarity=settings.tracklet_reid_color_min_similarity,
     )
 
     # 3. Индексация детекций по кадрам и треклетам
@@ -169,46 +179,59 @@ def run_tracklet_reid(settings: Settings) -> None:
         fi = int(frame["frame_index"]) - 1
         dets = frame.get("detections") or []
         for det in dets:
-            tid = int(det["tracklet_id"])
-            other_dets = [d for d in dets if int(d.get("tracklet_id", -1)) != tid]
-            obs_by_tid[tid].append((fi, det, other_dets))
+            tid = det.get("tracklet_id")
+            if tid is not None and int(tid) > 0:
+                obs_by_tid[int(tid)].append((fi, det, dets))
 
-    # 4. Предварительный отбор кадров-кандидатов
-    cands_by_frame: dict[int, list[tuple[int, dict, list[dict]]]] = defaultdict(list)
-    top_k = max(1, int(settings.tracklet_reid_top_k))
+    # 4. Формирование списка кадров для чтения
+    frames_to_read: set[int] = set()
+    for tid, obs_list in obs_by_tid.items():
+        if len(obs_list) <= 30:
+            for fi, _, _ in obs_list:
+                frames_to_read.add(fi)
+        else:
+            step = len(obs_list) / 30.0
+            for i in range(30):
+                idx = min(int(round(i * step)), len(obs_list) - 1)
+                frames_to_read.add(obs_list[idx][0])
 
-    for rec in tracklets:
-        tid = int(rec["tracklet_id"])
-        obs = obs_by_tid.get(tid) or []
-        if not obs:
-            continue
-        cands = _preselect_candidate_frames(obs, top_k=top_k, multiplier=3)
-        for fi, det, other_dets in cands:
-            cands_by_frame[fi].append((tid, det, other_dets))
+    sorted_frames = sorted(frames_to_read)
+    logger.info(
+        "STAGE 2b: чтение %s уникальных кадров для %s треклетов",
+        len(sorted_frames),
+        len(obs_by_tid),
+    )
 
     # 5. Чтение необходимых кадров из видео и вырезка кропов на лету (RAM-friendly)
-    pad = float(getattr(settings, "tracklet_reid_pad", 0.04) or 0.04)
     all_candidates: list[TrackFrameCandidate] = []
-    sorted_frames = sorted(cands_by_frame.keys())
     manifest = session_manifest(settings)
     video_path = _resolve_video_path(settings, frames_data) if not manifest else None
 
-    def _process_frame_candidates(frame: np.ndarray, fi: int) -> None:
-        fh, fw = frame.shape[:2]
-        for tid, det, other_dets in cands_by_frame[fi]:
-            crop, roi = crop_person(frame, det["bbox"], pad=pad)
-            all_candidates.append(
-                TrackFrameCandidate(
-                    frame_index=fi,
-                    target_det=det,
-                    all_dets=other_dets,
-                    crop_image=np.ascontiguousarray(crop),
-                    crop_roi=roi,
-                    frame_w=fw,
-                    frame_h=fh,
-                    tracklet_id=tid,
+    def _process_frame_candidates(frame_img: np.ndarray, frame_idx: int) -> None:
+        h, w = frame_img.shape[:2]
+        for tid, obs_list in obs_by_tid.items():
+            matching_obs = [obs for obs in obs_list if obs[0] == frame_idx]
+            for fi, target_det, all_dets in matching_obs:
+                tb = target_det.get("bbox")
+                if not tb or len(tb) < 4:
+                    continue
+                crop_arr, roi = crop_person(
+                    frame_img, tb, pad=settings.tracklet_reid_pad
                 )
-            )
+                if crop_arr is None or crop_arr.size == 0:
+                    continue
+                all_candidates.append(
+                    TrackFrameCandidate(
+                        frame_index=fi,
+                        target_det=target_det,
+                        all_dets=all_dets,
+                        crop_image=np.ascontiguousarray(crop_arr),
+                        crop_roi=roi,
+                        frame_w=w,
+                        frame_h=h,
+                        tracklet_id=tid,
+                    )
+                )
 
     pbar_read = make_pbar(
         total=len(sorted_frames), desc="[STAGE 2b: read & crop]", unit="frame"
@@ -242,10 +265,13 @@ def run_tracklet_reid(settings: Settings) -> None:
     finally:
         pbar_read.close()
 
-    # 6. Единый пакетный скоринг всех кандидатов через TrackBestFramesPicker
+    # 6. Единый пакетный скоринг всех кандидатов через TrackBestFramesPicker с фильтрацией выбросов
+    work_dir = os.path.dirname(tracklets_json_path(settings))
+    preloaded_poses = load_pose_lookup(work_dir)
     logger.info(
-        "STAGE 2b: скоринг %s кропов кандидатов через TrackBestFramesPicker",
+        "STAGE 2b: скоринг %s кропов кандидатов через TrackBestFramesPicker (готовых поз: %s)",
         len(all_candidates),
+        len(preloaded_poses),
     )
     scored_candidates = picker.score_candidates_batch(
         all_candidates,
@@ -254,14 +280,18 @@ def run_tracklet_reid(settings: Settings) -> None:
         pbar_desc="[STAGE 2b: Pose scoring]",
         cache_path=tracklet_pose_cache_path(settings),
         prune_cache=True,
+        preloaded_poses=preloaded_poses,
+        filter_outliers=True,
     )
 
-    scored_by_tid: dict[int, list[ScoredTrackFrame]] = defaultdict(list)
+    scored_by_tid: dict[int, list] = defaultdict(list)
     for sc in scored_candidates:
         tid = sc.tracklet_id if sc.tracklet_id is not None else 0
         scored_by_tid[tid].append(sc)
 
     # 7. Финальный отбор top_k лучших кропов на треклет
+    top_k = max(1, int(settings.tracklet_reid_top_k))
+    save_crops = bool(settings.tracklet_reid_save_crops)
     all_keys: list[str] = []
     all_crop_images: list[np.ndarray] = []
     paths_by_tid: dict[int, list[str]] = defaultdict(list)

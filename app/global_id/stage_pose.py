@@ -9,7 +9,14 @@ from typing import Any
 import numpy as np
 
 from app.artifact_meta import attach_artifact_meta
-from app.config import Settings, cameras_dir, info_json_path, poses_json_path, tracking_json_path
+from app.config import (
+    Settings,
+    cameras_dir,
+    info_json_path,
+    poses_json_path,
+    tracking_json_path,
+    tracklet_frames_json_path,
+)
 from app.global_id.camera_pose import dual_plane_from_bbox, load_camera_doc, parse_camera_pose
 from app.io.json_util import load_tracking_json, save_debug_json
 from app.pose.types import select_pose_index_by_completeness
@@ -58,24 +65,32 @@ def _frame_wants_pose(
         _mapped, _src, truncated, _h, _f = dual_plane_from_bbox(
             bbox, pose, image_size, person_height_m=person_height_m
         )
-        if truncated:
+        if not truncated:
             return True
     return False
 
 
-def _parse_pose_result(res: Any) -> list[dict[str, Any]]:
+def _pose_to_dicts(
+    pose_results: list[Any],
+) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
-    boxes = getattr(res, "boxes", None)
-    kpts = getattr(res, "keypoints", None)
-    if boxes is None or kpts is None:
+    if not pose_results:
         return out
-    xyxy = boxes.xyxy.cpu().numpy() if hasattr(boxes.xyxy, "cpu") else np.asarray(boxes.xyxy)
-    confs = boxes.conf.cpu().numpy() if hasattr(boxes.conf, "cpu") else np.asarray(boxes.conf)
-    kxy = kpts.xy.cpu().numpy() if hasattr(kpts.xy, "cpu") else np.asarray(kpts.xy)
-    if getattr(kpts, "conf", None) is not None:
-        kcf = kpts.conf.cpu().numpy() if hasattr(kpts.conf, "cpu") else np.asarray(kpts.conf)
-    else:
-        kcf = np.ones((len(kxy), kxy.shape[1] if len(kxy) else 0), dtype=np.float32)
+    r0 = pose_results[0]
+    boxes = getattr(r0, "boxes", None)
+    keypoints = getattr(r0, "keypoints", None)
+    if boxes is None or keypoints is None:
+        return out
+    xyxy = getattr(boxes, "xyxy", None)
+    confs = getattr(boxes, "conf", None)
+    kxy = getattr(keypoints, "xy", None)
+    kcf = getattr(keypoints, "conf", None)
+    if xyxy is None or confs is None or kxy is None or kcf is None:
+        return out
+    xyxy = xyxy.cpu().numpy()
+    confs = confs.cpu().numpy()
+    kxy = kxy.cpu().numpy()
+    kcf = kcf.cpu().numpy()
     for i in range(len(xyxy)):
         box = [float(v) for v in xyxy[i][:4]]
         xy = [[round(float(p[0]), 1), round(float(p[1]), 1)] for p in kxy[i]]
@@ -110,8 +125,9 @@ def _match_to_tracks(
         for inst in pose_inst
     ]
     for det in track_dets:
+        raw_tid = det.get("track_id") if det.get("track_id") is not None else det.get("tracklet_id")
         try:
-            tid = int(det["track_id"])
+            tid = int(raw_tid)
         except (KeyError, TypeError, ValueError):
             continue
         tb = det.get("bbox")
@@ -171,10 +187,19 @@ def load_pose_lookup(work_dir: str) -> dict[int, dict[int, dict[str, Any]]]:
 
 def run_pose(settings: Settings) -> None:
     track_path = tracking_json_path(settings)
-    if not os.path.isfile(track_path):
-        raise ValueError(f"Нет tracking JSON: {track_path}. Сначала --stage track")
+    tl_frames_path = tracklet_frames_json_path(settings)
+    source_name = "track"
+    if os.path.isfile(track_path):
+        tracking = load_tracking_json(track_path)
+    elif os.path.isfile(tl_frames_path):
+        tracking = load_tracking_json(tl_frames_path)
+        source_name = "tracklets"
+    else:
+        raise ValueError(
+            f"Нет tracking JSON ({track_path}) и нет tracklet_frames JSON ({tl_frames_path}). "
+            "Сначала --stage tracklets или --stage track"
+        )
 
-    tracking = load_tracking_json(track_path)
     frames_in = tracking.get("frames") or []
     every_n = max(1, int(settings.pose_every_n))
     selected: list[dict[str, Any]] = [fr for i, fr in enumerate(frames_in) if i % every_n == 0]

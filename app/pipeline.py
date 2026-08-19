@@ -364,6 +364,34 @@ def _run_track_finalize(settings: Settings) -> None:
     }
     logger.info("STAGE 2: финализация tracklet_global (%s треклетов → группы)", len(mapping))
     _write_tracking_outputs(settings, tracked, meta)
+    _remap_poses_and_feet(settings, mapping)
+
+
+def _remap_poses_and_feet(settings: Settings, mapping: dict[str, Any]) -> None:
+    from app.config import feet_json_path, poses_json_path
+
+    pose_path = poses_json_path(settings)
+    if os.path.isfile(pose_path):
+        pose_data = load_tracking_json(pose_path)
+        if isinstance(pose_data, dict):
+            for obs in pose_data.get("observations") or []:
+                tid_str = str(obs.get("track_id"))
+                if tid_str in mapping:
+                    obs["track_id"] = int(mapping[tid_str])
+            _save_stage_json(pose_path, pose_data, stage="pose")
+            logger.info("STAGE 2: ремап poses.json (tracklet_id → global track_id)")
+
+    feet_path = feet_json_path(settings)
+    if os.path.isfile(feet_path):
+        feet_data = load_tracking_json(feet_path)
+        if isinstance(feet_data, dict):
+            for fr in feet_data.get("frames") or []:
+                for pt in fr.get("points") or []:
+                    tid_str = str(pt.get("track_id"))
+                    if tid_str in mapping:
+                        pt["track_id"] = int(mapping[tid_str])
+            _save_stage_json(feet_path, feet_data, stage="feet")
+            logger.info("STAGE 2: ремап feet.json (tracklet_id → global track_id)")
 
 
 def _write_tracking_outputs(
@@ -448,16 +476,16 @@ def _write_tracking_outputs(
 PER_VIDEO_STAGES = (
     "detect",
     "tracklets",
+    "pose",
+    "feet",
     "tracklet_reid",
     "tracklet_link",
     "track",
-    "pose",
-    "feet",
     "camera_link",
 )
 GLOBAL_DAY_STAGES = ("day_link",)
 PIPELINE_STAGES = (*PER_VIDEO_STAGES, *GLOBAL_DAY_STAGES)
-TRACKLET_SUBSTAGES = ("tracklets", "tracklet_reid", "tracklet_link")
+TRACKLET_SUBSTAGES = ("tracklets", "pose", "feet", "tracklet_reid", "tracklet_link")
 
 
 def _filter_tracklet_stages(stages: list[str], settings: Settings) -> list[str]:

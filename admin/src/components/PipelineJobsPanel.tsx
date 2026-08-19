@@ -17,12 +17,11 @@ const STAGES = [
   "info",
   "detect",
   "tracklets",
+  "pose",
+  "feet",
   "tracklet_reid",
   "tracklet_link",
   "track",
-  "pose",
-  "feet",
-  "camera_link",
   "all",
   "no_merge",
 ] as const;
@@ -31,12 +30,11 @@ const STAGE_LABELS: Record<string, string> = {
   info: "info",
   detect: "detect",
   tracklets: "tracklets · 2a",
+  pose: "pose",
+  feet: "feet",
   tracklet_reid: "tracklet_reid · 2b",
   tracklet_link: "tracklet_link · 2c",
   track: "track",
-  pose: "pose",
-  feet: "feet",
-  camera_link: "camera_link · 5 (Pass 10)",
   all: "all · полный цикл",
   no_merge: "no_merge · алиас all",
 };
@@ -44,9 +42,8 @@ const STAGE_LABELS: Record<string, string> = {
 const STAGE_GROUPS: { title: string; stages: readonly string[] }[] = [
   { title: "0 · info", stages: ["info"] },
   { title: "1 · detect", stages: ["detect"] },
-  { title: "2 · треки", stages: ["tracklets", "tracklet_reid", "tracklet_link", "track"] },
-  { title: "3 · карта", stages: ["pose", "feet"] },
-  { title: "4 · камера / лица (Pass 10)", stages: ["camera_link"] },
+  { title: "2 · треклеты, позы и feet", stages: ["tracklets", "pose", "feet"] },
+  { title: "3 · ReID и склейка", stages: ["tracklet_reid", "tracklet_link", "track"] },
 ];
 
 const SESSION_STAGE_ORDER = STAGE_GROUPS.flatMap((g) => g.stages);

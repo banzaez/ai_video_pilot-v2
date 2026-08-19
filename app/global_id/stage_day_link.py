@@ -16,21 +16,194 @@ from app.global_id.spatial import METER_PX
 from app.io.json_util import load_tracking_json, save_debug_json
 from app.session.discover import parse_day_input
 from app.tracklet.link_mcf import (
-    _combo_score,
     _gap_score,
-    _motion_score,
-    _pair_uses_map,
-    _size_score,
-    _spatial_threshold_exceeded,
-    _tracklet_spatial_point,
     _unique_groups,
     link_hungarian_chains,
 )
 from app.util.intervals import intervals_overlap, pair_embed_score
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
 _CANDIDATE_TOP_K = 50
+
+
+def _as_xy(p: Any) -> tuple[float, float]:
+    if not p or not isinstance(p, (list, tuple)) or len(p) < 2:
+        return 0.0, 0.0
+    return float(p[0]), float(p[1])
+
+
+def _tracklet_spatial_point(tracklet: dict[str, Any], key: str) -> tuple[float, float, str]:
+    suffix = key[-1] if key else ""
+    map_key = f"map_{key}"
+    mp = tracklet.get(map_key)
+    has_kpts = isinstance(tracklet.get(f"kxy{suffix}"), list)
+    src = str(tracklet.get(f"map_src{suffix}") or "")
+    use_map = isinstance(mp, (list, tuple)) and len(mp) >= 2
+    if use_map and has_kpts and not src.startswith("kpt"):
+        use_map = False
+    if use_map:
+        return float(mp[0]), float(mp[1]), "map"
+    x, y = _as_xy(tracklet.get(key))
+    return x, y, "image"
+
+
+def _pair_uses_map(a: dict[str, Any], b: dict[str, Any], key_a: str, key_b: str) -> bool:
+    _, _, sa = _tracklet_spatial_point(a, key_a)
+    _, _, sb = _tracklet_spatial_point(b, key_b)
+    return sa == "map" and sb == "map"
+
+
+def _velocity(tracklet: dict[str, Any]) -> tuple[float, float]:
+    t0 = float(tracklet["t0"])
+    t1 = float(tracklet["t1"])
+    dt = t1 - t0
+    if dt <= 1e-6:
+        return 0.0, 0.0
+    x0, y0, _ = _tracklet_spatial_point(tracklet, "p0")
+    x1, y1, _ = _tracklet_spatial_point(tracklet, "p1")
+    return (x1 - x0) / dt, (y1 - y0) / dt
+
+
+def _predict_p1(tracklet: dict[str, Any], t: float) -> tuple[float, float]:
+    x1, y1, _ = _tracklet_spatial_point(tracklet, "p1")
+    vx, vy = _velocity(tracklet)
+    dt = t - float(tracklet["t1"])
+    return x1 + vx * dt, y1 + vy * dt
+
+
+def _spatial_residual(
+    a: dict[str, Any],
+    b: dict[str, Any],
+    *,
+    sigma_px: float,
+    sigma_m: float,
+) -> tuple[float, float]:
+    p1x, p1y, _ = _tracklet_spatial_point(a, "p1")
+    b0x, b0y, space = _tracklet_spatial_point(b, "p0")
+    dist_last = math.hypot(p1x - b0x, p1y - b0y)
+    pred_x, pred_y = _predict_p1(a, float(b["t0"]))
+    dist_pred = math.hypot(pred_x - b0x, pred_y - b0y)
+    residual = min(dist_last, dist_pred)
+
+    if space == "map" and sigma_m > 0:
+        residual_m = residual / METER_PX
+        if sigma_m <= 0:
+            return 1.0, residual_m
+        return float(math.exp(-residual_m / sigma_m)), residual_m
+    if sigma_px <= 0:
+        return 1.0, residual
+    return float(math.exp(-residual / sigma_px)), residual
+
+
+def _spatial_threshold_exceeded(
+    residual: float,
+    *,
+    space: str,
+    max_px: float,
+    max_m: float,
+) -> bool:
+    if space == "map":
+        if max_m <= 0:
+            return False
+        return residual > max_m
+    if max_px <= 0:
+        return False
+    return residual > max_px
+
+
+def _motion_score(
+    a: dict[str, Any],
+    b: dict[str, Any],
+    *,
+    sigma_px: float,
+    sigma_m: float = 0.0,
+) -> tuple[float, float]:
+    motion, residual = _spatial_residual(a, b, sigma_px=sigma_px, sigma_m=sigma_m)
+    gap = max(0.0, float(b["t0"]) - float(a["t1"]))
+    if gap <= 1.5:
+        vax, vay = _velocity(a)
+        vbx, vby = _velocity(b)
+        va_norm = math.hypot(vax, vay)
+        vb_norm = math.hypot(vbx, vby)
+        if va_norm > 20.0 and vb_norm > 20.0:
+            cos_theta = (vax * vbx + vay * vby) / (va_norm * vb_norm)
+            if cos_theta < -0.4:
+                factor = max(0.4, (cos_theta + 1.0) / 0.6)
+                motion *= factor
+    return motion, residual
+
+
+def _bbox_dim(tracklet: dict[str, Any], *, axis: str) -> float:
+    key = "h" if axis == "h" else "w"
+    raw = tracklet.get(key)
+    if raw is not None and float(raw) > 1:
+        return float(raw)
+    idx0, idx1 = (1, 3) if axis == "h" else (0, 2)
+    vals: list[float] = []
+    for b in (tracklet.get("bbox0") or [], tracklet.get("bbox1") or []):
+        if isinstance(b, (list, tuple)) and len(b) >= 4:
+            vals.append(max(0.0, float(b[idx1]) - float(b[idx0])))
+    return float(np.median(vals)) if vals else 0.0
+
+
+def _height(tracklet: dict[str, Any]) -> float:
+    return _bbox_dim(tracklet, axis="h")
+
+
+def _width(tracklet: dict[str, Any]) -> float:
+    return _bbox_dim(tracklet, axis="w")
+
+
+def _dim_sim(a: float, b: float, *, log_scale: float) -> float:
+    if a <= 1 or b <= 1 or log_scale <= 0:
+        return 1.0
+    ratio = abs(math.log(a / b))
+    return float(max(0.0, 1.0 - ratio / log_scale))
+
+
+def _size_score(a: dict[str, Any], b: dict[str, Any], *, log_scale: float) -> float:
+    ha, hb = _height(a), _height(b)
+    wa, wb = _width(a), _width(b)
+    h_sim = _dim_sim(ha, hb, log_scale=log_scale)
+    if wa <= 1 or wb <= 1:
+        return h_sim
+    w_sim = _dim_sim(wa, wb, log_scale=log_scale)
+    taller = max(ha, hb)
+    shorter = min(ha, hb)
+    if taller > 1 and shorter / taller <= 0.85 and w_sim >= 0.70:
+        return w_sim
+    return h_sim
+
+
+def _combo_score(
+    reid: float,
+    motion: float,
+    size: float,
+    gap: float,
+    *,
+    w_reid: float,
+    w_motion: float,
+    w_size: float,
+    w_gap: float,
+) -> float:
+    parts = (
+        (reid, w_reid),
+        (motion, w_motion),
+        (size, w_size),
+        (gap, w_gap),
+    )
+    num = 0.0
+    den = 0.0
+    for value, weight in parts:
+        if weight <= 0:
+            continue
+        num += weight * float(value)
+        den += weight
+    if den <= 0:
+        return float(reid)
+    return float(num / den)
 
 
 def _parse_iso_to_day_sec(iso_str: str | None) -> float:

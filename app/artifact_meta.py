@@ -14,13 +14,11 @@ VIDEO_STAGE_ORDER = (
     "info",
     "detect",
     "tracklets",
+    "pose",
+    "feet",
     "tracklet_reid",
     "tracklet_link",
     "track",
-    "pose",
-    "feet",
-    "camera_face",
-    "camera_link",
     "day_link",
 )
 STAGE_ORDER = VIDEO_STAGE_ORDER
@@ -30,13 +28,11 @@ STAGE_FILES: dict[str, str] = {
     "info": "info.json",
     "detect": "detections.json",
     "tracklets": "tracklet_frames.json",
+    "pose": "poses.json",
+    "feet": "feet.json",
     "tracklet_reid": "tracklet_reid.json",
     "tracklet_link": "tracklet_links.json",
     "track": "tracking.json",
-    "pose": "poses.json",
-    "feet": "feet.json",
-    "camera_face": "camera_face.json",
-    "camera_link": "camera_links.json",
     "day_link": "day_links.json",
 }
 
@@ -45,13 +41,11 @@ STAGE_PARENT: dict[str, str | None] = {
     "info": None,
     "detect": None,
     "tracklets": "detect",
+    "pose": "tracklets",
+    "feet": "pose",
     "tracklet_reid": "tracklets",
     "tracklet_link": "tracklet_reid",
     "track": "tracklet_link",
-    "pose": "track",
-    "feet": "pose",
-    "camera_face": "track",
-    "camera_link": "feet",
     "day_link": None,
 }
 

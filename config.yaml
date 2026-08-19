@@ -2,7 +2,7 @@
 # Приоритет: CLI-аргументы > этот YAML > значения по умолчанию в коде
 #
 # Пайплайн:
-#   info → detect → tracklets → tracklet_reid → tracklet_link → track → pose → feet
+#   info → detect → tracklets → pose → feet → tracklet_reid → tracklet_link → track
 #
 # Склейка кусков ByteTrack — стадия tracklet_link (tracklet_pipeline.link → tracklet_links.json).
 # Вкладка «Склейки» читает эти группы, отдельной стадии link нет.
@@ -47,6 +47,26 @@ best_frames:
     bone_thickness: 0.18 # Толщина костей скелета относительно ширины кропа (доля 0.05..0.40)
     bg_color: [128, 128, 128] # Нейтральный цвет фона для блендинга [R, G, B]
 
+  # --- Многоуровневая фильтрация краевых и аномальных кадров трека ---
+  # 1. Временной тримминг краев (защита от ошибок рождения/смерти трека)
+  trim:
+    enabled: true
+    start_frames: 2 # Исключать первые N кадров трека
+    end_frames: 2 # Исключать последние N кадров трека
+    min_track_len: 8 # Применять только если трек длится >= N кадров
+
+  # 2. Кинематический фильтр пространственных скачков BBox
+  kinematic:
+    enabled: true
+    max_speed_ratio: 3.0 # Макс. превышение медианной скорости перемещения центра BBox
+    max_area_ratio: 2.2 # Макс. допустимый скачок площади BBox
+
+  # 3. Фильтр согласованности цвета одежды (HSV-гистограмма)
+  color_consistency:
+    enabled: true
+    min_similarity: 0.50 # Порог сходства цвета верхней части тела с медианой трека (0..1)
+
+
 reid:
   device: mps
   batch_size: 8
@@ -84,7 +104,7 @@ detection:
     rtdetr: rtdetr-l.pt
     rtdetr_v2: PekingU/rtdetr_v2_r50vd
 
-# --- Stage 2a–2c: tracklets → ReID → tracklet_link ---
+# --- Stage 2: tracklets → pose → feet → ReID → link ---
 tracklet_pipeline:
   # Мин. число наблюдений у треклета на 2a. Короче — выкинуть до ReID.
   min_obs: 2
@@ -102,10 +122,10 @@ tracklet_pipeline:
     # Мин. conf нового ID + TAI-NMS. Выше 0.25 (OC-SORT) — меньше дублей вроде #1+#72; 0.70 дефолт TrackTrack режет слабых.
     new_track_thresh: 0.50
     # Шагов помнить lost. 30 (дефолт TT) ≈ 3.6 с при every_n=3 — чужой ID. 12 ≈ 1.4 с: дыры да, длинные окклюзии нет.
-    track_buffer: 25
+    track_buffer: 10
     # COST, не IoU: матч если cost < порога. 0.85 от OC-SORT здесь НАОБОРОТ слабее (склеивает лишнее).
     # Дефолт TT 0.7; 0.55 строже — меньше ID-switch при пересечениях.
-    match_thresh: 0.60
+    match_thresh: 0.55
     # Ослабленный rebind lost. 0 = выкл. Иначе lost легко садится на соседнего человека.
     lost_match_thr: 0.0
     # Веса cost (без ReID cost = HMIoU + conf + угол). Угол чуть выше — не склеивать встречных.
@@ -120,6 +140,21 @@ tracklet_pipeline:
     tai_thr: 0.45
     min_track_len: 3
     with_reid: false
+
+  # Stage pose: YOLO-pose на кадрах треклетов → poses.json
+  pose:
+    model: yolo26s-pose.pt
+    conf: 0.55
+    kpt_min: 0.25
+    every_n: 1
+
+  # Stage feet: проекция ног треклетов на план → feet.json + координаты в tracklets.json
+  feet:
+    torso_height_m: 0.0
+    person_height_m: 1.70
+    smooth_window: 10
+    max_speed_mps: 2.0
+
   # Stage 2b: эмбеддинги кропов треклетов (tracklet_reid.json + .npz)
   reid:
     top_k: 5
@@ -130,54 +165,34 @@ tracklet_pipeline:
     crops_dir: tracklet_crops
 
   # Stage 2c tracklet_link → tracklet_links.json (вкладка «Склейки»)
-  # Pose на f0/f1 уточняет ноги (p0/p1 → map_p0/map_p1); motion экстраполирует конец A к t0(B).
-  # Пять проходов: Pass 0 — ReID; Pass 1 — combo в окнах; Pass 2 — стык; Pass 3 — дырка; Pass 4 — handover.
+  # Склейка: Pass 0 (ReID + combo score).
   link:
-    # Кандидаты A→B и фильтры до combo (используются всеми pass).
+    # Кандидаты A→B и фильтры до combo.
     candidates:
       # Макс. пауза между концом A и началом B, сек. Дальше ребро не строится.
-      max_gap_sec: 6.0
+      max_gap_sec: 40.0
+      # Макс. допустимое наложение (overlap) треклетов по времени, сек.
+      max_overlap_sec: 2.0
       # Мин. ReID (max pairwise по кропам). Ниже — пара отбрасывается ещё до combo.
       min_reid_score: 0.90
-      # Макс. «промах» предсказанной точки: куда A должен был дойти к t0(B) vs p0(B).
-      # 0 = не фильтровать по motion на этапе кандидатов.
-      max_spatial_px: 700
-      max_spatial_m: 4.0
-      # Ширина гаусса для motion-score: exp(-residual / sigma). Больше = мягче к скачку bbox.
-      motion_sigma_px: 250
-      motion_sigma_m: 1.5
-      # Насколько похож масштаб bbox (log-шкала по росту).
-      size_log_scale: 0.45
-    # Веса combo = w_reid·reid + w_motion·motion + w_size·size + w_gap·gap (сумма ≈ 1).
+    # Веса combo = w_reid·reid + w_gap·gap (сумма = 1).
     combo:
-      w_reid: 0.65
-      w_motion: 0.20
-      w_size: 0.0
+      w_reid: 0.85
       w_gap: 0.15
 
-    # Pass 0: досклейка по ReID и combo score.
+    # Pass 0: склейка по ReID и combo score.
     pass0:
       min_reid: 0.96
       min_score: 0.75
-    # Pass 1: цепочки во времени (combo ≥ min_score в окнах).
-    pass1:
-      min_score: 0.90
-      window_sec: 60
-      window_overlap_sec: 15
-      solver: hungarian
-    # Pass 2: стык готовых цепочек (выход A → вход B).
-    pass2:
-      min_score: 0.85
-    # Pass 4: ID-switch — B стартует в хвосте A. max_overlap_sec 0 = выкл.
-    pass4:
-      max_overlap_sec: 2.0
-      min_reid: 0.90
-      min_score: 0.85
 
-    # Высота плоскости пересечения луча, м (0 = пол; совпадает с калибровкой пар)
-    torso_height_m: 0.0
-    # Перед склейкой: YOLO-pose только на f0/f1 каждого треклета → ноги в map_p0/map_p1.
-    # Полные стадии pose/feet после track по-прежнему для карты.
+    # Pass Alone Geo (Pass 1): склейка одиночного человека по геометрии (трек пропал и появился, вокруг никого не было)
+    pass_alone_geo:
+      enabled: true
+      radius_m: 2.0 # Радиус проверки изоляции (метры на плане этажа)
+      max_gap_sec: 10.0 # Макс. пауза между концом A и началом B, сек
+      max_dist_m: 3.0 # Макс. расстояние между точкой конца A и начала B, метры
+      max_speed_mps: 2.0 # Макс. скорость перемещения между точками, м/с
+      min_reid: 0.90 # Мин. ReID (0.0 — чисто геометрический матчинг)
 
 # --- Stage track: ремап треклетов → tracking.json / tracks.json ---
 tracker_filters:
@@ -187,38 +202,6 @@ tracker_filters:
   min_bbox_side: 40
   # Мин. длина трека в секундах (последний−первый кадр). Короче — выкинуть
   min_track_sec: 0
-
-# --- Stage pose: YOLO-pose → poses.json ---
-pose:
-  model: yolo26s-pose.pt
-  conf: 0.55
-  kpt_min: 0.25
-  every_n: 1
-
-# --- Stage feet: проекция ног → feet.json ---
-feet:
-  torso_height_m: 0.0
-  person_height_m: 1.70
-  smooth_window: 5
-  max_speed_mps: 2.0
-
-# --- Stage camera_link (Pass 10): верхнеуровневая склейка по InsightFace и координатам ног ---
-camera_link:
-  enabled: true
-  # Параллельно извлекаем лица всеми моделями; оценки сравнения — отдельно в face_scores.
-  face_models: [buffalo_l, antelopev2]
-  face_top_k: 3
-  min_face_score: 0.60
-  max_gap_sec: 120.0
-  max_speed_mps: 3.5
-  motion_sigma_m: 3.0
-  w_face: 0.50
-  w_reid: 0.30
-  w_motion: 0.20
-  min_combo_score: 0.85
-  solver: hungarian
-  face_crops_dir: face_crops
-  save_face_crops: true
 
 # --- Stage day_link: глобальная межкамерная склейка дня (Pass 1→2→4, без лиц) ---
 # С разных камер персона может быть одновременно: overlap по времени не режет пару.
