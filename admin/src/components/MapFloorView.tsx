@@ -49,6 +49,8 @@ type Props = {
   homography: HomographyDoc | null;
   tracking: TrackingData | null;
   videoRef?: React.RefObject<HTMLVideoElement | null>;
+  /** Плеер смонтирован — переподписать play/pause на новый <video>. */
+  videoActive?: boolean;
   currentFrame: number;
   showTrails: boolean;
   focusTrackIds?: number[] | null;
@@ -70,6 +72,7 @@ export function MapFloorView({
   homography,
   tracking,
   videoRef,
+  videoActive = false,
   currentFrame,
   showTrails,
   focusTrackIds = null,
@@ -92,6 +95,10 @@ export function MapFloorView({
   const [rotDeg, setRotDeg] = useState(0);
   const useGrid = isGridFloorplan(floorplanUrl) || floorplanUrl === "grid" || !floorplanUrl;
   const feetIndex = useMemo(() => buildFeetIndex(feetDoc), [feetDoc]);
+  const currentFrameRef = useRef(currentFrame);
+  currentFrameRef.current = currentFrame;
+  const drawRef = useRef<() => void>(() => {});
+  const videoRefProp = videoRef;
 
   function normRot(deg: number): number {
     return ((Math.round(deg / 45) * 45) % 360 + 360) % 360;
@@ -243,19 +250,19 @@ export function MapFloorView({
       } else if (!H || !tracking) {
         return;
       } else {
-      // currentFrame от плеера — уже в глобальном времени session (с учётом кусков)
       const t =
         tracking.fps > 0
-          ? currentFrame / tracking.fps
-          : (videoRef?.current?.currentTime ?? 0);
+          ? currentFrameRef.current / tracking.fps
+          : (videoRefProp?.current?.currentTime ?? 0);
       const frameFloat = frameAtTime(t, tracking.fps, tracking.frame_count);
       const keyframes = buildTrackKeyframes(tracking);
       const every = resolveDetectEveryN(tracking);
       const dets = detectionsAtFrame(keyframes, frameFloat, every);
       const focus = focusTrackIds != null ? new Set(focusTrackIds) : null;
+      const hasFocus = focus != null && focus.size > 0;
 
       const ordered =
-        focus == null
+        !hasFocus
           ? dets
           : [...dets.filter((d) => !focus.has(d.track_id)), ...dets.filter((d) => focus.has(d.track_id))];
 
@@ -292,8 +299,8 @@ export function MapFloorView({
           }
         }
 
-        const dimmed = focus != null && !focus.has(det.track_id) && !focus.has(fragTrackId);
-        const color = dimmed ? "#8a9188" : colorForTrackId(fragTrackId);
+        const dimmed = hasFocus && !focus.has(det.track_id) && !focus.has(fragTrackId);
+        const color = dimmed ? "#9aa0a6" : colorForTrackId(fragTrackId);
         const r = dimmed ? markerR * 0.7 : markerR;
 
         let hist = trailRef.current.get(det.track_id);
@@ -307,7 +314,7 @@ export function MapFloorView({
           if (hist.length > 50) hist.shift();
         }
 
-        ctx.globalAlpha = dimmed ? 0.45 : 1;
+        ctx.globalAlpha = dimmed ? 0.38 : 1;
         if (showTrails && hist.length > 1) {
           ctx.beginPath();
           ctx.strokeStyle = "#fff";
@@ -372,29 +379,29 @@ export function MapFloorView({
       }
     };
 
+    drawRef.current = draw;
+
     const loop = () => {
       draw();
-      const video = videoRef?.current;
+      const video = videoRefProp?.current;
       if (video && !video.paused && !video.ended) raf = requestAnimationFrame(loop);
     };
     const kick = () => {
       cancelAnimationFrame(raf);
       draw();
-      const video = videoRef?.current;
+      const video = videoRefProp?.current;
       if (video && !video.paused && !video.ended) raf = requestAnimationFrame(loop);
     };
 
     img?.addEventListener("load", kick);
     window.addEventListener("resize", kick);
-    const video = videoRef?.current;
+    const video = videoRefProp?.current;
     video?.addEventListener("play", kick);
     video?.addEventListener("pause", kick);
     video?.addEventListener("seeked", kick);
     kick();
-    const iv = window.setInterval(kick, 200);
     return () => {
       cancelAnimationFrame(raf);
-      clearInterval(iv);
       img?.removeEventListener("load", kick);
       window.removeEventListener("resize", kick);
       video?.removeEventListener("play", kick);
@@ -406,8 +413,8 @@ export function MapFloorView({
     useGrid,
     homography,
     tracking,
-    videoRef,
-    currentFrame,
+    videoRefProp,
+    videoActive,
     showTrails,
     focusTrackIds,
     groupByTrack,
@@ -416,7 +423,16 @@ export function MapFloorView({
     counters,
     rotDeg,
     markers,
+    mergeTimeline,
+    feetDoc,
+    feetIndex,
   ]);
+
+  useEffect(() => {
+    const v = videoRefProp?.current;
+    if (v && !v.paused && !v.ended) return;
+    drawRef.current();
+  }, [currentFrame, videoRefProp]);
 
   const hasAnyCam =
     !!normalizePlacement(homography?.placement) ||

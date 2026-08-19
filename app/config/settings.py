@@ -46,9 +46,7 @@ class NvrSettings:
     username: str = "admin"
     password: str = ""
     track_ids: list[str] = field(default_factory=lambda: ["1401", "1501"])
-    track_camera_map: dict[str, str] = field(
-        default_factory=lambda: {"1401": "Camera_01", "1501": "Camera_02"}
-    )
+    track_camera_map: dict[str, str] = field(default_factory=dict)
     search_lookback_hours: int = 24
     connect_timeout_sec: float = 30.0
     read_timeout_search_sec: float = 120.0

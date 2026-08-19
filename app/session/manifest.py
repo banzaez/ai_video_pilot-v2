@@ -92,7 +92,7 @@ def build_session_manifest(session: Session) -> dict[str, Any]:
         "kind": "camera_day",
         "session_key": session.key,
         "camera_index": session.camera_index,
-        "camera": f"Camera_{session.camera_index:02d}",
+        "camera": f"Camera_{session.camera_index:03d}",
         "day": session.day,
         "parts": parts_out,
         "fps": round(float(fps), 3),
@@ -102,7 +102,7 @@ def build_session_manifest(session: Session) -> dict[str, Any]:
         "duration_sec": duration_sec,
         "parsed": {
             "ok": True,
-            "camera": f"Camera_{session.camera_index:02d}",
+            "camera": f"Camera_{session.camera_index:03d}",
             "camera_index": session.camera_index,
             "started_at": parts_out[0]["started_at"],
             "ended_at": parts_out[-1]["ended_at"],

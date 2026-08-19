@@ -25,14 +25,6 @@ models_dir: data/models/detect
 # Папка с весами ReID (SOLIDER) — общая для tracklet_reid
 reid_models_dir: data/models/reid
 
-reid:
-  device: mps
-  batch_size: 8
-  solider_weights: solider_swin_base_msmt17.pth
-  solider_semantic_weight: 0.2
-  solider_image_size: [256, 128]
-  solider_transformer: swin_base_patch4_window7_224
-
 # --- Отбор лучших кадров (TrackBestFramesPicker) ---
 # Интеллектуальный отбор качественных кадров по скелету и чистоте от посторонних людей.
 # Используется в Stage 2b (ReID треклетов) и Stage Face / camera_link (извлечение лиц InsightFace).
@@ -55,12 +47,20 @@ best_frames:
     bone_thickness: 0.18 # Толщина костей скелета относительно ширины кропа (доля 0.05..0.40)
     bg_color: [128, 128, 128] # Нейтральный цвет фона для блендинга [R, G, B]
 
+reid:
+  device: mps
+  batch_size: 8
+  solider_weights: solider_swin_base_msmt17.pth
+  solider_semantic_weight: 0.2
+  solider_image_size: [256, 128]
+  solider_transformer: swin_base_patch4_window7_224
+
 # --- Stage 1: detect → detections.json ---
 detection:
   # yolo | rtdetr | rtdetr_v2
   # rtdetr: Ultralytics RT-DETR v1 (rtdetr-l.pt / rtdetr-x.pt)
   # rtdetr_v2: Hugging Face RT-DETRv2 (PekingU/rtdetr_v2_*), pip install transformers
-  backend: rtdetr
+  backend: yolo
   # Порог уверенности детекции (0..1). Ниже — больше боксов, выше — чище, но можно пропустить людей
   conf: 0.35
   # NMS IoU похожих боксов. Вложенные (торс в полном росте) — IoS; широкий бокс на двоих выкидывается
@@ -75,7 +75,7 @@ detection:
   # Точность инференса: 16/fp16 = FP16, null/32 = FP32 (на CPU всегда FP32)
   quantize: 16
   # Кадров за predict на Stage 1. RT-DETR обычно 16, YOLO можно 32+
-  batch_size: 16
+  batch_size: 32
   # Размер входа (px по длинной стороне)
   imgsz: 960
   # Веса по backend. yolo/rtdetr — файлы в models_dir; rtdetr_v2 — HF id или локальная папка
@@ -252,7 +252,7 @@ nvr:
   track_ids:
     - "1501"
     - "1401"
-  track_camera_map: { "1401": "Camera_01", "1501": "Camera_02" }
+  track_camera_map: {}
   search_lookback_hours: 24
   connect_timeout_sec: 30
   read_timeout_search_sec: 120

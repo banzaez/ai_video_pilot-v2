@@ -13,13 +13,29 @@ export function listFloorplans(): { name: string; url: string }[] {
 }
 
 export function cameraHomoPath(key: string): string {
-  return path.join(camerasDir, `${key}.json`);
+  const direct = path.join(camerasDir, `${key}.json`);
+  if (fs.existsSync(direct)) return direct;
+  const num = Number(key);
+  if (!Number.isNaN(num)) {
+    const pad3 = path.join(camerasDir, `${String(num).padStart(3, "0")}.json`);
+    if (fs.existsSync(pad3)) return pad3;
+    const pad2 = path.join(camerasDir, `${String(num).padStart(2, "0")}.json`);
+    if (fs.existsSync(pad2)) return pad2;
+  }
+  return direct;
 }
 
 export function cameraKeyFromName(video: string): string {
   const m = /Cam(?:era)?[_-]?(\d+)/i.exec(video);
-  if (m) return String(Number(m[1])).padStart(2, "0");
-  return video.replace(/\.[^.]+$/, "") || "00";
+  if (m) {
+    const num = Number(m[1]);
+    const pad3 = `${String(num).padStart(3, "0")}.json`;
+    if (fs.existsSync(path.join(camerasDir, pad3))) return String(num).padStart(3, "0");
+    const pad2 = `${String(num).padStart(2, "0")}.json`;
+    if (fs.existsSync(path.join(camerasDir, pad2))) return String(num).padStart(2, "0");
+    return String(num).padStart(3, "0");
+  }
+  return video.replace(/\.[^.]+$/, "") || "000";
 }
 
 export function mapsConfig() {

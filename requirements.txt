@@ -1,5 +1,5 @@
 # Минимальные версии. Для воспроизводимости: pip freeze > requirements.lock
-ultralytics>=8.4.120,<9
+ultralytics>=8.4.121,<9
 opencv-python>=5.0.0.93
 numpy>=2.5.2,<3
 lapx>=0.9.4,<1

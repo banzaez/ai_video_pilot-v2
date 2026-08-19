@@ -38,7 +38,7 @@ from app.artifact_meta import attach_artifact_meta
 from app.io.json_util import load_tracking_json, save_debug_json
 from app.postprocess import apply_track_filters, build_track_summaries, surviving_track_ids
 from app.progress import make_pbar
-from app.session.discover import SESSION_PREFIX, resolve_sessions_for_input
+from app.session.discover import SESSION_PREFIX, parse_day_input, resolve_sessions_for_input
 from app.session.manifest import build_session_manifest, is_session_manifest
 from app.tracker_config import tracker_params_dict
 from app.tracklet import run_tracklet_link, run_tracklet_reid, run_tracklets
@@ -86,7 +86,7 @@ def run_info(settings: Settings, video_dir: str | None = None, jobs: list[str] |
         raise ValueError("Нужен видеофайл: пайплайн только офлайн (detect → ByteTrack).")
 
     mode, sessions, legacy_jobs = resolve_sessions_for_input(str(settings.input_path))
-    if mode == "session":
+    if mode in ("session", "day"):
         _run_info_sessions(settings, sessions)
         return
 
@@ -143,11 +143,13 @@ def run_info(settings: Settings, video_dir: str | None = None, jobs: list[str] |
 
 def _run_info_sessions(settings: Settings, sessions) -> None:
     res_root = str(settings.json_output_dir or "data/results")
-    scoped = session_key(settings) is not None
+    single = session_key(settings) is not None
+    day_scoped = parse_day_input(str(settings.input_path)) is not None
     active_keys = {s.key for s in sessions}
-    logger.info("STAGE 0: sessions %s%s", len(sessions), " (одна)" if scoped else "")
+    scope_note = " (одна)" if single else (" (день)" if day_scoped else "")
+    logger.info("STAGE 0: sessions %s%s", len(sessions), scope_note)
 
-    if not scoped and os.path.isdir(res_root):
+    if not single and not day_scoped and os.path.isdir(res_root):
         for name in os.listdir(res_root):
             if name.startswith("_"):
                 continue

@@ -60,7 +60,7 @@ function dayFromStarted(startedRaw: string): string | null {
 }
 
 export function sessionKeyFromPart(cameraIndex: number, startedRaw: string): string {
-  return `${String(cameraIndex).padStart(2, "0")}_${startedRaw.slice(0, 8)}`;
+  return `${String(cameraIndex).padStart(3, "0")}_${startedRaw.slice(0, 8)}`;
 }
 
 export function parseProdStem(stem: string): ParsedPart | null {

@@ -20,6 +20,8 @@ from requests.auth import HTTPDigestAuth
 
 from app.config.settings import NvrSettings
 
+from collections.abc import Callable
+
 logger = logging.getLogger(__name__)
 
 SEARCH_PAGE_SIZE: int = 100
@@ -44,6 +46,15 @@ class NvrApiError(Exception):
         super().__init__(
             f"ISAPI error {status_code}: {status_string} / {sub_status}"
         )
+
+
+@dataclass
+class ChannelInfo:
+    channel_id: int
+    track_id: str
+    name: str
+    online: bool
+    ip: str | None = None
 
 
 @dataclass
@@ -115,6 +126,53 @@ class HikvisionNvrClient:
             read_timeout_download_sec=nvr.read_timeout_download_sec,
         )
 
+    def probe_channels(self) -> list[ChannelInfo]:
+        """Опрос каналов NVR через ISAPI InputProxy."""
+        url_cfg = f"{self.base_url}/ISAPI/ContentMgmt/InputProxy/channels"
+        url_status = f"{self.base_url}/ISAPI/ContentMgmt/InputProxy/channels/status"
+
+        ns = {"ns": _NS}
+        statuses: dict[int, bool] = {}
+        try:
+            r_st = self._session.get(url_status, timeout=self._timeout_search)
+            if r_st.status_code == 200:
+                root_st = ET.fromstring(r_st.text)
+                for item in root_st.findall(".//ns:InputProxyChannelStatus", ns) or root_st.findall(".//InputProxyChannelStatus"):
+                    cid_text = item.findtext("ns:id", namespaces=ns) or item.findtext("id")
+                    online_text = item.findtext("ns:online", namespaces=ns) or item.findtext("online")
+                    if cid_text:
+                        statuses[int(cid_text)] = (str(online_text).lower() == "true")
+        except Exception as exc:
+            logger.warning("probe_channels status check failed: %s", exc)
+
+        channels: list[ChannelInfo] = []
+        try:
+            r_cfg = self._session.get(url_cfg, timeout=self._timeout_search)
+            if r_cfg.status_code == 200:
+                root_cfg = ET.fromstring(r_cfg.text)
+                for item in root_cfg.findall(".//ns:InputProxyChannel", ns) or root_cfg.findall(".//InputProxyChannel"):
+                    cid_text = item.findtext("ns:id", namespaces=ns) or item.findtext("id")
+                    if not cid_text:
+                        continue
+                    cid = int(cid_text)
+                    name = item.findtext("ns:name", namespaces=ns) or item.findtext("name") or f"Camera {cid:03d}"
+                    ip = item.findtext(".//ns:ipAddress", namespaces=ns) or item.findtext(".//ipAddress")
+                    track_id = f"{cid * 100 + 1}"
+                    online = statuses.get(cid, True)
+                    channels.append(
+                        ChannelInfo(
+                            channel_id=cid,
+                            track_id=track_id,
+                            name=name.strip(),
+                            online=online,
+                            ip=ip.strip() if ip else None,
+                        )
+                    )
+        except Exception as exc:
+            logger.warning("probe_channels config check failed: %s", exc)
+
+        return channels
+
     def search_recordings(
         self,
         track_id: str,
@@ -170,6 +228,7 @@ class HikvisionNvrClient:
         segment: RecordingSegment,
         dest_dir: Path,
         filename: str | None = None,
+        progress_callback: Callable[[int], None] | None = None,
     ) -> Path:
         dest_dir.mkdir(parents=True, exist_ok=True)
 
@@ -228,6 +287,8 @@ class HikvisionNvrClient:
                     if chunk:
                         f.write(chunk)
                         downloaded_bytes += len(chunk)
+                        if progress_callback is not None:
+                            progress_callback(len(chunk))
 
             logger.info(
                 "download_segment: done, saved %d bytes -> %s",

@@ -15,13 +15,26 @@ DEFAULT_MAX_MAP_M = 3.0
 
 
 def load_camera_h(cameras_dir: str, camera_key: str) -> np.ndarray | None:
-    path = os.path.join(cameras_dir, f"{camera_key}.json")
-    if not os.path.isfile(path):
-        return None
+    candidates = [f"{camera_key}.json"]
     try:
-        with open(path, encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception:
+        idx = int(camera_key)
+        candidates.append(f"{idx:03d}.json")
+        candidates.append(f"{idx:02d}.json")
+        candidates.append(f"{idx}.json")
+    except ValueError:
+        pass
+
+    data = None
+    for name in dict.fromkeys(candidates):
+        path = os.path.join(cameras_dir, name)
+        if os.path.isfile(path):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    data = json.load(f)
+                break
+            except Exception:
+                continue
+    if not isinstance(data, dict):
         return None
     raw = data.get("H") if isinstance(data, dict) else None
     if not isinstance(raw, (list, tuple)) or len(raw) != 9:

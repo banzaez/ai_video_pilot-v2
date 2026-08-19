@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { FloatingVideoWindow } from "./components/FloatingVideoWindow";
 import { MapCalibratePanel } from "./components/MapCalibratePanel";
 import { MapFloorView } from "./components/MapFloorView";
@@ -7,6 +7,7 @@ import { DayAnalysisPanel } from "./components/DayAnalysisPanel";
 import { PipelineJobsPanel } from "./components/PipelineJobsPanel";
 import { TrackingPlayer, type TrackingPlayerHandle } from "./components/TrackingPlayer";
 import { TrackingSidebar } from "./components/TrackingSidebar";
+import { createPlayerSink } from "./playback";
 import type { HomographyDoc } from "./homography";
 import type { FeetDoc, TrackingData } from "./types";
 import {
@@ -94,6 +95,7 @@ export default function App() {
   const [tab, setTab] = useState<AppTab>("tracks");
   const [mapDirty, setMapDirty] = useState(false);
   const [mergeFocusIds, setMergeFocusIds] = useState<number[] | null>(null);
+  const [mergeJump, setMergeJump] = useState<{ trackId: number; sec: number } | null>(null);
   const [homography, setHomography] = useState<HomographyDoc | null>(null);
   const [floorplanUrl, setFloorplanUrl] = useState("grid");
   const [mapCameras, setMapCameras] = useState<MapCameraMark[]>([]);
@@ -102,6 +104,7 @@ export default function App() {
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const playerRef = useRef<TrackingPlayerHandle>(null);
+  const lastVideoSecRef = useRef(0);
   const floatVideoRef = useRef(floatVideo);
   floatVideoRef.current = floatVideo;
   const floatMapRef = useRef(floatMap);
@@ -195,6 +198,15 @@ export default function App() {
     return fps > 0 ? currentFrame / fps : 0;
   }, [currentFrame, tracking?.fps, videoInfo?.fps]);
 
+  const onPlayerFrame = useCallback(
+    (frame: number) => {
+      setCurrentFrame(frame);
+      const fps = tracking?.fps || videoInfo?.fps || 25;
+      if (fps > 0) lastVideoSecRef.current = frame / fps;
+    },
+    [tracking?.fps, videoInfo?.fps],
+  );
+
   const videoAspect = useMemo(() => {
     const w = videoInfo?.width || tracking?.width || 0;
     const h = videoInfo?.height || tracking?.height || 0;
@@ -273,7 +285,17 @@ export default function App() {
     persistPrefs();
   }
 
+  function rememberVideoTime() {
+    const t = playerRef.current?.getGlobalSec();
+    if (t != null && Number.isFinite(t) && t >= 0) lastVideoSecRef.current = t;
+  }
+
   function toggleShowVideo(next: boolean) {
+    if (!next) {
+      rememberVideoTime();
+      playerRef.current?.pause();
+      videoRef.current?.pause();
+    }
     showVideoRef.current = next;
     setShowVideo(next);
     persistPrefs();
@@ -284,6 +306,21 @@ export default function App() {
     setShowMap(next);
     persistPrefs();
   }
+
+  const mergePlaybackSink = useMemo(
+    () =>
+      createPlayerSink(() => playerRef.current, {
+        onTime: (t) => {
+          lastVideoSecRef.current = t;
+        },
+        ensureVisible: () => {
+          if (!showVideoRef.current) toggleShowVideo(true);
+        },
+      }),
+    // toggleShowVideo опирается на refs — sink живёт весь цикл приложения
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [],
+  );
 
   useEffect(() => {
     let cancelled = false;
@@ -330,6 +367,11 @@ export default function App() {
     if (tab === "map" && next !== "map" && mapDirty) {
       const ok = window.confirm("Есть несохранённые изменения на Карте.\nУйти без сохранения?");
       if (!ok) return;
+    }
+    if (next === "day") {
+      rememberVideoTime();
+      playerRef.current?.pause();
+      videoRef.current?.pause();
     }
     setTab(next);
   }
@@ -398,6 +440,7 @@ export default function App() {
     setSessionParts(session.parts);
     setVideoUrl(session.parts[0]?.videoUrl ?? null);
     setVideoName(sessionLabel(session));
+    lastVideoSecRef.current = 0;
     try {
       const meta = await fetchMediaMeta(session.key, { session: true });
       setVideoInfo(meta.info);
@@ -457,16 +500,38 @@ export default function App() {
   }
 
   function handleSeekToSec(sec: number) {
-    // Через плеер: partAtTime + смена куска + seek после loadeddata
-    if (playerRef.current) {
-      playerRef.current.seekToGlobal(sec, true);
-      return;
-    }
-    if (videoRef.current) {
-      videoRef.current.currentTime = sec;
-      videoRef.current.play().catch(() => {});
-    }
+    lastVideoSecRef.current = sec;
+    if (!showVideoRef.current) toggleShowVideo(true);
+    const trySeek = (left: number) => {
+      if (playerRef.current) {
+        playerRef.current.seekToGlobal(sec, true);
+        return;
+      }
+      if (left > 0) requestAnimationFrame(() => trySeek(left - 1));
+    };
+    trySeek(12);
   }
+
+  async function openTrackInMerge(sessionKey: string, trackId: number, dayT0: number) {
+    const item = sessions.find((s) => s.key === sessionKey);
+    if (!item) return;
+    if (item.key !== librarySession) {
+      await selectSession(item);
+    }
+    setSelectedTrackId(trackId);
+    setMergeFocusIds(null);
+    const start = item.parts[0]?.started_at ?? "";
+    const m = /(\d{2}):(\d{2}):(\d{2})/.exec(start);
+    const t0Abs = m ? Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]) : 0;
+    const localSec = Math.max(0, dayT0 - t0Abs);
+    setMergeJump({ trackId, sec: localSec });
+    requestTab("merge");
+    handleSeekToSec(localSec);
+  }
+
+  const consumeMergeJump = useCallback(() => setMergeJump(null), []);
+
+  const videoMounted = showVideo;
 
   return (
     <>
@@ -654,11 +719,18 @@ export default function App() {
               currentFrame={currentFrame}
               selectedTrackId={selectedTrackId}
               onSelectTrackId={setSelectedTrackId}
-              onSeekToSec={handleSeekToSec}
+              playbackSink={mergePlaybackSink}
               onFocusTracks={setMergeFocusIds}
+              jumpTo={mergeJump}
+              onJumpConsumed={consumeMergeJump}
             />
           ) : tab === "day" ? (
-            <DayAnalysisPanel selectedDay={selectedDay} />
+            <DayAnalysisPanel
+              selectedDay={selectedDay}
+              onOpenTrackInMerge={(sessionKey, trackId, t0) => {
+                void openTrackInMerge(sessionKey, trackId, t0);
+              }}
+            />
           ) : tab === "pipeline" ? (
             <PipelineJobsPanel
               librarySession={librarySession}
@@ -679,7 +751,7 @@ export default function App() {
           )}
         </main>
       </div>
-      <div style={{ display: showVideo ? "contents" : "none" }}>
+      {videoMounted && (
         <FloatingVideoWindow
           title={videoName || "нет файла"}
           label="Видео"
@@ -699,16 +771,17 @@ export default function App() {
             showLabels
             showTrails
             trailLength={30}
-            onFrameChange={setCurrentFrame}
+            onFrameChange={onPlayerFrame}
             videoRef={videoRef}
             highlightIds={overlayHighlightIds}
             groupByTrack={groupByTrack}
             mergeTimeline={mergeTimeline}
             focusTrackIds={playerFocusTrackIds}
             compact={false}
+            startAtSec={lastVideoSecRef.current}
           />
         </FloatingVideoWindow>
-      </div>
+      )}
       {showMap && (
         <FloatingVideoWindow
           title={`cam ${cameraKey}`}
@@ -725,6 +798,7 @@ export default function App() {
             homography={homography}
             tracking={tracking}
             videoRef={videoRef}
+            videoActive={videoMounted}
             currentFrame={currentFrame}
             showTrails
             focusTrackIds={playerFocusTrackIds}

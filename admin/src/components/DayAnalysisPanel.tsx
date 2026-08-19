@@ -1,8 +1,19 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { colorForTrackId, fetchTrackingJson, formatDuration } from "../utils";
 import { TrackingPlayer, type TrackingPlayerHandle } from "./TrackingPlayer";
 import type { MediaSession } from "../session";
 import type { TrackingData } from "../types";
+import {
+  PlaybackToolbar,
+  PlayheadTimeline,
+  formatHms as formatShortTime,
+  formatTimeOfDay,
+  makeTimeBounds,
+  usePlaybackClock,
+  type PlaybackSink,
+  type TimeBounds,
+  type TimelineLane,
+} from "../playback";
 
 export interface CropRef {
   session_key: string;
@@ -23,6 +34,8 @@ export interface DayTrack {
   has_reid: boolean;
   crops: string[];
 }
+
+export type OpenTrackInMerge = (sessionKey: string, trackId: number, t0: number) => void;
 
 export interface DayTransitionEdge {
   from: string;
@@ -99,11 +112,13 @@ export interface DaySummaryItem {
 type FilterMode = "all" | "multi_cam" | "pass1" | "pass2" | "pass4" | "solo";
 type SortMode = "person_id" | "tracks" | "span" | "time";
 type RightTab = "edges" | "tracks" | "inspector";
-type TimeBounds = { minT: number; maxT: number; span: number };
 type DayCameraSession = MediaSession & { t0_abs?: number };
+type DaySeg = { personId: number; sessionKey: string; trackId: number; t0: number };
 
 const trackingCache = new Map<string, Record<string, TrackingData>>();
-const UI_HZ_MS = 100;
+const DRIFT_SEC = 0.45;
+const EMPTY_FOCUS: number[] = [];
+const EMPTY_GROUP: Record<number, number> = {};
 
 function groupCropUrl(sessionKey: string, file: string): string {
   return `/api/group_crop/${encodeURIComponent(sessionKey)}/${encodeURIComponent(file)}`;
@@ -120,23 +135,6 @@ function cropSrc(crop: string | CropRef | null | undefined, sessionKey?: string)
     return sessionKey ? groupCropUrl(sessionKey, crop) : crop;
   }
   return groupCropUrl(crop.session_key, crop.file);
-}
-
-function formatSecToTimeOfDay(sec: number): string {
-  const s = Math.floor(sec) % 86400;
-  const ms = Math.floor((sec - Math.floor(sec)) * 100);
-  const hh = String(Math.floor(s / 3600)).padStart(2, "0");
-  const mm = String(Math.floor((s % 3600) / 60)).padStart(2, "0");
-  const ss = String(s % 60).padStart(2, "0");
-  return `${hh}:${mm}:${ss}.${String(ms).padStart(2, "0")}`;
-}
-
-function formatShortTime(sec: number): string {
-  const s = Math.floor(sec) % 86400;
-  const hh = String(Math.floor(s / 3600)).padStart(2, "0");
-  const mm = String(Math.floor((s % 3600) / 60)).padStart(2, "0");
-  const ss = String(s % 60).padStart(2, "0");
-  return `${hh}:${mm}:${ss}`;
 }
 
 function formatScore(v: number | null | undefined): string {
@@ -314,6 +312,7 @@ const DayInspector = memo(function DayInspector({
   onTab,
   onSelectEdge,
   onSeek,
+  onOpenTrackInMerge,
 }: {
   person: GlobalPerson | null;
   edges: DayTransitionEdge[];
@@ -322,6 +321,7 @@ const DayInspector = memo(function DayInspector({
   onTab: (tab: RightTab) => void;
   onSelectEdge: (edge: DayTransitionEdge) => void;
   onSeek: (sec: number) => void;
+  onOpenTrackInMerge?: OpenTrackInMerge;
 }) {
   if (!person) {
     return (
@@ -393,7 +393,15 @@ const DayInspector = memo(function DayInspector({
                   <div
                     key={`${edge.from}->${edge.to}`}
                     className={`day-edge ${on ? "on" : ""}`}
-                    onClick={() => onSelectEdge(edge)}
+                    title="Клик — к склейке на таймлайне · Shift+клик — вкладка Склейки"
+                    onClick={(e) => {
+                      if (e.shiftKey) {
+                        const tr = person.tracks.find((t) => t.uid === edge.from);
+                        if (tr) onOpenTrackInMerge?.(tr.session_key, tr.track_id, tr.t0);
+                        return;
+                      }
+                      onSelectEdge(edge);
+                    }}
                   >
                     <div className="day-edge-head">
                       <div className="day-edge-title">
@@ -432,10 +440,19 @@ const DayInspector = memo(function DayInspector({
                   <div
                     key={side}
                     className="day-pair-col"
-                    onClick={() => {
-                      if (tr) onSeek(isFrom ? tr.t1 : tr.t0);
+                    onClick={(e) => {
+                      if (!tr) return;
+                      if (e.shiftKey) {
+                        onOpenTrackInMerge?.(tr.session_key, tr.track_id, isFrom ? tr.t1 : tr.t0);
+                        return;
+                      }
+                      onSeek(isFrom ? tr.t1 : tr.t0);
                     }}
-                    title={isFrom ? "К точке выхода" : "К точке входа"}
+                    title={
+                      isFrom
+                        ? "Клик — к точке выхода · Shift+клик — Склейки"
+                        : "Клик — к точке входа · Shift+клик — Склейки"
+                    }
                   >
                     <strong>
                       {isFrom ? "До" : "После"} {cameraShort(isFrom ? selectedEdge.from_camera : selectedEdge.to_camera)} #
@@ -513,7 +530,17 @@ const DayInspector = memo(function DayInspector({
             </thead>
             <tbody>
               {person.tracks.map((t) => (
-                <tr key={t.uid} onClick={() => onSeek(t.t0)} title="К началу трека">
+                <tr
+                  key={t.uid}
+                  onClick={(e) => {
+                    if (e.shiftKey) {
+                      onOpenTrackInMerge?.(t.session_key, t.track_id, t.t0);
+                      return;
+                    }
+                    onSeek(t.t0);
+                  }}
+                  title="Клик — к началу трека · Shift+клик — вкладка Склейки"
+                >
                   <td>
                     <strong>{t.camera}</strong>
                   </td>
@@ -533,184 +560,13 @@ const DayInspector = memo(function DayInspector({
   );
 });
 
-const DayTimeline = memo(function DayTimeline({
-  cameras,
-  persons,
-  selectedPersonId,
-  timeBounds,
-  zoom,
-  currentDaySec,
-  onSeek,
-  onSelectPerson,
-  onScrubbing,
+export function DayAnalysisPanel({
+  selectedDay,
+  onOpenTrackInMerge,
 }: {
-  cameras: DayCameraSession[];
-  persons: GlobalPerson[];
-  selectedPersonId: number | null;
-  timeBounds: TimeBounds;
-  zoom: number;
-  currentDaySec: number;
-  onSeek: (sec: number) => void;
-  onSelectPerson: (id: number, t0: number) => void;
-  onScrubbing?: (active: boolean) => void;
+  selectedDay: string;
+  onOpenTrackInMerge?: OpenTrackInMerge;
 }) {
-  const scrollRef = useRef<HTMLDivElement>(null);
-  const shellRef = useRef<HTMLDivElement>(null);
-  const plotRef = useRef<HTMLDivElement>(null);
-  const dragging = useRef(false);
-  const downPos = useRef({ x: 0, y: 0 });
-  const barHit = useRef<{ id: number; t0: number } | null>(null);
-
-  const seekFromClientX = useCallback(
-    (clientX: number) => {
-      const plot = plotRef.current;
-      if (!plot) return;
-      const rect = plot.getBoundingClientRect();
-      const pct = Math.max(0, Math.min(1, (clientX - rect.left) / Math.max(1, rect.width)));
-      onSeek(timeBounds.minT + pct * timeBounds.span);
-    },
-    [onSeek, timeBounds.minT, timeBounds.span],
-  );
-
-  const endDrag = useCallback(
-    (e: ReactPointerEvent<HTMLDivElement>) => {
-      if (!dragging.current) return;
-      dragging.current = false;
-      onScrubbing?.(false);
-      e.currentTarget.classList.remove("is-dragging");
-      if (e.currentTarget.hasPointerCapture(e.pointerId)) {
-        e.currentTarget.releasePointerCapture(e.pointerId);
-      }
-      const dx = Math.abs(e.clientX - downPos.current.x);
-      const dy = Math.abs(e.clientY - downPos.current.y);
-      if (dx < 5 && dy < 5 && barHit.current) {
-        onSelectPerson(barHit.current.id, barHit.current.t0);
-      } else {
-        seekFromClientX(e.clientX);
-      }
-      barHit.current = null;
-    },
-    [onSelectPerson, onScrubbing, seekFromClientX],
-  );
-
-  useEffect(() => {
-    if (dragging.current) return;
-    const scroller = scrollRef.current;
-    const plot = plotRef.current;
-    if (!scroller || !plot || timeBounds.span <= 0) return;
-    const pct = (currentDaySec - timeBounds.minT) / timeBounds.span;
-    const plotRect = plot.getBoundingClientRect();
-    const scrollRect = scroller.getBoundingClientRect();
-    const x = plotRect.left - scrollRect.left + scroller.scrollLeft + pct * plot.offsetWidth;
-    const view = scroller.clientWidth;
-    const sl = scroller.scrollLeft;
-    if (x < sl + 48 || x > sl + view - 48) {
-      scroller.scrollLeft = Math.max(0, x - view * 0.45);
-    }
-  }, [currentDaySec, zoom, timeBounds.minT, timeBounds.span]);
-
-  const playheadPct = timeBounds.span > 0 ? ((currentDaySec - timeBounds.minT) / timeBounds.span) * 100 : 0;
-
-  return (
-    <div className="day-timeline-scroll" ref={scrollRef}>
-      <div
-        ref={shellRef}
-        className="day-timeline-inner"
-        style={{ width: `${Math.max(100, 100 * zoom)}%` }}
-        onPointerDown={(e) => {
-          if (e.button !== 0) return;
-          e.preventDefault();
-          e.currentTarget.setPointerCapture(e.pointerId);
-          e.currentTarget.classList.add("is-dragging");
-          dragging.current = true;
-          onScrubbing?.(true);
-          downPos.current = { x: e.clientX, y: e.clientY };
-          const bar = (e.target as HTMLElement).closest(".day-bar") as HTMLElement | null;
-          const pid = bar?.dataset.personId;
-          const t0 = bar?.dataset.t0;
-          barHit.current = pid != null && t0 != null ? { id: Number(pid), t0: Number(t0) } : null;
-          seekFromClientX(e.clientX);
-        }}
-        onPointerMove={(e) => {
-          if (!dragging.current) return;
-          e.preventDefault();
-          seekFromClientX(e.clientX);
-        }}
-        onPointerUp={endDrag}
-        onPointerCancel={endDrag}
-        onDragStart={(e) => e.preventDefault()}
-      >
-        <div className="day-axis-row">
-          <div className="day-lane-label" aria-hidden />
-          <div className="day-axis" ref={plotRef}>
-            {Array.from({ length: 11 }).map((_, i) => {
-              const frac = i / 10;
-              const t = timeBounds.minT + frac * timeBounds.span;
-              return (
-                <div key={i} className="day-axis-tick" style={{ left: `${frac * 100}%` }}>
-                  <i />
-                  {formatShortTime(t)}
-                </div>
-              );
-            })}
-          </div>
-        </div>
-        <div className="day-playhead-layer" aria-hidden>
-          <div className="day-lane-label" />
-          <div className="day-playhead-track">
-            <div className="day-playhead" style={{ left: `${playheadPct}%` }} />
-          </div>
-        </div>
-        <div className="day-lanes">
-          {cameras.map((sess) => {
-            const hasSel =
-              selectedPersonId != null &&
-              persons.some(
-                (p) => p.person_id === selectedPersonId && p.tracks.some((t) => t.camera === sess.camera),
-              );
-            return (
-              <div key={sess.key} className={`day-lane ${hasSel ? "has-sel" : ""}`}>
-                <div className="day-lane-label">{sess.camera}</div>
-                <div className="day-lane-track">
-                  {persons.map((person) => {
-                    const selected = person.person_id === selectedPersonId;
-                    const noFocus = selectedPersonId == null;
-                    return person.tracks
-                      .filter((t) => t.camera === sess.camera)
-                      .map((t) => {
-                        const leftPct = ((t.t0 - timeBounds.minT) / timeBounds.span) * 100;
-                        const widthPct = Math.max(0.45, ((t.t1 - t.t0) / timeBounds.span) * 100);
-                        return (
-                          <div
-                            key={t.uid}
-                            role="button"
-                            tabIndex={-1}
-                            data-person-id={person.person_id}
-                            data-t0={t.t0}
-                            className={`day-bar ${noFocus ? "" : selected ? "on" : "dim"}`}
-                            style={{
-                              left: `${leftPct}%`,
-                              width: `${widthPct}%`,
-                              background: colorForTrackId(t.track_id),
-                            }}
-                            title={`${person.label} (${sess.camera} #${t.track_id}) ${formatShortTime(t.t0)}–${formatShortTime(t.t1)}`}
-                          >
-                            {selected && !noFocus ? `T${t.track_id}` : ""}
-                          </div>
-                        );
-                      });
-                  })}
-                </div>
-              </div>
-            );
-          })}
-        </div>
-      </div>
-    </div>
-  );
-});
-
-export function DayAnalysisPanel({ selectedDay }: { selectedDay: string }) {
   const [dayData, setDayData] = useState<DayLinksData | null>(null);
   const [loading, setLoading] = useState(false);
   const [runningSolver, setRunningSolver] = useState(false);
@@ -724,22 +580,15 @@ export function DayAnalysisPanel({ selectedDay }: { selectedDay: string }) {
   const [selectedEdge, setSelectedEdge] = useState<DayTransitionEdge | null>(null);
   const [rightTab, setRightTab] = useState<RightTab>("edges");
 
-  const [currentDaySec, setCurrentDaySec] = useState(0);
-  const [isPlaying, setIsPlaying] = useState(false);
-  const [playbackSpeed, setPlaybackSpeed] = useState(1);
-  const [zoom, setZoom] = useState(1);
-
   const playerRefs = useRef<Record<string, TrackingPlayerHandle | null>>({});
-  const currentDaySecRef = useRef(0);
-  const isPlayingRef = useRef(false);
-  const scrubbingRef = useRef(false);
-  const playbackSpeedRef = useRef(1);
-  const timeBoundsRef = useRef<TimeBounds>({ minT: 0, maxT: 300, span: 300 });
-  const seekToDaySecRef = useRef<(sec: number, playAfter?: boolean) => void>(() => {});
-  const syncPlayersRef = useRef<(t: number, play?: boolean) => void>(() => {});
+  const playerRefCbs = useRef<Record<string, (r: TrackingPlayerHandle | null) => void>>({});
+  const playbackSpeedRef = useRef(2);
+  const timeBoundsRef = useRef<TimeBounds>(makeTimeBounds(0, 300));
+  const cameraSessionsRef = useRef<DayCameraSession[]>([]);
+  const startedKeysRef = useRef<Set<string>>(new Set());
 
   const timeBounds = useMemo((): TimeBounds => {
-    if (!dayData?.persons?.length) return { minT: 0, maxT: 300, span: 300 };
+    if (!dayData?.persons?.length) return makeTimeBounds(0, 300);
     let minT = Infinity;
     let maxT = -Infinity;
     for (const p of dayData.persons) {
@@ -753,14 +602,97 @@ export function DayAnalysisPanel({ selectedDay }: { selectedDay: string }) {
         if (p.t1 > maxT) maxT = p.t1;
       }
     }
-    if (!Number.isFinite(minT)) minT = 0;
-    if (!Number.isFinite(maxT) || maxT <= minT) maxT = minT + 300;
-    return { minT, maxT, span: Math.max(1e-6, maxT - minT) };
+    return makeTimeBounds(minT, maxT);
   }, [dayData?.persons]);
 
   timeBoundsRef.current = timeBounds;
-  isPlayingRef.current = isPlaying;
-  playbackSpeedRef.current = playbackSpeed;
+  cameraSessionsRef.current = dayData?.camera_sessions ?? [];
+
+  const playerRefFor = (key: string) =>
+    (playerRefCbs.current[key] ??= (r) => {
+      playerRefs.current[key] = r;
+    });
+
+  const sampleDaySecFromPlayers = () => {
+    const sessions = cameraSessionsRef.current;
+    const minT = timeBoundsRef.current.minT;
+    let fallback: number | null = null;
+    for (const sess of sessions) {
+      const handle = playerRefs.current[sess.key];
+      if (!handle) continue;
+      const t0Abs = sess.t0_abs ?? minT;
+      const duration = sess.duration_sec ?? 300;
+      const g = handle.getGlobalSec();
+      if (g == null) continue;
+      const daySec = t0Abs + g;
+      if (daySec < t0Abs - 0.05 || daySec > t0Abs + duration + 0.05) continue;
+      if (!handle.paused()) return daySec;
+      fallback = daySec;
+    }
+    return fallback;
+  };
+  const sampleDaySecRef = useRef(sampleDaySecFromPlayers);
+  sampleDaySecRef.current = sampleDaySecFromPlayers;
+
+  const syncPlayersToTime = useCallback((tDay: number, playAfter = false, hard = true) => {
+    const sessions = cameraSessionsRef.current;
+    if (!sessions.length) return;
+    const minT = timeBoundsRef.current.minT;
+    const nextStarted = new Set<string>();
+    for (const sess of sessions) {
+      const handle = playerRefs.current[sess.key];
+      if (!handle) continue;
+      const t0Abs = sess.t0_abs ?? minT;
+      const duration = sess.duration_sec ?? 300;
+      if (tDay < t0Abs || tDay > t0Abs + duration) {
+        handle.pause();
+        continue;
+      }
+      nextStarted.add(sess.key);
+      handle.setPlaybackRate(playbackSpeedRef.current);
+      const local = Math.max(0, tDay - t0Abs);
+      const already = startedKeysRef.current.has(sess.key);
+      if (hard || !already) {
+        if (!playAfter) handle.pause();
+        handle.seekToGlobal(local, playAfter);
+        continue;
+      }
+      if (!playAfter) {
+        handle.pause();
+        continue;
+      }
+      const g = handle.getGlobalSec();
+      if (g == null || Math.abs(g - local) > DRIFT_SEC) {
+        handle.seekToGlobal(local, true);
+      } else if (handle.paused()) {
+        handle.play();
+      }
+    }
+    startedKeysRef.current = nextStarted;
+  }, []);
+
+  const playbackSink = useMemo<PlaybackSink>(
+    () => ({
+      sampleTime: () => sampleDaySecRef.current(),
+      apply: (t, play, mode) => syncPlayersToTime(t, play, mode === "hard"),
+      setRate: (next) => {
+        playbackSpeedRef.current = next;
+        for (const handle of Object.values(playerRefs.current)) {
+          handle?.setPlaybackRate(next);
+        }
+      },
+    }),
+    [syncPlayersToTime],
+  );
+
+  const clock = usePlaybackClock({
+    bounds: timeBounds,
+    sink: playbackSink,
+    defaultRate: 2,
+  });
+  const seekToDaySec = clock.seek;
+  const currentDaySec = clock.currentSec;
+  const currentDaySecRef = clock.currentSecRef;
 
   useEffect(() => {
     if (!selectedDay) return;
@@ -779,15 +711,11 @@ export function DayAnalysisPanel({ selectedDay }: { selectedDay: string }) {
           setFilterMode(multi ? "multi_cam" : "all");
           const first = multi ?? json.persons[0]!;
           setSelectedPersonId(first.person_id);
-          setCurrentDaySec(first.t0);
-          currentDaySecRef.current = first.t0;
         } else {
           setSelectedPersonId(null);
-          setCurrentDaySec(0);
-          currentDaySecRef.current = 0;
         }
         setSelectedEdge(null);
-        setIsPlaying(false);
+        startedKeysRef.current = new Set();
 
         const cached = trackingCache.get(selectedDay);
         if (cached) {
@@ -822,112 +750,21 @@ export function DayAnalysisPanel({ selectedDay }: { selectedDay: string }) {
     };
   }, [selectedDay]);
 
-  const syncPlayersToTime = useCallback((tDay: number, playAfter = false) => {
-    const sessions = dayData?.camera_sessions;
-    if (!sessions) return;
-    const minT = timeBoundsRef.current.minT;
-    for (const sess of sessions) {
-      const handle = playerRefs.current[sess.key];
-      if (!handle) continue;
-      const t0Abs = sess.t0_abs ?? minT;
-      const duration = sess.duration_sec ?? 300;
-      if (tDay < t0Abs || tDay > t0Abs + duration) {
-        handle.pause();
-        continue;
-      }
-      handle.setPlaybackRate(playbackSpeedRef.current);
-      if (!playAfter) handle.pause();
-      handle.seekToGlobal(Math.max(0, tDay - t0Abs), playAfter);
+  const initDayRef = useRef("");
+  useEffect(() => {
+    if (loading || !dayData || initDayRef.current === selectedDay) return;
+    const dayKey = dayData.day || dayData.day_clean;
+    if (dayKey && dayKey !== selectedDay && dayData.day_clean !== selectedDay) return;
+    initDayRef.current = selectedDay;
+    clock.pause();
+    startedKeysRef.current = new Set();
+    if (dayData.persons?.length) {
+      const first = dayData.persons.find((p) => p.n_cameras > 1) ?? dayData.persons[0]!;
+      clock.seek(first.t0, false);
+    } else {
+      clock.seek(timeBounds.minT, false);
     }
-  }, [dayData?.camera_sessions]);
-
-  const seekToDaySec = useCallback(
-    (targetSec: number, playAfter?: boolean) => {
-      const { minT, maxT } = timeBoundsRef.current;
-      const clamped = Math.max(minT, Math.min(maxT, targetSec));
-      currentDaySecRef.current = clamped;
-      setCurrentDaySec(clamped);
-      syncPlayersToTime(clamped, playAfter ?? isPlayingRef.current);
-    },
-    [syncPlayersToTime],
-  );
-
-  seekToDaySecRef.current = seekToDaySec;
-  syncPlayersRef.current = syncPlayersToTime;
-
-  useEffect(() => {
-    if (!isPlaying) return;
-    const id = window.setInterval(() => {
-      if (scrubbingRef.current) return;
-      syncPlayersRef.current(currentDaySecRef.current, true);
-    }, 1000);
-    return () => window.clearInterval(id);
-  }, [isPlaying]);
-
-  useEffect(() => {
-    if (!isPlaying) return;
-    for (const handle of Object.values(playerRefs.current)) {
-      handle?.setPlaybackRate(playbackSpeed);
-    }
-  }, [isPlaying, playbackSpeed]);
-
-  useEffect(() => {
-    if (!isPlaying) return;
-    let animId = 0;
-    let lastTs = performance.now();
-    let lastUi = 0;
-
-    const loop = (now: number) => {
-      if (scrubbingRef.current) {
-        lastTs = now;
-        animId = requestAnimationFrame(loop);
-        return;
-      }
-      const dt = ((now - lastTs) / 1000) * playbackSpeedRef.current;
-      lastTs = now;
-      const bounds = timeBoundsRef.current;
-      let next = currentDaySecRef.current + dt;
-      if (next >= bounds.maxT) {
-        next = bounds.maxT;
-        currentDaySecRef.current = next;
-        setCurrentDaySec(next);
-        setIsPlaying(false);
-        syncPlayersRef.current(next, false);
-        return;
-      }
-      currentDaySecRef.current = next;
-      if (now - lastUi >= UI_HZ_MS) {
-        lastUi = now;
-        setCurrentDaySec(next);
-      }
-      animId = requestAnimationFrame(loop);
-    };
-
-    animId = requestAnimationFrame(loop);
-    return () => cancelAnimationFrame(animId);
-  }, [isPlaying]);
-
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (["INPUT", "TEXTAREA", "SELECT"].includes((e.target as HTMLElement)?.tagName)) return;
-      if (e.code === "Space") {
-        e.preventDefault();
-        setIsPlaying((p) => {
-          const next = !p;
-          syncPlayersRef.current(currentDaySecRef.current, next);
-          return next;
-        });
-      } else if (e.code === "ArrowLeft") {
-        e.preventDefault();
-        seekToDaySecRef.current(currentDaySecRef.current - (e.shiftKey ? 1 : 1 / 25));
-      } else if (e.code === "ArrowRight") {
-        e.preventDefault();
-        seekToDaySecRef.current(currentDaySecRef.current + (e.shiftKey ? 1 : 1 / 25));
-      }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, []);
+  }, [loading, dayData, selectedDay, timeBounds.minT, clock.pause, clock.seek]);
 
   const handleRunDayLink = async () => {
     if (!selectedDay || runningSolver) return;
@@ -1007,6 +844,31 @@ export function DayAnalysisPanel({ selectedDay }: { selectedDay: string }) {
 
   const cameraSessionsList = dayData?.camera_sessions ?? [];
   const timelinePersons = selectedPerson ? dayData?.persons ?? [] : displayPersons;
+
+  const timelineLanes = useMemo((): TimelineLane<DaySeg>[] => {
+    return cameraSessionsList.map((sess) => {
+      const segments = timelinePersons.flatMap((p) =>
+        p.tracks
+          .filter((t) => t.session_key === sess.key || t.camera === sess.camera)
+          .map((t) => {
+            const selected = selectedPersonId === p.person_id;
+            return {
+              id: t.uid,
+              t0: t.t0,
+              t1: t.t1,
+              color: colorForTrackId(t.track_id),
+              label: selected ? `P${p.person_id} T${t.track_id}` : undefined,
+              title: `${p.label} · ${sess.camera} T${t.track_id}  ${formatShortTime(t.t0)}–${formatShortTime(t.t1)} · Shift+клик — Склейки`,
+              selected,
+              dimmed: selectedPersonId != null && !selected,
+              data: { personId: p.person_id, sessionKey: t.session_key, trackId: t.track_id, t0: t.t0 },
+            };
+          }),
+      );
+      const highlight = selectedPerson?.tracks.some((t) => t.session_key === sess.key || t.camera === sess.camera);
+      return { id: sess.key, label: sess.camera, highlight, segments };
+    });
+  }, [cameraSessionsList, timelinePersons, selectedPersonId, selectedPerson]);
 
   const selectPerson = useCallback(
     (person: GlobalPerson) => {
@@ -1128,47 +990,17 @@ export function DayAnalysisPanel({ selectedDay }: { selectedDay: string }) {
           />
 
           <section className="day-center" aria-label="Таймлайн и видео дня">
-            <div className="day-toolbar">
-              <div className="day-toolbar-group">
-                <button
-                  type="button"
-                  className={`day-btn day-btn-play ${isPlaying ? "is-playing" : "day-btn-primary"}`}
-                  onClick={() => {
-                    const next = !isPlaying;
-                    setIsPlaying(next);
-                    syncPlayersToTime(currentDaySecRef.current, next);
-                  }}
-                  title="Пробел"
-                >
-                  {isPlaying ? "Пауза" : "Пуск"}
-                </button>
-                <button type="button" className="day-btn" onClick={() => seekToDaySec(currentDaySecRef.current - 1 / 25)} title="←">
-                  −1к
-                </button>
-                <button type="button" className="day-btn" onClick={() => seekToDaySec(currentDaySecRef.current + 1 / 25)} title="→">
-                  +1к
-                </button>
-                {[0.5, 1, 2, 4].map((spd) => (
-                  <button
-                    key={spd}
-                    type="button"
-                    className={`day-btn day-speed ${playbackSpeed === spd ? "on" : ""}`}
-                    onClick={() => setPlaybackSpeed(spd)}
-                  >
-                    {spd}×
-                  </button>
-                ))}
-              </div>
-              <span className="day-clock">{formatSecToTimeOfDay(currentDaySec)}</span>
-              <span className="day-clock-span">
-                {formatShortTime(timeBounds.minT)}–{formatShortTime(timeBounds.maxT)} ({formatDuration(timeBounds.span)})
-              </span>
-              <div className="day-toolbar-group right">
-                {selectedPerson && (
+            <PlaybackToolbar
+              clock={clock}
+              bounds={timeBounds}
+              formatCurrent={formatTimeOfDay}
+              formatBound={formatShortTime}
+              extras={
+                selectedPerson ? (
                   <>
                     <button
                       type="button"
-                      className="day-btn"
+                      className="playhead-btn"
                       onClick={() => {
                         setSelectedPersonId(null);
                         setSelectedEdge(null);
@@ -1178,45 +1010,35 @@ export function DayAnalysisPanel({ selectedDay }: { selectedDay: string }) {
                     </button>
                     {personEdges.length > 0 && (
                       <>
-                        <button type="button" className="day-btn" onClick={() => jumpToTransition("prev")}>
+                        <button type="button" className="playhead-btn" onClick={() => jumpToTransition("prev")}>
                           ← Склейка
                         </button>
-                        <button type="button" className="day-btn" onClick={() => jumpToTransition("next")}>
+                        <button type="button" className="playhead-btn" onClick={() => jumpToTransition("next")}>
                           Склейка →
                         </button>
                       </>
                     )}
                   </>
-                )}
-                <button type="button" className="day-btn" onClick={() => setZoom((z) => Math.max(0.5, z - 0.25))}>
-                  −
-                </button>
-                <span className="day-clock-span">{Math.round(zoom * 100)}%</span>
-                <button type="button" className="day-btn" onClick={() => setZoom((z) => Math.min(4, z + 0.25))}>
-                  +
-                </button>
-                <button type="button" className="day-btn" onClick={() => setZoom(1)}>
-                  100%
-                </button>
-              </div>
-            </div>
+                ) : null
+              }
+            />
 
-            <DayTimeline
-              cameras={cameraSessionsList}
-              persons={timelinePersons}
-              selectedPersonId={selectedPersonId}
-              timeBounds={timeBounds}
-              zoom={zoom}
-              currentDaySec={currentDaySec}
-              onSeek={seekToDaySec}
-              onScrubbing={(active) => {
-                scrubbingRef.current = active;
-              }}
-              onSelectPerson={(id, t0) => {
-                setSelectedPersonId(id);
+            <PlayheadTimeline
+              lanes={timelineLanes}
+              bounds={timeBounds}
+              currentSec={currentDaySec}
+              zoom={clock.zoom}
+              formatTick={formatShortTime}
+              onSeek={(sec) => clock.seek(sec)}
+              onScrubbing={clock.setScrubbing}
+              onSelect={(seg) => {
+                setSelectedPersonId(seg.data.personId);
                 setSelectedEdge(null);
                 setRightTab("edges");
-                seekToDaySec(t0);
+                clock.seek(seg.data.t0);
+              }}
+              onShiftSelect={(seg) => {
+                onOpenTrackInMerge?.(seg.data.sessionKey, seg.data.trackId, seg.data.t0);
               }}
             />
 
@@ -1231,7 +1053,7 @@ export function DayAnalysisPanel({ selectedDay }: { selectedDay: string }) {
                 const duration = sess.duration_sec ?? 300;
                 const isActiveNow = currentDaySec >= t0Abs && currentDaySec <= t0Abs + duration;
                 const localSec = Math.max(0, currentDaySec - t0Abs);
-                const focusIds = focusTrackIdsByCamera[sess.camera] ?? [];
+                const focusIds = focusTrackIdsByCamera[sess.camera] ?? EMPTY_FOCUS;
                 const isPersonInCamera = focusIds.length > 0 && isActiveNow;
                 return (
                   <div
@@ -1254,18 +1076,16 @@ export function DayAnalysisPanel({ selectedDay }: { selectedDay: string }) {
                     </div>
                     <div className="day-camera-body">
                       <TrackingPlayer
-                        ref={(r) => {
-                          playerRefs.current[sess.key] = r;
-                        }}
+                        ref={playerRefFor(sess.key)}
                         videoUrl={sess.parts[0]?.videoUrl ?? null}
                         tracking={cameraTracking[sess.key] ?? null}
                         sessionParts={sess.parts.length ? sess.parts : null}
                         showLabels={true}
                         showTrails={true}
                         trailLength={25}
-                        groupByTrack={dayData?.track_to_person?.[sess.key] ?? {}}
+                        groupByTrack={dayData?.track_to_person?.[sess.key] ?? EMPTY_GROUP}
+                        highlightIds={selectedPerson ? focusIds : []}
                         focusTrackIds={selectedPerson ? focusIds : null}
-                        hideUnfocused={selectedPerson != null}
                         compact={true}
                       />
                     </div>
@@ -1283,6 +1103,7 @@ export function DayAnalysisPanel({ selectedDay }: { selectedDay: string }) {
             onTab={setRightTab}
             onSelectEdge={onSelectEdge}
             onSeek={seekToDaySec}
+            onOpenTrackInMerge={onOpenTrackInMerge}
           />
         </div>
       )}

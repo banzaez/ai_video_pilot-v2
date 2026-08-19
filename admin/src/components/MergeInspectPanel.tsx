@@ -2,6 +2,15 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import { createPortal } from "react-dom";
 import type { TrackingData } from "../types";
 import {
+  PlaybackToolbar,
+  PlayheadTimeline,
+  formatDurationClock,
+  makeTimeBounds,
+  usePlaybackClock,
+  type PlaybackSink,
+  type TimelineLane,
+} from "../playback";
+import {
   faceBucketKeys,
   formatEntityId,
   groupId,
@@ -52,9 +61,13 @@ type Props = {
   currentFrame: number;
   selectedTrackId: number | null;
   onSelectTrackId: (trackId: number | null) => void;
-  onSeekToSec: (sec: number) => void;
+  playbackSink: PlaybackSink;
   onFocusTracks: (ids: number[] | null) => void;
+  jumpTo?: { trackId: number; sec: number } | null;
+  onJumpConsumed?: () => void;
 };
+
+type MergeSeg = { trackId: number; t0: number };
 
 function formatScore(v: number | null | undefined): string {
   if (v == null || !Number.isFinite(v)) return "—";
@@ -344,7 +357,11 @@ function MergeEntityRef({
       onPickGroup(id);
       return;
     }
-    const tr = mergeTimeline?.tracks.find((t) => t.track_id === id);
+    const tr = mergeTimeline ? resolveMergeTrack(mergeTimeline, id, null) : null;
+    if (tr?.group_id != null) {
+      onPickTrack(tr.track_id, tr.t0);
+      return;
+    }
     onPickTrack(id, tr?.t0 ?? 0);
   }
 
@@ -541,6 +558,24 @@ function fragmentLive(t: MergeTimelineTrack, currentSec: number): boolean {
   return currentSec >= t.t0 && currentSec <= t.t1;
 }
 
+/** Фрагмент по track_id / global_id; если задано время — живой или ближайший. */
+function resolveMergeTrack(
+  timeline: MergeTimeline,
+  trackId: number,
+  sec?: number | null,
+): MergeTimelineTrack | null {
+  const hits = timeline.tracks.filter((t) => t.track_id === trackId || t.global_id === trackId);
+  if (!hits.length) return null;
+  if (sec == null || !Number.isFinite(sec)) return hits[0] ?? null;
+  const live = hits.find((t) => sec >= t.t0 - 0.05 && sec <= t.t1 + 0.05);
+  if (live) return live;
+  return [...hits].sort((a, b) => Math.abs(a.t0 - sec) - Math.abs(b.t0 - sec))[0] ?? null;
+}
+
+function rowKeyForTrack(tr: MergeTimelineTrack): string {
+  return tr.group_id != null ? `g:${tr.group_id}` : `solo:${tr.track_id}`;
+}
+
 export function MergeInspectPanel({
   activeVideo,
   mergeTimeline,
@@ -556,8 +591,10 @@ export function MergeInspectPanel({
   currentFrame,
   selectedTrackId,
   onSelectTrackId,
-  onSeekToSec,
+  playbackSink,
   onFocusTracks,
+  jumpTo = null,
+  onJumpConsumed,
 }: Props) {
   const [query, setQuery] = useState("");
   const [listFilter, setListFilter] = useState<MergeListFilter>("all");
@@ -565,9 +602,24 @@ export function MergeInspectPanel({
   const [selectedRowKey, setSelectedRowKey] = useState<string | null>(null);
   const [selectedFragmentId, setSelectedFragmentId] = useState<number | null>(null);
   const [atCurrentFrame, setAtCurrentFrame] = useState(false);
-  const selectedGroupRef = useRef<HTMLDivElement>(null);
-  const timelineRef = useRef<HTMLDivElement>(null);
-  const selectedBarRef = useRef<HTMLButtonElement>(null);
+  const selectedRowBtnRef = useRef<HTMLButtonElement>(null);
+
+  const timeBounds = useMemo(
+    () => makeTimeBounds(0, Math.max(mergeTimeline?.duration_sec ?? 1, 0.001)),
+    [mergeTimeline?.duration_sec],
+  );
+  const clock = usePlaybackClock({
+    bounds: timeBounds,
+    sink: playbackSink,
+    defaultRate: 2,
+    hotkeys: { space: true, arrows: false },
+    enabled: Boolean(activeVideo && mergeTimeline),
+  });
+  const playheadSec = clock.currentSec;
+
+  useEffect(() => {
+    clock.noteExternalTime(currentSec);
+  }, [currentSec, clock.noteExternalTime]);
 
   const minScore = mergeTimeline?.summary?.min_score ?? null;
   const dupTracks = useMemo(
@@ -694,43 +746,18 @@ export function MergeInspectPanel({
 
   // Synchronize when external selectedTrackId changes (e.g. clicking on video)
   useEffect(() => {
-    if (selectedTrackId == null || !mergeTimeline) return;
-    // Don't disturb if already in the same group or track
-    if (selectedRowKey) {
-      const curRow = rows.find((r) => rowKey(r) === selectedRowKey);
-      if (curRow) {
-        if (
-          curRow.kind === "group" &&
-          curRow.tracks.some(
-            (t) => t.track_id === selectedFragmentId || videoTrackId(t) === selectedTrackId,
-          )
-        ) {
-          return;
-        }
-        if (
-          curRow.kind === "solo" &&
-          (curRow.track.track_id === selectedFragmentId ||
-            videoTrackId(curRow.track) === selectedTrackId)
-        ) {
-          return;
-        }
-      }
-    }
-    const tr =
-      mergeTimeline.tracks.find((t) => t.track_id === selectedTrackId) ??
-      mergeTimeline.tracks.find((t) => t.global_id === selectedTrackId);
+    if (jumpTo || selectedTrackId == null || !mergeTimeline) return;
+    const tr = resolveMergeTrack(mergeTimeline, selectedTrackId, playheadSec);
     if (!tr) return;
-    const key = tr.group_id != null ? `g:${tr.group_id}` : `solo:${tr.track_id}`;
+    const key = rowKeyForTrack(tr);
+    if (selectedRowKey === key && selectedFragmentId === tr.track_id) return;
     setSelectedRowKey(key);
     setSelectedFragmentId(tr.track_id);
-  }, [selectedTrackId, mergeTimeline, selectedRowKey, selectedFragmentId, rows]);
+  }, [jumpTo, selectedTrackId, mergeTimeline, playheadSec, selectedRowKey, selectedFragmentId]);
 
   useEffect(() => {
-    selectedBarRef.current?.scrollIntoView({ block: "nearest", behavior: "smooth" });
-    if (selectedRow) {
-      selectedGroupRef.current?.scrollIntoView({ block: "nearest", behavior: "smooth" });
-    }
-  }, [selectedTrackId, selectedRow]);
+    selectedRowBtnRef.current?.scrollIntoView({ block: "nearest" });
+  }, [selectedRowKey]);
 
   const clearSelection = useCallback(() => {
     setSelectedRowKey(null);
@@ -778,44 +805,65 @@ export function MergeInspectPanel({
       clearSelection();
       return;
     }
-    setSelectedRowKey(key);
+    selectRow(row);
+  }
+
+  function selectRow(row: MergeListRow) {
+    setSelectedRowKey(rowKey(row));
     if (row.kind === "solo") {
       setSelectedFragmentId(row.track.track_id);
       onSelectTrackId(videoTrackId(row.track));
-      onSeekToSec(row.track.t0);
+      clock.seek(row.track.t0);
     } else if (row.tracks.length) {
       const sorted = [...row.tracks].sort((a, b) => a.t0 - b.t0);
       const first = sorted[0];
       setSelectedFragmentId(first.track_id);
       onSelectTrackId(videoTrackId(first));
-      onSeekToSec(first.t0);
+      clock.seek(first.t0);
     }
   }
 
   function pickTrack(trackId: number, sec: number) {
-    const tr = mergeTimeline?.tracks.find((t) => t.track_id === trackId);
+    const tr = mergeTimeline ? resolveMergeTrack(mergeTimeline, trackId, sec) : null;
     if (tr) {
-      setSelectedRowKey(tr.group_id != null ? `g:${tr.group_id}` : `solo:${trackId}`);
-      setSelectedFragmentId(trackId);
+      setSelectedRowKey(rowKeyForTrack(tr));
+      setSelectedFragmentId(tr.track_id);
       onSelectTrackId(videoTrackId(tr));
     } else {
       setSelectedFragmentId(trackId);
       onSelectTrackId(trackId);
     }
-    onSeekToSec(sec);
+    clock.seek(sec);
   }
+
+  useEffect(() => {
+    if (!jumpTo) return;
+    if (!mergeTimeline) {
+      onJumpConsumed?.();
+      return;
+    }
+    setListFilter("all");
+    setQuery("");
+    const tr = resolveMergeTrack(mergeTimeline, jumpTo.trackId, jumpTo.sec);
+    if (tr) {
+      setSelectedRowKey(rowKeyForTrack(tr));
+      setSelectedFragmentId(tr.track_id);
+      onSelectTrackId(videoTrackId(tr));
+      clock.seek(jumpTo.sec);
+    }
+    onJumpConsumed?.();
+  }, [jumpTo, mergeTimeline, clock.seek, onSelectTrackId, onJumpConsumed]);
 
   function pickGroup(groupId: number) {
     const row = rows.find((r) => r.kind === "group" && r.group.group_id === groupId);
     if (row) {
-      pickRow(row);
+      selectRow(row);
       return;
     }
     const tr = mergeTimeline?.tracks.find((t) => t.group_id === groupId);
     if (tr) pickTrack(tr.track_id, tr.t0);
   }
 
-  const duration = Math.max(mergeTimeline?.duration_sec ?? 1, 0.001);
   const pairs = mergeTimeline?.pairs ?? [];
   const summary: MergeTimelineSummary = mergeTimeline?.summary ?? {
     method: null,
@@ -827,7 +875,6 @@ export function MergeInspectPanel({
   };
   const nGrouped = mergeTimeline?.tracks.filter((t) => t.group_id != null).length ?? 0;
   const nSolo = soloTracks.length;
-  const playhead = Math.min(100, Math.max(0, (currentSec / duration) * 100));
 
   const allTracksSorted = useMemo(() => {
     if (!mergeTimeline) return [];
@@ -841,8 +888,8 @@ export function MergeInspectPanel({
 
   const filteredTracks = useMemo(() => {
     if (!activeAtFrame) return allTracksSorted;
-    return allTracksSorted.filter((t) => fragmentLive(t, currentSec) && activeAtFrame.has(videoTrackId(t)));
-  }, [allTracksSorted, activeAtFrame, currentSec]);
+    return allTracksSorted.filter((t) => fragmentLive(t, playheadSec) && activeAtFrame.has(videoTrackId(t)));
+  }, [allTracksSorted, activeAtFrame, playheadSec]);
 
   const timelineSections = useMemo(() => {
     const byGroup = new Map<number | "solo", MergeTimelineTrack[]>();
@@ -906,6 +953,32 @@ export function MergeInspectPanel({
     }
     return timelineSections;
   }, [timelineSections, activeRowKey, rows, soloTracks, mergeTimeline]);
+
+  const timelineLanes = useMemo((): TimelineLane<MergeSeg>[] => {
+    return visibleSections.map((section) => ({
+      id: String(section.key),
+      label: section.label,
+      highlight:
+        section.groupId != null
+          ? activeRowKey === `g:${section.groupId}`
+          : Boolean(activeRowKey?.startsWith("solo:")),
+      segments: section.tracks.map((t) => {
+        const selected = selectedFragmentId === t.track_id;
+        const score = section.score != null ? ` · ${formatScore(section.score)}` : "";
+        return {
+          id: String(t.track_id),
+          t0: t.t0,
+          t1: t.t1,
+          color: colorForTrackId(t.track_id),
+          label: selected ? `t${t.track_id}` : undefined,
+          title: `${section.label} t${t.track_id}  ${t.t0.toFixed(1)}–${t.t1.toFixed(1)}s${score}`,
+          selected,
+          dimmed: selectedFragmentId != null && !selected && section.tracks.length > 1,
+          data: { trackId: t.track_id, t0: t.t0 },
+        };
+      }),
+    }));
+  }, [visibleSections, activeRowKey, selectedFragmentId]);
 
   const groupTrackSet = useMemo(() => {
     if (!selectedRow || selectedRow.kind !== "group") return new Set<number>();
@@ -1038,6 +1111,7 @@ export function MergeInspectPanel({
                   <button
                     type="button"
                     className={`merge-inspect-row${isSelected ? " on" : ""}`}
+                    ref={isSelected ? selectedRowBtnRef : undefined}
                     onClick={() => pickRow(row)}
                   >
                     <div className="merge-inspect-row-content">
@@ -1091,143 +1165,75 @@ export function MergeInspectPanel({
 
         {/* Center column */}
         <section className="merge-inspect-center">
-          <div className="merge-inspect-center-toolbar">
-            <label className="toggle sidebar-toggle">
-              <input type="checkbox" checked={atCurrentFrame} onChange={(e) => setAtCurrentFrame(e.target.checked)} />
-              только текущий кадр
-            </label>
-            {activeRowKey && (
-              <button type="button" className="merge-clear-sel" onClick={clearSelection}>
-                сбросить выбор
-              </button>
-            )}
-            {selectedRow?.kind === "group" && chronTracks.length > 1 && (
-              <div className="merge-nav">
-                <button
-                  type="button"
-                  title="Предыдущий фрагмент (стрелка влево)"
-                  onClick={() => {
-                    const idx = selectedFragmentId != null ? chronTracks.findIndex((t) => t.track_id === selectedFragmentId) : 0;
-                    const nextIdx = idx <= 0 ? chronTracks.length - 1 : idx - 1;
-                    const tr = chronTracks[nextIdx];
-                    pickTrack(tr.track_id, tr.t0);
-                  }}
-                >
-                  ← пред
-                </button>
-                <button
-                  type="button"
-                  title="Следующий фрагмент (стрелка вправо)"
-                  onClick={() => {
-                    const idx = selectedFragmentId != null ? chronTracks.findIndex((t) => t.track_id === selectedFragmentId) : -1;
-                    const nextIdx = idx < 0 || idx >= chronTracks.length - 1 ? 0 : idx + 1;
-                    const tr = chronTracks[nextIdx];
-                    pickTrack(tr.track_id, tr.t0);
-                  }}
-                >
-                  след →
-                </button>
-              </div>
-            )}
-          </div>
-
-          {selectedRow?.kind === "group" && (
-            <div className="merge-mini-scale">
-              <span className="merge-mini-label">
-                {entityRefLabel("group", selectedRow.group.group_id)} · {chronTracks.length} фрагм.
-              </span>
-              <div className="merge-mini-lane">
-                {chronTracks.map((t, idx) => {
-                  const left = (t.t0 / duration) * 100;
-                  const width = Math.max(0.5, ((t.t1 - t.t0) / duration) * 100);
-                  return (
+          <PlaybackToolbar
+            clock={clock}
+            bounds={timeBounds}
+            formatCurrent={formatDurationClock}
+            extras={
+              <>
+                <label className="toggle sidebar-toggle">
+                  <input type="checkbox" checked={atCurrentFrame} onChange={(e) => setAtCurrentFrame(e.target.checked)} />
+                  только текущий кадр
+                </label>
+                {activeRowKey && (
+                  <button type="button" className="playhead-btn" onClick={clearSelection}>
+                    сбросить выбор
+                  </button>
+                )}
+                {selectedRow?.kind === "group" && chronTracks.length > 1 && (
+                  <div className="merge-nav">
                     <button
-                      key={t.track_id}
                       type="button"
-                      className={`merge-mini-bar${selectedFragmentId === t.track_id ? " on" : ""}`}
-                      style={{ left: `${left}%`, width: `${width}%`, backgroundColor: colorForTrackId(t.track_id) }}
-                      title={`[${idx + 1}/${chronTracks.length}] ${entityRefLabel("track", t.track_id)} ${t.t0.toFixed(1)}–${t.t1.toFixed(1)}s → tracking t${videoTrackId(t)}`}
-                      onClick={() => pickTrack(t.track_id, t.t0)}
-                    />
-                  );
-                })}
-              </div>
-            </div>
-          )}
-
-          <div className="merge-inspect-axis">
-            <span>0</span>
-            <span>{formatDuration(duration / 2)}</span>
-            <span>{formatDuration(duration)}</span>
-          </div>
-
-          <div className="merge-inspect-timeline" ref={timelineRef}>
-            {visibleSections.length === 0 ? (
-              <p className="merge-inspect-empty">Нет треков по фильтру</p>
-            ) : (
-              visibleSections.map((section) => {
-                const sectionKey = section.groupId != null ? `g:${section.groupId}` : "solo";
-                const sectionSelected = activeRowKey === sectionKey || activeRowKey?.startsWith("solo:");
-                return (
-                  <div
-                    key={String(section.key)}
-                    ref={sectionSelected ? selectedGroupRef : undefined}
-                    className={`merge-inspect-group${sectionSelected ? " on" : ""}`}
-                  >
-                    <div className="merge-inspect-group-head">
-                      <button
-                        type="button"
-                        className="merge-inspect-group-label"
-                        onClick={() => {
-                          if (section.groupId == null) return;
-                          const row = rows.find(
-                            (r) => r.kind === "group" && r.group.group_id === section.groupId,
-                          );
-                          if (row) pickRow(row);
-                        }}
-                      >
-                        <strong>{section.label}</strong>
-                        {section.score != null && <span>{formatScore(section.score)}</span>}
-                        <span>{section.tracks.length} фрагм.</span>
-                      </button>
-                    </div>
-                    {section.tracks.map((t) => {
-                      const left = (t.t0 / duration) * 100;
-                      const width = Math.max(0.4, ((t.t1 - t.t0) / duration) * 100);
-                      const color = colorForTrackId(t.track_id);
-                      const selected = selectedFragmentId === t.track_id;
-                      const live = fragmentLive(t, currentSec);
-                      const gid = t.group_id;
-                      return (
-                        <div
-                          key={t.track_id}
-                          className={`merge-inspect-track-row${selected ? " on" : ""}${live ? " is-live" : ""}`}
-                        >
-                          <MergeEntityRef
-                            kind="track"
-                            id={t.track_id}
-                            variant="timeline"
-                            {...entityRefCommon}
-                          />
-                          <div className="merge-inspect-lane">
-                            <div className="merge-inspect-playhead" style={{ left: `${playhead}%` }} />
-                            <button
-                              ref={selected ? selectedBarRef : undefined}
-                              type="button"
-                              className="merge-inspect-bar"
-                              style={{ left: `${left}%`, width: `${width}%`, backgroundColor: color }}
-                              title={`${entityRefLabel("track", t.track_id)}  ${t.t0.toFixed(1)}–${t.t1.toFixed(1)}s${gid != null ? `  ${entityRefLabel("group", gid)}` : ""}`}
-                              onClick={() => pickTrack(t.track_id, t.t0)}
-                            />
-                          </div>
-                        </div>
-                      );
-                    })}
+                      title="Предыдущий фрагмент (стрелка влево)"
+                      onClick={() => {
+                        const idx = selectedFragmentId != null ? chronTracks.findIndex((t) => t.track_id === selectedFragmentId) : 0;
+                        const nextIdx = idx <= 0 ? chronTracks.length - 1 : idx - 1;
+                        const tr = chronTracks[nextIdx];
+                        pickTrack(tr.track_id, tr.t0);
+                      }}
+                    >
+                      ← пред
+                    </button>
+                    <button
+                      type="button"
+                      title="Следующий фрагмент (стрелка вправо)"
+                      onClick={() => {
+                        const idx = selectedFragmentId != null ? chronTracks.findIndex((t) => t.track_id === selectedFragmentId) : -1;
+                        const nextIdx = idx < 0 || idx >= chronTracks.length - 1 ? 0 : idx + 1;
+                        const tr = chronTracks[nextIdx];
+                        pickTrack(tr.track_id, tr.t0);
+                      }}
+                    >
+                      след →
+                    </button>
                   </div>
-                );
-              })
-            )}
-          </div>
+                )}
+              </>
+            }
+          />
+
+          {visibleSections.length === 0 ? (
+            <p className="merge-inspect-empty">Нет треков по фильтру</p>
+          ) : (
+            <PlayheadTimeline
+              lanes={timelineLanes}
+              bounds={timeBounds}
+              currentSec={playheadSec}
+              zoom={clock.zoom}
+              formatTick={formatDurationClock}
+              onSeek={(sec) => clock.seek(sec)}
+              onScrubbing={clock.setScrubbing}
+              onSelect={(seg) => pickTrack(seg.data.trackId, seg.data.t0)}
+              onLaneClick={(lane) => {
+                if (/^\d+$/.test(lane.id)) {
+                  pickGroup(Number(lane.id));
+                  return;
+                }
+                const first = lane.segments[0];
+                if (first) pickTrack(first.data.trackId, first.data.t0);
+              }}
+            />
+          )}
 
           {selectedRow && (
             <div className="merge-inspect-dossier">
@@ -1239,7 +1245,7 @@ export function MergeInspectPanel({
               <div className="merge-crop-compare">
                 {(selectedRow.kind === "group" ? chronTracks : [selectedRow.track]).map((t, idx) => {
                   const crops = cropPreview(cropUrls[String(t.track_id)] ?? []);
-                  const live = fragmentLive(t, currentSec);
+                  const live = fragmentLive(t, playheadSec);
                   const isCurFrag = selectedFragmentId === t.track_id;
                   return (
                     <div
@@ -1308,7 +1314,7 @@ export function MergeInspectPanel({
                       {selectedGroupPairs.map((p) => {
                         const ta = mergeTimeline.tracks.find((t) => t.track_id === p.a);
                         const tb = mergeTimeline.tracks.find((t) => t.track_id === p.b);
-                        const live = (ta != null && fragmentLive(ta, currentSec)) || (tb != null && fragmentLive(tb, currentSec));
+                        const live = (ta != null && fragmentLive(ta, playheadSec)) || (tb != null && fragmentLive(tb, playheadSec));
                         return (
                         <tr key={`${p.a}-${p.b}`} className={live ? "is-live" : undefined}>
                           <td className="merge-pair-ids">

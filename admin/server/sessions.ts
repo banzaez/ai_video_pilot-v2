@@ -8,7 +8,13 @@ export function discoverSessionsFromVideoDir(): MediaSession[] {
   if (!fs.existsSync(videoDir)) return [];
   const files = fs.readdirSync(videoDir);
   const parts = files
-    .filter((f) => /\.(mp4|webm|mov|mkv)$/i.test(f) && f !== "lite")
+    .filter(
+      (f) =>
+        /\.(mp4|webm|mov|mkv)$/i.test(f) &&
+        f !== "lite" &&
+        !f.startsWith("_") &&
+        !f.startsWith("."),
+    )
     .map((f) => parseProdStem(f.replace(/\.[^.]+$/, "")))
     .filter((p): p is NonNullable<typeof p> => p != null);
   const grouped = groupBySessionKey(parts);
@@ -37,7 +43,7 @@ export function discoverSessionsFromVideoDir(): MediaSession[] {
     const hasJson = fs.existsSync(workFile(key, "tracking.json"));
     sessions.push({
       key,
-      camera: `Camera_${String(group[0]!.camera_index).padStart(2, "0")}`,
+      camera: `Camera_${String(group[0]!.camera_index).padStart(3, "0")}`,
       camera_index: group[0]!.camera_index,
       day: group[0]!.day,
       parts: sessionParts,

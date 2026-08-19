@@ -123,15 +123,25 @@ def parse_camera_pose(raw: dict[str, Any] | None) -> CameraPose | None:
 
 
 def load_camera_doc(cameras_dir: str, camera_key: str) -> dict[str, Any] | None:
-    path = os.path.join(cameras_dir, f"{camera_key}.json")
-    if not os.path.isfile(path):
-        return None
+    candidates = [f"{camera_key}.json"]
     try:
-        with open(path, encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception:
-        return None
-    return data if isinstance(data, dict) else None
+        idx = int(camera_key)
+        candidates.append(f"{idx:03d}.json")
+        candidates.append(f"{idx:02d}.json")
+        candidates.append(f"{idx}.json")
+    except ValueError:
+        pass
+
+    for name in dict.fromkeys(candidates):
+        path = os.path.join(cameras_dir, name)
+        if os.path.isfile(path):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    data = json.load(f)
+                return data if isinstance(data, dict) else None
+            except Exception:
+                continue
+    return None
 
 
 def load_camera_pose(cameras_dir: str, camera_key: str) -> CameraPose | None:

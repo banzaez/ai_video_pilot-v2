@@ -26,7 +26,7 @@ _PROD_STEM = re.compile(
     re.IGNORECASE,
 )
 
-_SESSION_KEY = re.compile(r"^\d{2}_\d{8}$")
+_SESSION_KEY = re.compile(r"^\d{2,3}_\d{8}$")
 _DAY_KEY = re.compile(r"^(\d{8}|\d{4}-\d{2}-\d{2})$")
 
 
@@ -89,7 +89,7 @@ class ParsedPart:
 
 def session_key_from_part(camera_index: int, started_raw: str) -> str:
     day = started_raw[:8]
-    return f"{int(camera_index):02d}_{day}"
+    return f"{int(camera_index):03d}_{day}"
 
 
 def parse_prod_stem(stem: str) -> ParsedPart | None:

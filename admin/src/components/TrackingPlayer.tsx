@@ -1,4 +1,4 @@
-import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from "react";
+import { forwardRef, memo, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from "react";
 import type { TrackingData } from "../types";
 import {
   partAtTime,
@@ -41,13 +41,18 @@ type Props = {
   /** Если true и задан focusTrackIds, не рисовать невыбранные треки вовсе */
   hideUnfocused?: boolean;
   compact?: boolean;
+  /** Восстановить позицию при монтировании (после закрытия окна). */
+  startAtSec?: number;
 };
 
 /** Seek по глобальному времени сессии (с учётом кусков). */
 export type TrackingPlayerHandle = {
   seekToGlobal: (tSec: number, playAfter?: boolean) => void;
   setPlaybackRate: (rate: number) => void;
+  play: () => void;
   pause: () => void;
+  getGlobalSec: () => number | null;
+  paused: () => boolean;
 };
 
 type JogStripProps = {
@@ -302,7 +307,7 @@ function JogStripRuler({ globalSec, durationSec, fps, onSeek }: JogStripProps) {
   );
 }
 
-export const TrackingPlayer = forwardRef<TrackingPlayerHandle, Props>(function TrackingPlayer(
+export const TrackingPlayer = memo(forwardRef<TrackingPlayerHandle, Props>(function TrackingPlayer(
   {
     videoUrl,
     tracking,
@@ -318,6 +323,7 @@ export const TrackingPlayer = forwardRef<TrackingPlayerHandle, Props>(function T
     focusTrackIds = null,
     hideUnfocused = false,
     compact = false,
+    startAtSec = 0,
   },
   ref,
 ) {
@@ -375,9 +381,12 @@ export const TrackingPlayer = forwardRef<TrackingPlayerHandle, Props>(function T
   mergeTimelineRef.current = mergeTimeline;
   const focusTrackIdsRef = useRef<Set<number> | null>(null);
   focusTrackIdsRef.current = focusTrackIds != null ? new Set(focusTrackIds) : null;
+  const sessionPartsRef = useRef(sessionParts);
+  sessionPartsRef.current = sessionParts;
   const onFrameChangeRef = useRef(onFrameChange);
   onFrameChangeRef.current = onFrameChange;
   const lastNotifiedFrame = useRef<number | null>(null);
+  const overlayKey = `${hideUnfocused}|${(focusTrackIds ?? []).join(",")}|${highlightIds.join(",")}`;
 
   useEffect(() => {
     if (lastNotifiedFrame.current === currentFrame) return;
@@ -392,9 +401,12 @@ export const TrackingPlayer = forwardRef<TrackingPlayerHandle, Props>(function T
       const video = videoRef.current;
       if (!video) return;
       const t = Math.max(0, tSec);
+      const sameFrame = 0.5 / Math.max(fps, 1);
       if (!isSession || !sessionParts?.length) {
         setGlobalSec(t);
-        video.currentTime = t;
+        if (Math.abs(video.currentTime - t) > sameFrame) {
+          video.currentTime = t;
+        }
         if (playAfter) video.play().catch(() => {});
         return;
       }
@@ -405,6 +417,10 @@ export const TrackingPlayer = forwardRef<TrackingPlayerHandle, Props>(function T
       activePartRef.current = hit.part;
       setActivePartIdx(partIndexOf(sessionParts, hit.part));
       setGlobalSec(Math.max(0, Math.min(t, durationSec || t)));
+      if (same && Math.abs(video.currentTime - hit.localTime) <= sameFrame) {
+        if (wasPlaying && video.paused) video.play().catch(() => {});
+        return;
+      }
       if (!same) {
         video.src = hit.part.videoUrl;
       }
@@ -434,10 +450,16 @@ export const TrackingPlayer = forwardRef<TrackingPlayerHandle, Props>(function T
     (rate: number) => {
       const video = videoRef.current;
       if (!video || !Number.isFinite(rate) || rate <= 0) return;
-      video.playbackRate = rate;
+      if (video.playbackRate !== rate) video.playbackRate = rate;
     },
     [videoRef],
   );
+
+  const play = useCallback(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    video.play().catch(() => {});
+  }, [videoRef]);
 
   const pause = useCallback(() => {
     const video = videoRef.current;
@@ -445,11 +467,33 @@ export const TrackingPlayer = forwardRef<TrackingPlayerHandle, Props>(function T
     video.pause();
   }, [videoRef]);
 
-  useImperativeHandle(ref, () => ({ seekToGlobal, setPlaybackRate, pause }), [
+  const getGlobalSec = useCallback(() => {
+    const video = videoRef.current;
+    if (!video) return null;
+    if (isSession) {
+      const part = activePartRef.current;
+      if (!part) return video.currentTime;
+      return part.time_offset_sec + video.currentTime;
+    }
+    return video.currentTime;
+  }, [videoRef, isSession]);
+
+  const paused = useCallback(() => {
+    const video = videoRef.current;
+    return !video || video.paused;
+  }, [videoRef]);
+
+  useImperativeHandle(ref, () => ({ seekToGlobal, setPlaybackRate, play, pause, getGlobalSec, paused }), [
     seekToGlobal,
     setPlaybackRate,
+    play,
     pause,
+    getGlobalSec,
+    paused,
   ]);
+
+  const startAtSecRef = useRef(startAtSec);
+  startAtSecRef.current = startAtSec;
 
   const scrubRafRef = useRef<number | null>(null);
   const frameStep = 1 / Math.max(fps, 1);
@@ -481,6 +525,23 @@ export const TrackingPlayer = forwardRef<TrackingPlayerHandle, Props>(function T
 
   const lastSourceKey = useRef<string | null>(null);
   const currentSourceKey = videoUrl || sessionParts?.map((p) => p.name).join(",") || null;
+  const restoredRef = useRef(false);
+
+  useEffect(() => {
+    if (restoredRef.current) return;
+    const t = startAtSecRef.current;
+    if (!t || t <= 0.05) return;
+    const video = videoRef.current;
+    if (!video) return;
+    restoredRef.current = true;
+    const apply = () => seekToGlobal(t, false);
+    if (video.readyState >= 1) {
+      apply();
+      return;
+    }
+    video.addEventListener("loadedmetadata", apply, { once: true });
+    return () => video.removeEventListener("loadedmetadata", apply);
+  }, [videoUrl, currentSourceKey, seekToGlobal, videoRef]);
 
   useEffect(() => {
     trailHistory.current.clear();
@@ -571,7 +632,10 @@ export const TrackingPlayer = forwardRef<TrackingPlayerHandle, Props>(function T
 
     let raf = 0;
     let lastUi = 0;
+    let lastLayoutAt = 0;
+    let layoutDirty = true;
     const MAX_SIDE = 1280;
+    const LAYOUT_MS = 250;
 
     const draw = () => {
       const ctx = canvas.getContext("2d");
@@ -590,8 +654,11 @@ export const TrackingPlayer = forwardRef<TrackingPlayerHandle, Props>(function T
         canvas.height = ch;
       }
 
+      const now = performance.now();
       // object-fit: contain → чёрные поля; canvas должен совпасть с картинкой, не со stage
-      if (stage) {
+      if (stage && (layoutDirty || now - lastLayoutAt >= LAYOUT_MS)) {
+        lastLayoutAt = now;
+        layoutDirty = false;
         const videoRect = video.getBoundingClientRect();
         const stageRect = stage.getBoundingClientRect();
         if (videoRect.width > 0 && videoRect.height > 0) {
@@ -611,24 +678,27 @@ export const TrackingPlayer = forwardRef<TrackingPlayerHandle, Props>(function T
 
       if (!tracking || !keyframes) return;
 
-      const gSec = sessionParts?.length
+      const parts = sessionPartsRef.current;
+      const gSec = parts?.length
         ? (activePartRef.current?.time_offset_sec ?? 0) + video.currentTime
         : video.currentTime;
       const frameFloat = frameAtTime(gSec, tracking.fps, tracking.frame_count);
       const idx = frameIndexAtTime(gSec, tracking.fps, tracking.frame_count);
       const focus = focusTrackIdsRef.current;
+      const highlights = highlightRef.current;
+      const hasFocus = focus != null && focus.size > 0;
+      const hasHighlight = highlights.size > 0;
       const detections = detectionsAtFrame(keyframes, frameFloat, detectEveryN);
-      // Сначала серые (вне фильтра), поверх — треки фильтра
+      const selectedSet = hasFocus ? focus! : hasHighlight ? highlights : null;
       const ordered =
-        focus == null
+        selectedSet == null
           ? detections
           : [
-              ...detections.filter((d) => !focus.has(d.track_id)),
-              ...detections.filter((d) => focus.has(d.track_id)),
+              ...detections.filter((d) => !selectedSet.has(d.track_id)),
+              ...detections.filter((d) => selectedSet.has(d.track_id)),
             ];
-      const count = focus == null ? detections.length : detections.filter((d) => focus.has(d.track_id)).length;
+      const count = selectedSet == null ? detections.length : detections.filter((d) => selectedSet.has(d.track_id)).length;
 
-      const now = performance.now();
       const pushUi = video.paused || video.ended || now - lastUi >= 125;
       if (pushUi) {
         lastUi = now;
@@ -637,7 +707,8 @@ export const TrackingPlayer = forwardRef<TrackingPlayerHandle, Props>(function T
       }
 
       const activeIds = new Set<number>();
-      const DIM = "#6b736c";
+      const DIM = "#9aa0a6";
+      const DIM_ALPHA = 0.38;
       const curSec = video?.currentTime ?? (fps > 0 ? currentFrame / fps : 0);
 
       for (const det of ordered) {
@@ -666,9 +737,12 @@ export const TrackingPlayer = forwardRef<TrackingPlayerHandle, Props>(function T
           }
         }
 
-        const dimmed = focus != null && !focus.has(det.track_id) && !focus.has(fragTrackId);
+        const focused = selectedSet
+          ? selectedSet.has(det.track_id) || selectedSet.has(fragTrackId)
+          : false;
+        const dimmed = selectedSet != null && !focused;
         if (dimmed && hideUnfocusedRef.current) continue;
-        const highlighted = !dimmed && (highlightRef.current.has(det.track_id) || highlightRef.current.has(fragTrackId));
+        const highlighted = focused && (highlights.has(det.track_id) || highlights.has(fragTrackId));
         const color = dimmed ? DIM : colorForTrackId(fragTrackId);
         const bc: [number, number] = [Math.round((x1 + x2) / 2), y2];
 
@@ -683,7 +757,7 @@ export const TrackingPlayer = forwardRef<TrackingPlayerHandle, Props>(function T
           if (hist.length > trailLength) hist.shift();
         }
 
-        ctx.globalAlpha = dimmed ? 0.78 : 1;
+        ctx.globalAlpha = dimmed ? DIM_ALPHA : 1;
         if (highlighted) {
           ctx.strokeStyle = "#ffffff";
           ctx.lineWidth = Math.max(5, Math.round(vw / 240));
@@ -741,6 +815,7 @@ export const TrackingPlayer = forwardRef<TrackingPlayerHandle, Props>(function T
       }
     };
     const kick = () => {
+      layoutDirty = true;
       cancelAnimationFrame(raf);
       draw();
       if (!video.paused && !video.ended) {
@@ -762,7 +837,7 @@ export const TrackingPlayer = forwardRef<TrackingPlayerHandle, Props>(function T
       video.removeEventListener("loadeddata", kick);
       window.removeEventListener("resize", kick);
     };
-  }, [tracking, keyframes, detectEveryN, showLabels, showTrails, trailLength, videoRef, focusTrackIds, sessionParts]);
+  }, [tracking, keyframes, detectEveryN, showLabels, showTrails, trailLength, videoRef, overlayKey]);
 
   type ZoomMode = "all" | "1h" | "10m" | "1m";
   const [zoomMode, setZoomMode] = useState<ZoomMode>("all");
@@ -1112,4 +1187,4 @@ export const TrackingPlayer = forwardRef<TrackingPlayerHandle, Props>(function T
       )}
     </div>
   );
-});
+}));

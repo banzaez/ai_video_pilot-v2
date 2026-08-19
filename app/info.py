@@ -54,11 +54,13 @@ def _fourcc_name(cap: cv2.VideoCapture) -> str | None:
 
 
 def list_video_files(directory: str) -> list[str]:
-    """Видеофайлы в папке, по имени."""
+    """Видеофайлы в папке, по имени (файлы, начинающиеся с '_' или '.', игнорируются)."""
     if not directory or not os.path.isdir(directory):
         return []
     out: list[str] = []
     for name in sorted(os.listdir(directory)):
+        if name.startswith(("_", ".")):
+            continue
         path = os.path.join(directory, name)
         if os.path.isfile(path) and os.path.splitext(name)[1].lower() in VIDEO_EXTS:
             out.append(path)
@@ -110,7 +112,7 @@ def parse_video_name(stem: str) -> dict[str, Any]:
     ended_raw = gd.get("ended")
     if m.re is _PROD_NVR:
         idx_raw = gd.get("camera_index")
-        cam = f"Camera_{int(idx_raw):02d}" if idx_raw else None
+        cam = f"Camera_{int(idx_raw):03d}" if idx_raw else None
         started = _iso_from_nvr(started_raw) if started_raw else None
         ended = _iso_from_nvr(ended_raw) if ended_raw else None
         duration = None
@@ -230,13 +232,13 @@ def resolve_camera_key(
     info: dict[str, Any] | None = None,
     *,
     stem: str | None = None,
-    default: str = "01",
+    default: str = "001",
 ) -> str:
-    """Возвращает ключ камеры в формате 2 цифр ('01', '02')."""
+    """Возвращает ключ камеры в формате 3 цифр ('001', '046') или исходном ключе."""
     meta = camera_meta(info, stem=stem)
     idx = meta.get("camera_index")
     if idx is not None:
-        return f"{int(idx):02d}"
+        return f"{int(idx):03d}"
     return default
 
 

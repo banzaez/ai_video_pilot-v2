@@ -672,11 +672,11 @@ export async function saveCounters(
 
 export function cameraKeyFromVideo(videoName: string, cameraIndex?: number | null): string {
   if (typeof cameraIndex === "number" && Number.isFinite(cameraIndex)) {
-    return String(cameraIndex).padStart(2, "0");
+    return String(cameraIndex).padStart(3, "0");
   }
   const m = /Cam(?:era)?[_-]?(\d+)/i.exec(videoName);
-  if (m) return String(Number(m[1])).padStart(2, "0");
-  return videoName.replace(/\.[^.]+$/, "") || "00";
+  if (m) return String(Number(m[1])).padStart(3, "0");
+  return videoName.replace(/\.[^.]+$/, "") || "000";
 }
 
 export function defaultFloatVideo(aspect = VIDEO_ASPECT): FloatVideoGeom {
