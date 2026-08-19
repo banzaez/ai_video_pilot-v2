@@ -41,7 +41,7 @@ import {
 } from "./utils";
 import { sessionDays, sessionsForDay, formatSessionDay, cameraLabel, sessionLabel, type MediaSession, type SessionPart } from "./session";
 import "./App.css";
-import type { MapCameraMark, MapCalibPoint } from "./components/MapFloorView";
+import type { MapCameraMark, MapCalibPoint, MapLiveMarker } from "./components/MapFloorView";
 import { normalizeBodyCalib } from "./feet";
 import type { CountersDoc } from "./counters";
 import { emptyCountersDoc, normalizeCountersDoc } from "./counters";
@@ -101,6 +101,7 @@ export default function App() {
   const [mapCameras, setMapCameras] = useState<MapCameraMark[]>([]);
   const [allCalibPoints, setAllCalibPoints] = useState<MapCalibPoint[]>([]);
   const [counters, setCounters] = useState<CountersDoc | null>(null);
+  const [dayLiveMarkers, setDayLiveMarkers] = useState<MapLiveMarker[]>([]);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const playerRef = useRef<TrackingPlayerHandle>(null);
@@ -730,6 +731,7 @@ export default function App() {
               onOpenTrackInMerge={(sessionKey, trackId, t0) => {
                 void openTrackInMerge(sessionKey, trackId, t0);
               }}
+              onLiveMarkersChange={setDayLiveMarkers}
             />
           ) : tab === "pipeline" ? (
             <PipelineJobsPanel
@@ -784,7 +786,7 @@ export default function App() {
       )}
       {showMap && (
         <FloatingVideoWindow
-          title={`cam ${cameraKey}`}
+          title={tab === "day" ? (selectedDay ? `День: ${selectedDay}` : "День") : `cam ${cameraKey}`}
           label="Карта"
           geom={floatMap}
           allowMinimize={false}
@@ -806,10 +808,11 @@ export default function App() {
             mergeTimeline={mergeTimeline}
             camerasOnMap={mapCameras}
             allCalibPoints={allCalibPoints}
-            activeCameraKey={cameraKey}
+            activeCameraKey={tab === "day" ? null : cameraKey}
             counters={counters}
             feetDoc={feetDoc}
             compact={false}
+            markers={tab === "day" ? dayLiveMarkers : undefined}
           />
         </FloatingVideoWindow>
       )}

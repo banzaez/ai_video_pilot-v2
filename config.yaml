@@ -98,21 +98,21 @@ tracklet_pipeline:
     # Conf ≥ этого → первый матч. Детекции уже ≥0.35; 0.40 = типичный человек в high, слабые — во второй проход.
     track_high_thresh: 0.40
     # low < conf < high: только продлевают живой трек, новый ID не заводят.
-    track_low_thresh: 0.25
+    track_low_thresh: 0.20
     # Мин. conf нового ID + TAI-NMS. Выше 0.25 (OC-SORT) — меньше дублей вроде #1+#72; 0.70 дефолт TrackTrack режет слабых.
     new_track_thresh: 0.50
     # Шагов помнить lost. 30 (дефолт TT) ≈ 3.6 с при every_n=3 — чужой ID. 12 ≈ 1.4 с: дыры да, длинные окклюзии нет.
-    track_buffer: 12
+    track_buffer: 25
     # COST, не IoU: матч если cost < порога. 0.85 от OC-SORT здесь НАОБОРОТ слабее (склеивает лишнее).
     # Дефолт TT 0.7; 0.55 строже — меньше ID-switch при пересечениях.
-    match_thresh: 0.55
+    match_thresh: 0.60
     # Ослабленный rebind lost. 0 = выкл. Иначе lost легко садится на соседнего человека.
     lost_match_thr: 0.0
     # Веса cost (без ReID cost = HMIoU + conf + угол). Угол чуть выше — не склеивать встречных.
     iou_weight: 0.5
     reid_weight: 0.5
     conf_weight: 0.1
-    angle_weight: 0.08
+    angle_weight: 0.10
     penalty_p: 0.25
     penalty_q: 0.4
     reduce_step: 0.05
@@ -257,4 +257,3 @@ nvr:
   connect_timeout_sec: 30
   read_timeout_search_sec: 120
   read_timeout_download_sec: 900
-

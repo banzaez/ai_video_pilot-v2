@@ -234,8 +234,11 @@ export function MapFloorView({
             ctx.setLineDash([]);
           }
 
-          const srcTag = mk.feetSource && mk.feetSource !== "none" && mk.feetSource !== "bbox" ? `·${mk.feetSource}` : "";
-          const label = `${mk.camera} #${mk.trackId}${srcTag}`;
+          const camId = mk.camera
+            .replace(/^Camera[_-]?0*(\d+).*$/i, "$1")
+            .replace(/^cam[_-]?0*(\d+)$/i, "$1")
+            .replace(/^0+(\d+)$/, "$1");
+          const label = `${camId} #${mk.trackId}`;
           const fontPx = Math.max(11, mw / 52);
           ctx.font = `700 ${fontPx}px "IBM Plex Mono", monospace`;
           const tw = ctx.measureText(label).width;

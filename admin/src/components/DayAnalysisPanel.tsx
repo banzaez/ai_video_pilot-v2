@@ -1,8 +1,21 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { colorForTrackId, fetchTrackingJson, formatDuration } from "../utils";
+import {
+  buildTrackKeyframes,
+  cameraKeyFromVideo,
+  colorForTrackId,
+  detectionsAtFrame,
+  fetchHomography,
+  fetchTrackingJson,
+  formatDuration,
+  frameAtTime,
+  resolveDetectEveryN,
+} from "../utils";
 import { TrackingPlayer, type TrackingPlayerHandle } from "./TrackingPlayer";
 import { sessionDurationSec, type MediaSession } from "../session";
 import type { TrackingData } from "../types";
+import type { HomographyDoc, Mat3 } from "../homography";
+import { resolveFeetOnMap } from "../feetIndex";
+import type { MapLiveMarker } from "./MapFloorView";
 import {
   PlaybackToolbar,
   PlayheadTimeline,
@@ -147,6 +160,7 @@ function sessionCoverage(sess: DayCameraSession): { t0: number; t1: number } | u
 type DaySeg = { personId: number; sessionKey: string; trackId: number; t0: number };
 
 const trackingCache = new Map<string, Record<string, TrackingData>>();
+const homographyCache = new Map<string, Record<string, HomographyDoc>>();
 const EMPTY_FOCUS: number[] = [];
 const EMPTY_GROUP: Record<number, number> = {};
 
@@ -593,15 +607,18 @@ const DayInspector = memo(function DayInspector({
 export function DayAnalysisPanel({
   selectedDay,
   onOpenTrackInMerge,
+  onLiveMarkersChange,
 }: {
   selectedDay: string;
   onOpenTrackInMerge?: OpenTrackInMerge;
+  onLiveMarkersChange?: (markers: MapLiveMarker[]) => void;
 }) {
   const [dayData, setDayData] = useState<DayLinksData | null>(null);
   const [loading, setLoading] = useState(false);
   const [runningSolver, setRunningSolver] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [cameraTracking, setCameraTracking] = useState<Record<string, TrackingData>>({});
+  const [cameraHomographies, setCameraHomographies] = useState<Record<string, HomographyDoc>>({});
 
   const [filterMode, setFilterMode] = useState<FilterMode>("multi_cam");
   const [sortMode, setSortMode] = useState<SortMode>("person_id");
@@ -821,6 +838,33 @@ export function DayAnalysisPanel({
             setCameraTracking(loaded);
           }
         }
+
+        const homoCached = homographyCache.get(selectedDay);
+        if (homoCached) {
+          setCameraHomographies(homoCached);
+        } else if (json.camera_sessions?.length) {
+          const loadedHomos: Record<string, HomographyDoc> = {};
+          await Promise.all(
+            json.camera_sessions.map(async (sess) => {
+              const videoName = sess.parts?.[0]?.name || sess.camera || sess.key;
+              const camKey = cameraKeyFromVideo(videoName, sess.camera_index);
+              try {
+                const doc = await fetchHomography(camKey);
+                if (doc) {
+                  loadedHomos[camKey] = doc;
+                  loadedHomos[sess.camera] = doc;
+                  loadedHomos[sess.key] = doc;
+                }
+              } catch {
+                /* нет homography */
+              }
+            }),
+          );
+          if (!cancelled) {
+            homographyCache.set(selectedDay, loadedHomos);
+            setCameraHomographies(loadedHomos);
+          }
+        }
       } catch (e) {
         if (!cancelled) setError(`Ошибка загрузки дня ${selectedDay}: ${e}`);
       } finally {
@@ -953,6 +997,81 @@ export function DayAnalysisPanel({
       return { id: sess.key, label: sess.camera, highlight, coverage: sessionCoverage(sess), segments };
     });
   }, [cameraSessionsList, timelinePersons, selectedPersonId, selectedPerson]);
+
+  const liveMarkers = useMemo((): MapLiveMarker[] => {
+    if (!dayData?.camera_sessions?.length) return [];
+    const minT = timeBounds.minT;
+    const markers: MapLiveMarker[] = [];
+    const focusIds = selectedPerson ? focusTrackIdsByCamera : null;
+
+    for (const sess of dayData.camera_sessions) {
+      const tracking = cameraTracking[sess.key];
+      if (!tracking) continue;
+      const videoName = sess.parts?.[0]?.name || sess.camera || sess.key;
+      const camKey = cameraKeyFromVideo(videoName, sess.camera_index);
+      const homo =
+        cameraHomographies[sess.camera] ??
+        cameraHomographies[sess.key] ??
+        cameraHomographies[camKey];
+      const H = (homo?.H?.length === 9 ? (homo.H as Mat3) : null) ?? null;
+      if (!H && !homo?.placement) continue;
+
+      const t0Abs = sess.t0_abs ?? minT;
+      const duration = sessionFileDuration(sess);
+      const localSec = currentDaySec - t0Abs;
+      if (localSec < -0.05 || (duration > 0 && localSec > duration + 0.05)) continue;
+
+      const fps = tracking.fps || sess.fps || 25;
+      const frameFloat = frameAtTime(Math.max(0, localSec), fps, tracking.frame_count);
+      const keyframes = buildTrackKeyframes(tracking);
+      const every = resolveDetectEveryN(tracking);
+      const dets = detectionsAtFrame(keyframes, frameFloat, every);
+
+      const sessFocus = focusIds?.[sess.camera];
+
+      for (const det of dets) {
+        const projected = resolveFeetOnMap(det, frameFloat, H, {
+          cameraKey: camKey,
+          homography: homo,
+          trackingSize: [tracking.width, tracking.height],
+          detectEveryN: every,
+        });
+        if (!projected) continue;
+
+        const isFocus = sessFocus != null && sessFocus.includes(det.track_id);
+        const dimmed = selectedPerson != null && !isFocus;
+
+        markers.push({
+          camera: sess.camera,
+          trackId: det.track_id,
+          map: projected.map,
+          live: true,
+          dimmed,
+          feetSource: projected.source,
+          confidence: projected.confidence,
+        });
+      }
+    }
+    return markers;
+  }, [
+    dayData?.camera_sessions,
+    timeBounds.minT,
+    selectedPerson,
+    focusTrackIdsByCamera,
+    cameraTracking,
+    cameraHomographies,
+    currentDaySec,
+  ]);
+
+  useEffect(() => {
+    onLiveMarkersChange?.(liveMarkers);
+  }, [liveMarkers, onLiveMarkersChange]);
+
+  useEffect(() => {
+    return () => {
+      onLiveMarkersChange?.([]);
+    };
+  }, [onLiveMarkersChange]);
 
   const selectPerson = useCallback(
     (person: GlobalPerson) => {
