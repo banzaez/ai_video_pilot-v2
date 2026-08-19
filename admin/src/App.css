@@ -5654,6 +5654,11 @@ body {
   -webkit-user-select: none;
 }
 
+.day-center .playhead-timeline {
+  max-height: none;
+  overflow-y: hidden;
+}
+
 .playhead-timeline-inner,
 .day-timeline-inner {
   --day-gutter: 78px;
