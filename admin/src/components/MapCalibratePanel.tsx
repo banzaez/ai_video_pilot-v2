@@ -371,6 +371,8 @@ export function MapCalibratePanel({
   const [draftSide, setDraftSide] = useState<"image" | "map" | null>(null);
   const [selectedCounterId, setSelectedCounterId] = useState<string | null>(null);
   const [mode, setMode] = useState<Mode>("pairs");
+  const [mainTab, setMainTab] = useState<"calibrate" | "counters">("calibrate");
+  const [activeStep, setActiveStep] = useState<number>(2); // 1: Frame/Floor, 2: Pairs H, 3: 3D Camera, 4: Validation Test
   const [pendingImage, setPendingImage] = useState<Pt | null>(null);
   const [frameUrl, setFrameUrl] = useState<string | null>(null);
   const [frameSize, setFrameSize] = useState<[number, number] | null>(null);
@@ -1739,6 +1741,8 @@ export function MapCalibratePanel({
     rotateMap: (_d: number) => {},
     refreshFrame: () => {},
     captureFromPlayer: () => {},
+    setActiveStep: (_s: number | ((prev: number) => number)) => {},
+    setMainTab: (_t: "calibrate" | "counters" | ((prev: "calibrate" | "counters") => "calibrate" | "counters")) => {},
   });
   keyHandlersRef.current = {
     mode,
@@ -1756,6 +1760,8 @@ export function MapCalibratePanel({
     rotateMap,
     refreshFrame,
     captureFromPlayer,
+    setActiveStep,
+    setMainTab,
   };
 
   useEffect(() => {
@@ -1837,18 +1843,27 @@ export function MapCalibratePanel({
 
       if (e.key === "1") {
         e.preventDefault();
-        switchMode("pairs");
+        h.setMainTab("calibrate");
+        h.setActiveStep(1);
+        setStatus("Раздел 1: Кадр и подложка");
       } else if (e.key === "2") {
         e.preventDefault();
-        switchMode("test");
+        h.setMainTab("calibrate");
+        h.setActiveStep(2);
+        switchMode("pairs");
       } else if (e.key === "3") {
         e.preventDefault();
+        h.setMainTab("calibrate");
+        h.setActiveStep(3);
         switchMode("place");
       } else if (e.key === "4") {
         e.preventDefault();
-        switchMode("count");
+        h.setMainTab("calibrate");
+        h.setActiveStep(4);
+        switchMode("test");
       } else if (e.key === "5") {
         e.preventDefault();
+        h.setMainTab("counters");
         switchMode("draw");
       } else if (key === "r") {
         e.preventDefault();
@@ -2397,9 +2412,6 @@ export function MapCalibratePanel({
     );
   }
 
-  const [mainTab, setMainTab] = useState<"calibrate" | "counters">("calibrate");
-  const [activeStep, setActiveStep] = useState<number>(2); // 1: Frame/Floor, 2: Pairs H, 3: 3D Camera, 4: Validation Test
-
   return (
     <div className="map-calib-v2">
       {/* TOP HEADER */}
@@ -2805,7 +2817,7 @@ export function MapCalibratePanel({
                 >
                   <div className="map-calib-step-num">1</div>
                   <div className="map-calib-section-title">
-                    <strong>Кадр и подложка</strong>
+                    <strong>Кадр и подложка <Kbd>1</Kbd></strong>
                     <small>{useGrid ? "Сетка 0.5 м" : floorplan}</small>
                   </div>
                   <span className="map-calib-step-arrow">{activeStep === 1 ? "▲" : "▼"}</span>
@@ -2884,7 +2896,7 @@ export function MapCalibratePanel({
                 >
                   <div className="map-calib-step-num">2</div>
                   <div className="map-calib-section-title">
-                    <strong>Пары точек H</strong>
+                    <strong>Пары точек H <Kbd>2</Kbd></strong>
                     <small>
                       {doc?.pairs.length ?? 0} пар · клик на кадре → клик на плане
                     </small>
@@ -3009,7 +3021,7 @@ export function MapCalibratePanel({
                 >
                   <div className="map-calib-step-num">3</div>
                   <div className="map-calib-section-title">
-                    <strong>3D-Камера и лучи</strong>
+                    <strong>3D-Камера и лучи <Kbd>3</Kbd></strong>
                     <small>
                       {doc?.placement
                         ? `${doc.placement.height_m?.toFixed(1) ?? "3.0"}м · ${doc.placement.pitch_deg?.toFixed(0) ?? "35"}° · yaw ${doc.placement.yaw_deg.toFixed(0)}°`
@@ -3116,7 +3128,7 @@ export function MapCalibratePanel({
                 >
                   <div className="map-calib-step-num">4</div>
                   <div className="map-calib-section-title">
-                    <strong>Проверка и тест</strong>
+                    <strong>Проверка и тест <Kbd>4</Kbd></strong>
                     <small>
                       {mode === "test"
                         ? testHvsRayGap != null
@@ -3307,8 +3319,8 @@ export function MapCalibratePanel({
       <footer className="map-calib-footer">
         <span className="map-calib-footer-status">{status || "Готов к работе"}</span>
         <span className="map-calib-footer-hotkeys">
-          Горячие клавиши: <Kbd>1</Kbd> Точки · <Kbd>2</Kbd> Тест · <Kbd>3</Kbd> Камера ·{" "}
-          <Kbd>F</Kbd> Кадр из плеера · <Kbd>R</Kbd> Сброс зума · <Kbd>{MOD_KEY}+S</Kbd> Сохранить
+          Горячие клавиши: <Kbd>1</Kbd>..<Kbd>4</Kbd> Разделы · <Kbd>F</Kbd> Кадр · <Kbd>[</Kbd> <Kbd>]</Kbd> Поворот ·{" "}
+          <Kbd>R</Kbd> Сброс · <Kbd>{MOD_KEY}+S</Kbd> Сохранить
         </span>
       </footer>
     </div>
