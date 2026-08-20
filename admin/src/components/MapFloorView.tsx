@@ -396,6 +396,9 @@ export function MapFloorView({
       if (video && !video.paused && !video.ended) raf = requestAnimationFrame(loop);
     };
 
+    const ro = typeof ResizeObserver !== "undefined" ? new ResizeObserver(() => kick()) : null;
+    if (stage) ro?.observe(stage);
+
     img?.addEventListener("load", kick);
     window.addEventListener("resize", kick);
     const video = videoRefProp?.current;
@@ -405,6 +408,7 @@ export function MapFloorView({
     kick();
     return () => {
       cancelAnimationFrame(raf);
+      ro?.disconnect();
       img?.removeEventListener("load", kick);
       window.removeEventListener("resize", kick);
       video?.removeEventListener("play", kick);

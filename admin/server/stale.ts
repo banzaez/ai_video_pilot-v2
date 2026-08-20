@@ -1,6 +1,5 @@
 import fs from "node:fs";
 import path from "node:path";
-import { camerasDir } from "./config.js";
 import { calibFingerprint } from "../src/calibFingerprint.js";
 import { readArtifact, readJsonFile, refMatches, workFile } from "./common.js";
 
@@ -119,21 +118,30 @@ export function dirArtifactStats(dirPath: string): {
   };
 }
 
+import { cameraHomoPath } from "./maps.js";
+
 export function cameraKeyFromWorkDir(base: string): string {
+  const m = /^(\d+)_/.exec(base);
+  if (m) {
+    const num = Number(m[1]);
+    return Number.isFinite(num) ? String(num).padStart(3, "0") : m[1];
+  }
   const info = readJsonFile(workFile(base, "info.json")) as { camera_index?: number } | null;
   if (info?.camera_index != null && Number.isFinite(Number(info.camera_index))) {
-    return String(Number(info.camera_index)).padStart(2, "0");
+    return String(Number(info.camera_index)).padStart(3, "0");
   }
-  const m = /^(\d{2})_/.exec(base);
-  return m?.[1] ?? "01";
+  return "001";
 }
 
 export function liveFeetFingerprint(
   base: string,
-  feetData: { torso_height_m?: number; person_height_m?: number; tracking_size?: number[] } | null,
+  feetData: { camera_key?: string; torso_height_m?: number; person_height_m?: number; tracking_size?: number[] } | null,
 ): string | null {
-  const cam = cameraKeyFromWorkDir(base);
-  const cameraDoc = readJsonFile(path.join(camerasDir, `${cam}.json`)) as Record<string, unknown> | null;
+  const cam =
+    typeof feetData?.camera_key === "string" && feetData.camera_key
+      ? feetData.camera_key
+      : cameraKeyFromWorkDir(base);
+  const cameraDoc = readJsonFile(cameraHomoPath(cam)) as Record<string, unknown> | null;
   const tracking = readJsonFile(workFile(base, "tracking.json")) as { width?: number; height?: number } | null;
   const trackingSize =
     Array.isArray(feetData?.tracking_size) && feetData.tracking_size.length >= 2

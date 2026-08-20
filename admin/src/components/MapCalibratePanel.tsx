@@ -179,10 +179,15 @@ function usePaneSize(ref: React.RefObject<HTMLDivElement | null>, layoutTick: nu
   return size;
 }
 
-/** Масштаб HUD-маркеров: при zoom > 1 точки на экране меньше (удобнее целиться). */
+/** Масштаб HUD-маркеров: сохраняем комфортный читаемый размер при zoom in (не уменьшаем до микроскопического),
+ * а при сильном zoom out (scale < 1) плавно сжимаем, чтобы точки не перекрывали весь план. */
 function markerHudScale(viewScale: number): number {
-  const s = Math.max(0.4, viewScale);
-  return Math.min(1, Math.max(0.35, 1 / Math.sqrt(s)));
+  if (viewScale >= 1) {
+    // При приближении оставляем стабильный читаемый размер 1.0 (при экстремальном 8x можно слегка 0.9)
+    return Math.max(0.9, 1.0 - (viewScale - 1) * 0.015);
+  }
+  // При отдалении (scale < 1) уменьшаем пропорционально, не давая закрывать всю карту
+  return Math.max(0.55, Math.min(1.0, Math.pow(viewScale, 0.6)));
 }
 
 function defaultPlacement(pt: Pt, yaw = 0, fov = DEFAULT_FOV): CameraPlacement {
@@ -885,18 +890,40 @@ export function MapCalibratePanel({
     const onImg = (e: WheelEvent) => {
       e.preventDefault();
       e.stopPropagation();
-      setImgView((v) => ({
-        ...v,
-        scale: Math.min(8, Math.max(0.4, v.scale * (e.deltaY > 0 ? 0.9 : 1.1))),
-      }));
+      if (!imgEl) return;
+      const rect = imgEl.getBoundingClientRect();
+      const ox = e.clientX - rect.left - rect.width / 2;
+      const oy = e.clientY - rect.top - rect.height / 2;
+      const factor = e.deltaY > 0 ? 0.9 : 1.1;
+      setImgView((v) => {
+        const nextScale = Math.min(8, Math.max(0.4, v.scale * factor));
+        const k = nextScale / v.scale;
+        return {
+          ...v,
+          scale: nextScale,
+          tx: ox - (ox - v.tx) * k,
+          ty: oy - (oy - v.ty) * k,
+        };
+      });
     };
     const onMap = (e: WheelEvent) => {
       e.preventDefault();
       e.stopPropagation();
-      setMapView((v) => ({
-        ...v,
-        scale: Math.min(8, Math.max(0.4, v.scale * (e.deltaY > 0 ? 0.9 : 1.1))),
-      }));
+      if (!mapEl) return;
+      const rect = mapEl.getBoundingClientRect();
+      const ox = e.clientX - rect.left - rect.width / 2;
+      const oy = e.clientY - rect.top - rect.height / 2;
+      const factor = e.deltaY > 0 ? 0.9 : 1.1;
+      setMapView((v) => {
+        const nextScale = Math.min(8, Math.max(0.4, v.scale * factor));
+        const k = nextScale / v.scale;
+        return {
+          ...v,
+          scale: nextScale,
+          tx: ox - (ox - v.tx) * k,
+          ty: oy - (oy - v.ty) * k,
+        };
+      });
     };
     imgEl?.addEventListener("wheel", onImg, { passive: false });
     mapEl?.addEventListener("wheel", onMap, { passive: false });
@@ -1040,12 +1067,12 @@ export function MapCalibratePanel({
   }
 
   function onImageClick(e: React.MouseEvent) {
+    if (e.button !== 0 || e.altKey) return;
     if (suppressClickRef.current) {
       suppressClickRef.current = false;
       return;
     }
     if (panRef.current || dragRef.current || placeDragRef.current || counterDragRef.current) return;
-    if (e.altKey) return;
     if (mode === "place") return;
     const wrap = imageWrapRef.current;
     if (!wrap || !frameUrl) {
@@ -1157,12 +1184,12 @@ export function MapCalibratePanel({
   }
 
   function onMapClick(e: React.MouseEvent) {
+    if (e.button !== 0 || e.altKey) return;
     if (suppressClickRef.current) {
       suppressClickRef.current = false;
       return;
     }
     if (panRef.current || dragRef.current || placeDragRef.current || counterDragRef.current) return;
-    if (e.altKey) return;
     if (mode === "place") return; // жест через pointerdown/up
     const wrap = mapWrapRef.current;
     if (!wrap) return;
@@ -1215,7 +1242,7 @@ export function MapCalibratePanel({
   }
 
   function startDragPair(i: number, side: "image" | "map", e: React.PointerEvent) {
-    if (mode !== "pairs") return;
+    if (mode !== "pairs" || e.button !== 0 || e.altKey) return;
     e.stopPropagation();
     e.preventDefault();
     beginHistoryEdit();
@@ -1814,6 +1841,7 @@ export function MapCalibratePanel({
               onMouseEnter={() => setHoverPair(i)}
               onMouseLeave={() => setHoverPair(null)}
               onClick={(e) => {
+                if (e.button !== 0 || e.altKey) return;
                 e.stopPropagation();
                 setSelectedPair(i);
               }}
@@ -1881,6 +1909,7 @@ export function MapCalibratePanel({
               onMouseEnter={() => setHoverPair(i)}
               onMouseLeave={() => setHoverPair(null)}
               onClick={(e) => {
+                if (e.button !== 0 || e.altKey) return;
                 e.stopPropagation();
                 setSelectedPair(i);
               }}
@@ -2016,6 +2045,7 @@ export function MapCalibratePanel({
                 className={`map-calib-counter-poly${hot ? " is-hot" : ""}`}
                 style={{ pointerEvents: "auto", cursor: "pointer", strokeWidth: strokeW * (hot ? 1.4 : 1) }}
                 onClick={(e) => {
+                  if (e.button !== 0 || e.altKey) return;
                   e.stopPropagation();
                   setSelectedCounterId(c.id);
                   setStatus(
