@@ -210,3 +210,66 @@ export function runDayLinkProcess(dayClean: string): Promise<{ success: boolean;
     });
   });
 }
+
+export function runFeetProcess(params: {
+  session?: string;
+  camera?: string;
+  day?: string;
+}): Promise<{ success: boolean; output: string }> {
+  return new Promise((resolve) => {
+    let inputArg = "";
+    if (params.session) {
+      const sess = params.session.trim();
+      inputArg = sess.startsWith("session:") ? sess : `session:${sess}`;
+    } else if (params.day) {
+      const clean = params.day.replace(/-/g, "").trim();
+      inputArg = `day:${clean}`;
+    } else if (params.camera) {
+      const cam = params.camera.trim();
+      const allSessions = discoverSessionsFromVideoDir();
+      const camSessions = allSessions.filter((s) => s.camera === cam || s.key.startsWith(`${cam}_`));
+      if (camSessions.length === 1) {
+        inputArg = `session:${camSessions[0]!.key}`;
+      } else {
+        inputArg = `session:${cam}`;
+      }
+    } else {
+      resolve({ success: false, output: "No session, day, or camera specified" });
+      return;
+    }
+
+    const pythonExe = path.join(projectRoot, "venv", "bin", "python");
+    const args = ["-m", "app.main", "--input", inputArg, "--stage", "feet"];
+
+    const proc = spawn(pythonExe, args, {
+      cwd: projectRoot,
+      env: { ...process.env },
+    });
+
+    let stdout = "";
+    let stderr = "";
+
+    proc.stdout.on("data", (d) => {
+      stdout += String(d);
+    });
+
+    proc.stderr.on("data", (d) => {
+      stderr += String(d);
+    });
+
+    proc.on("close", (code) => {
+      resolve({
+        success: code === 0,
+        output: (stdout + "\n" + stderr).trim(),
+      });
+    });
+
+    proc.on("error", (err) => {
+      resolve({
+        success: false,
+        output: String(err),
+      });
+    });
+  });
+}
+

@@ -19,7 +19,7 @@ import { cropUrlsFor, findTrackletBbox, videoLocalFrame } from "./crops.js";
 import { hitsByTrack, mergeHitsFor, mergeTimelineFor, similarFromTrackletLinks } from "./merges.js";
 import { cameraHomoPath, mapsConfig } from "./maps.js";
 import { discoverSessionsFromVideoDir } from "./sessions.js";
-import { discoverDays, getDayLinksMeta, runDayLinkProcess } from "./day.js";
+import { discoverDays, getDayLinksMeta, runDayLinkProcess, runFeetProcess } from "./day.js";
 
 // Re-exports for backwards compatibility
 export { readArtifact, refMatches, readJsonFile, workFile };
@@ -27,7 +27,7 @@ export { staleStagesReport } from "./stale.js";
 export { faceGalleryFor, cameraLinkFor } from "./faces.js";
 export { cropUrlsFor } from "./crops.js";
 export { mergeHitsFor, mergeTimelineFor, similarFromTrackletLinks } from "./merges.js";
-export { discoverDays, getDayLinksMeta, runDayLinkProcess } from "./day.js";
+export { discoverDays, getDayLinksMeta, runDayLinkProcess, runFeetProcess } from "./day.js";
 
 export function mediaLibraryPlugin(): Plugin {
   return {
@@ -82,6 +82,30 @@ export function mediaLibraryPlugin(): Plugin {
               return;
             }
             const result = await runDayLinkProcess(body.day);
+            res.setHeader("Content-Type", "application/json");
+            res.end(JSON.stringify(result));
+          } catch (err) {
+            res.statusCode = 500;
+            res.end(JSON.stringify({ error: String(err) }));
+          }
+          return;
+        }
+
+        if (url.startsWith("/api/feet/run")) {
+          if (req.method !== "POST") {
+            res.statusCode = 405;
+            res.end(JSON.stringify({ error: "Method not allowed" }));
+            return;
+          }
+          try {
+            const raw = await readRequestBody(req);
+            const body = JSON.parse(raw || "{}") as { session?: string; camera?: string; day?: string };
+            if (!body.session && !body.camera && !body.day) {
+              res.statusCode = 400;
+              res.end(JSON.stringify({ error: "Missing { session, camera, or day } in request body" }));
+              return;
+            }
+            const result = await runFeetProcess(body);
             res.setHeader("Content-Type", "application/json");
             res.end(JSON.stringify(result));
           } catch (err) {

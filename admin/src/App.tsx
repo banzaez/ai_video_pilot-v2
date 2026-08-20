@@ -485,6 +485,18 @@ export default function App() {
     }
   }
 
+  const reloadFeetDoc = useCallback(async () => {
+    const item = sessions.find((i) => i.key === librarySession);
+    if (item?.jsonUrl) {
+      try {
+        const feet = await fetchFeetJson(`${feetJsonUrl(item.jsonUrl)}?t=${Date.now()}`);
+        setFeetDoc(feet);
+      } catch {
+        /* ignore */
+      }
+    }
+  }, [sessions, librarySession]);
+
   async function onLibraryChange(key: string) {
     const item = sessions.find((i) => i.key === key);
     if (!item) return;
@@ -741,6 +753,7 @@ export default function App() {
           ) : (
             <MapCalibratePanel
               videoName={videoName || librarySession}
+              sessionKey={librarySession}
               videoUrl={videoUrl}
               cameraIndex={videoInfo?.parsed?.camera_index}
               imageSize={imageSize}
@@ -749,6 +762,7 @@ export default function App() {
               onFloorplanChange={setFloorplanUrl}
               onCountersChange={setCounters}
               onDirtyChange={setMapDirty}
+              onFeetReload={reloadFeetDoc}
             />
           )}
         </main>

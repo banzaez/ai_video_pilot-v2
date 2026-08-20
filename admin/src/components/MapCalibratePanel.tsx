@@ -63,6 +63,7 @@ import {
   fetchCounters,
   fetchHomography,
   fetchMapsConfig,
+  runFeetApi,
   saveCounters,
   saveHomography,
   type MapsConfig,
@@ -70,6 +71,7 @@ import {
 
 type Props = {
   videoName: string;
+  sessionKey?: string;
   videoUrl?: string | null;
   cameraIndex?: number | null;
   imageSize: [number, number] | null;
@@ -79,6 +81,7 @@ type Props = {
   onCountersChange?: (doc: CountersDoc | null) => void;
   /** Есть несохранённые изменения (H и/или прилавки) — для confirm ухода с вкладки */
   onDirtyChange?: (dirty: boolean) => void;
+  onFeetReload?: () => Promise<void> | void;
 };
 
 type Mode = "pairs" | "test" | "place" | "count" | "draw";
@@ -339,6 +342,7 @@ function docFingerprint(d: HomographyDoc): string {
 
 export function MapCalibratePanel({
   videoName,
+  sessionKey,
   videoUrl = null,
   cameraIndex,
   imageSize,
@@ -347,6 +351,7 @@ export function MapCalibratePanel({
   onFloorplanChange,
   onCountersChange,
   onDirtyChange,
+  onFeetReload,
 }: Props) {
   const cameraKey = useMemo(
     () => cameraKeyFromVideo(videoName, cameraIndex),
@@ -357,6 +362,7 @@ export function MapCalibratePanel({
   const [floorplan, setFloorplan] = useState(GRID_FLOORPLAN);
   const [error, setError] = useState<string | null>(null);
   const [status, setStatus] = useState<string | null>(null);
+  const [isRecalculatingFeet, setIsRecalculatingFeet] = useState(false);
   const [dirty, setDirty] = useState(false);
   const savedFpRef = useRef<string>("");
   const [counters, setCounters] = useState<CountersDoc>(() => emptyCountersDoc());
@@ -1499,6 +1505,25 @@ export function MapCalibratePanel({
     if (dirtyRef.current) await persist();
   }
 
+  async function triggerFeetRecalc() {
+    setIsRecalculatingFeet(true);
+    setStatus("Запущен пересчёт stage feet через API...");
+    try {
+      const targetSession = sessionKey || videoName;
+      const res = await runFeetApi({ session: targetSession, camera: cameraKey });
+      if (res.success) {
+        setStatus(`Калибровка сохранена · stage feet успешно пересчитан через API (${new Date().toLocaleTimeString()})`);
+        await onFeetReload?.();
+      } else {
+        setStatus(`Калибровка сохранена · ошибка API feet: ${res.error || res.output || "неизвестно"}`);
+      }
+    } catch (err) {
+      setStatus(`Калибровка сохранена · сбой запроса API: ${String(err)}`);
+    } finally {
+      setIsRecalculatingFeet(false);
+    }
+  }
+
   async function persist() {
     if (!docRef.current) return;
     try {
@@ -1508,7 +1533,6 @@ export function MapCalibratePanel({
       setDoc(saved);
       onHomoRef.current?.(saved);
       markClean(saved);
-      setStatus(`Сохранено data/maps/cameras/${cameraKey}.json · точки ног устарели — python -m app.main --stage feet`);
       setError(null);
       // обновить статусы камер в полоске
       try {
@@ -1517,6 +1541,7 @@ export function MapCalibratePanel({
       } catch {
         /* ignore */
       }
+      await triggerFeetRecalc();
     } catch (e) {
       setError(e instanceof Error ? e.message : "Ошибка сохранения");
     }
@@ -2718,10 +2743,18 @@ export function MapCalibratePanel({
               className={`primary${dirty || countersDirty ? " needs-save" : ""}`}
               title={`${MOD_KEY}+S`}
               onClick={() => void persistAll()}
-              disabled={!doc && !countersDirty}
+              disabled={(!doc && !countersDirty) || isRecalculatingFeet}
             >
-              {dirty || countersDirty ? "Сохранить *" : "Сохранить"}
+              {isRecalculatingFeet ? "Сохранение..." : dirty || countersDirty ? "Сохранить *" : "Сохранить"}
               <Kbd>{MOD_KEY}+S</Kbd>
+            </button>
+            <button
+              type="button"
+              onClick={() => void triggerFeetRecalc()}
+              disabled={isRecalculatingFeet}
+              title="Пересчитать stage feet на бэкенде через API"
+            >
+              {isRecalculatingFeet ? "Пересчёт..." : "⚡ Feet API"}
             </button>
             <button type="button" onClick={exportJson} disabled={!doc}>
               Export

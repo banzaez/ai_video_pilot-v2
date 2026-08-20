@@ -402,6 +402,24 @@ export async function fetchFeetJson(url: string): Promise<import("./types").Feet
   }
 }
 
+export async function runFeetApi(params: {
+  session?: string;
+  camera?: string;
+  day?: string;
+}): Promise<{ success: boolean; output?: string; error?: string }> {
+  const res = await fetch("/api/feet/run", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(params),
+  });
+  if (!res.ok) {
+    const txt = await res.text();
+    return { success: false, error: txt || `HTTP ${res.status}` };
+  }
+  return (await res.json()) as { success: boolean; output?: string; error?: string };
+}
+
+
 export async function fetchMediaLibrary(): Promise<MediaItem[]> {
   const res = await fetch("/api/media/list");
   if (!res.ok) throw new Error("Не удалось получить список видео");
