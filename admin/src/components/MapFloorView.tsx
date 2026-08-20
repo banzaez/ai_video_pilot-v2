@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import type { FeetDoc, TrackingData } from "../types";
 import {
-  colorForCameraKey,
   drawCameraPlacement,
   normalizePlacement,
   type CameraPlacement,
@@ -749,41 +748,6 @@ export function MapFloorView({
         </div>
       </div>
 
-      {showCameras && (camerasOnMap.length > 0 || homography?.camera_key || markers.length > 0) && (
-        <div className="map-floor-cam-legend" onPointerDown={(e) => e.stopPropagation()}>
-          <span className="map-floor-cam-legend-title">Камеры:</span>
-          {Array.from(
-            new Set([
-              ...camerasOnMap.map((c) => c.key),
-              ...(homography?.camera_key ? [homography.camera_key] : []),
-              ...(activeCameraKey ? [activeCameraKey] : []),
-              ...markers.map((m) =>
-                m.camera
-                  .replace(/^Camera[_-]?0*(\d+).*$/i, "$1")
-                  .replace(/^cam[_-]?0*(\d+)$/i, "$1")
-                  .replace(/^0+(\d+)$/, "$1")
-                  .padStart(3, "0"),
-              ),
-            ]),
-          )
-            .filter(Boolean)
-            .sort()
-            .map((k) => {
-              const color = colorForCameraKey(k);
-              const isActive = k === activeCameraKey || k === homography?.camera_key;
-              return (
-                <span
-                  key={k}
-                  className={`map-floor-cam-legend-item${isActive ? " is-active" : ""}`}
-                  title={`Камера ${k}`}
-                >
-                  <span className="map-floor-cam-dot" style={{ background: color }} />
-                  <span>cam {k}</span>
-                </span>
-              );
-            })}
-        </div>
-      )}
 
       {!markers.length && !homography?.H && !hasAnyCam && (
         <p className="map-floor-hint">Нет гомографии — откройте вкладку «Карта» и задайте ≥4 точки на сетке</p>

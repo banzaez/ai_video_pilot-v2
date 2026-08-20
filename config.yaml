@@ -117,7 +117,7 @@ tracklet_pipeline:
     # Мин. conf нового ID + TAI-NMS. Выше 0.25 (OC-SORT) — меньше дублей вроде #1+#72; 0.70 дефолт TrackTrack режет слабых.
     new_track_thresh: 0.35
     # Шагов помнить lost. 30 (дефолт TT) ≈ 3.6 с при every_n=3 — чужой ID. 12 ≈ 1.4 с: дыры да, длинные окклюзии нет.
-    track_buffer: 6
+    track_buffer: 30
     # COST, не IoU: матч если cost < порога. 0.85 от OC-SORT здесь НАОБОРОТ слабее (склеивает лишнее).
     # Дефолт TT 0.7; 0.55 строже — меньше ID-switch при пересечениях.
     match_thresh: 0.45
@@ -126,7 +126,7 @@ tracklet_pipeline:
     # --- Веса многофакторной матрицы стоимости (Cost Matrix) ---
     # cost = iou_weight·HMIoU + reid_weight·Cosine(ReID) + conf_weight·Δconf + angle_weight·Δangle
     # Вес пространственного расстояния (IoU / HMIoU). При активном ReID обычно 0.50
-    iou_weight: 0.45
+    iou_weight: 0.40
     # Вес расстояния по внешности (ReID). Влияние сходства эмбеддингов людей при матче (0.20-0.35)
     reid_weight: 0.35
     # Вес разницы в confidence детекций (0.05-0.15)
