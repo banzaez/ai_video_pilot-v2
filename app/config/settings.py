@@ -158,24 +158,21 @@ class Settings:
     day_link_enabled: bool = True
     day_link_top_k: int = 0
     day_link_save_crops: bool = True
-    day_link_min_reid_score: float = 0.85
     day_link_max_gap_sec: float = 300.0
-    day_link_max_overlap_sec: float = 20.0
-    day_link_max_spatial_px: float = 0.0
-    day_link_max_spatial_m: float = 4.0
-    day_link_motion_sigma_px: float = 180.0
-    day_link_motion_sigma_m: float = 3.0
-    day_link_size_log_scale: float = 0.45
-    day_link_w_reid: float = 0.65
-    day_link_w_motion: float = 0.20
-    day_link_w_size: float = 0.0
-    day_link_w_gap: float = 0.15
-    day_link_pass1_min_reid: float = 0.94
-    day_link_pass1_min_score: float = 0.85
-    day_link_pass2_min_score: float = 0.80
-    day_link_pass4_max_overlap_sec: float = 20.0
-    day_link_pass4_min_reid: float = 0.90
-    day_link_pass4_min_score: float = 0.70
+
+    # Pass 0: Alone Geo (совпадение на 2D-карте + изоляция на всех камерах)
+    day_link_pass0_enabled: bool = True
+    day_link_pass0_radius_m: float = 2.0
+    day_link_pass0_min_overlap_sec: float = 5.0
+    day_link_pass0_max_gap_sec: float = 10.0
+    day_link_pass0_max_dist_m: float = 3.0
+    day_link_pass0_max_speed_mps: float = 2.5
+    day_link_pass0_min_reid: float = 0.90
+
+    # Pass 1: Strict ReID (ReID >= 0.96)
+    day_link_pass1_enabled: bool = True
+    day_link_pass1_min_reid: float = 0.96
+    day_link_pass1_max_gap_sec: float = 300.0
 
     input_path: str = "data/video"
     json_output_dir: str | None = "data/results"

@@ -136,7 +136,7 @@ export interface DaySummaryItem {
   stats?: DayLinksData["stats"];
 }
 
-type FilterMode = "all" | "multi_cam" | "pass1" | "pass2" | "pass4" | "solo";
+type FilterMode = "all" | "multi_cam" | "pass0" | "pass1" | "solo";
 type SortMode = "person_id" | "tracks" | "span" | "time";
 type RightTab = "edges" | "tracks" | "inspector";
 type DayCameraSession = MediaSession & { t0_abs?: number };
@@ -278,14 +278,11 @@ const DayPersonList = memo(function DayPersonList({
         <button type="button" className={filterMode === "multi_cam" ? "on" : ""} onClick={() => onFilter("multi_cam")}>
           Мультикам ({counts.multi})
         </button>
+        <button type="button" className={filterMode === "pass0" ? "on" : ""} onClick={() => onFilter("pass0")}>
+          Pass 0
+        </button>
         <button type="button" className={filterMode === "pass1" ? "on" : ""} onClick={() => onFilter("pass1")}>
           Pass 1
-        </button>
-        <button type="button" className={filterMode === "pass2" ? "on" : ""} onClick={() => onFilter("pass2")}>
-          Pass 2
-        </button>
-        <button type="button" className={filterMode === "pass4" ? "on" : ""} onClick={() => onFilter("pass4")}>
-          Pass 4
         </button>
         <button type="button" className={filterMode === "solo" ? "on" : ""} onClick={() => onFilter("solo")}>
           Соло ({counts.solo})
@@ -945,7 +942,7 @@ export function DayAnalysisPanel({
     let list = dayData.persons.filter((p) => {
       if (filterMode === "multi_cam" && p.n_cameras < 2) return false;
       if (filterMode === "solo" && (p.n_cameras > 1 || p.n_tracks > 1)) return false;
-      if (filterMode === "pass1" || filterMode === "pass2" || filterMode === "pass4") {
+      if (filterMode === "pass0" || filterMode === "pass1") {
         const passN = Number(filterMode.slice(4));
         const uids = new Set(p.tracks.map((t) => t.uid));
         if (!dayData.edges.some((e) => e.pass === passN && uids.has(e.from) && uids.has(e.to))) return false;
@@ -1143,9 +1140,8 @@ export function DayAnalysisPanel({
               <span>
                 Склейки <b>{stats.n_merges_total ?? 0}</b>
               </span>
+              <span className="pass-pill pass0">P0 {stats.pass0_merges ?? 0}</span>
               <span className="pass-pill pass1">P1 {stats.pass1_merges ?? 0}</span>
-              <span className="pass-pill pass2">P2 {stats.pass2_merges ?? 0}</span>
-              <span className="pass-pill pass4">P4 {stats.pass4_merges ?? 0}</span>
             </>
           )}
         </div>

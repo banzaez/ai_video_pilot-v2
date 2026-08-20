@@ -202,30 +202,23 @@ tracker_filters:
   # Мин. длина трека в секундах (последний−первый кадр). Короче — выкинуть
   min_track_sec: 0
 
-# --- Stage day_link: глобальная межкамерная склейка дня (Pass 1→2→4, без лиц) ---
-# С разных камер персона может быть одновременно: overlap по времени не режет пару.
-# На одной камере пересечение треков по-прежнему запрещено.
+# --- Stage day_link: глобальная межкамерная склейка дня (Pass 0: Alone Geo, Pass 1: ReID >= 0.96) ---
 day_link:
   enabled: true
   candidates:
     max_gap_sec: 300
-    min_reid_score: 0.90
-    max_spatial_m: 4.0
-    motion_sigma_m: 3.0
-  combo:
-    w_reid: 0.65
-    w_motion: 0.20
-    w_size: 0.0
-    w_gap: 0.15
-  pass1:
-    min_reid: 0.94
-    min_score: 0.85
-  pass2:
-    min_score: 0.90
-  pass4:
-    max_overlap_sec: 20
+  pass0:
+    enabled: true
+    radius_m: 2.0
+    min_overlap_sec: 5.0
+    max_gap_sec: 10.0
+    max_dist_m: 3.0
+    max_speed_mps: 2.5
     min_reid: 0.90
-    min_score: 0.70
+  pass1:
+    enabled: true
+    min_reid: 0.96
+    max_gap_sec: 300.0
 
 nvr:
   enabled: true

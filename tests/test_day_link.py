@@ -1,4 +1,4 @@
-"""Тесты для глобальной стадии межкамерной склейки дня (stage_day_link, без лиц)."""
+"""Тесты для глобальной стадии межкамерной склейки дня (stage_day_link: Pass 0 Alone Geo, Pass 1 ReID)."""
 
 from __future__ import annotations
 
@@ -40,7 +40,7 @@ def _node(
         "camera_index": camera_index,
         "track_id": track_id,
         "f0": 0,
-        "f1": 1,
+        "f1": int(round((t1 - t0) * 25)),
         "t0": t0,
         "t1": t1,
         "duration_sec": t1 - t0,
@@ -55,7 +55,7 @@ def _node(
         "h": 180.0,
         "w": 80.0,
         "avg_speed_mps": 0.2,
-        "n_frames": 10,
+        "n_frames": max(1, int(round((t1 - t0) * 25))),
         "reid_embs": reid,
         "has_reid": reid is not None,
         "crops": ["g_0001_k0_f1.jpg"] if reid is not None else [],
@@ -65,29 +65,60 @@ def _node(
 
 def _settings(**overrides) -> Settings:
     s = Settings()
-    s.day_link_pass1_min_score = 0.70
-    s.day_link_pass1_min_reid = 0.85
-    s.day_link_pass2_min_score = 0.95
-    s.day_link_pass4_min_score = 0.70
-    s.day_link_pass4_min_reid = 0.0
-    s.day_link_max_overlap_sec = 20.0
-    s.day_link_pass4_max_overlap_sec = 20.0
-    s.day_link_min_reid_score = 0.85
-    s.day_link_max_spatial_m = 4.0
-    s.day_link_max_spatial_px = 0.0
-    s.day_link_motion_sigma_m = 3.0
-    s.day_link_w_reid = 0.65
-    s.day_link_w_motion = 0.20
-    s.day_link_w_size = 0.0
-    s.day_link_w_gap = 0.15
+    s.day_link_enabled = True
     s.day_link_max_gap_sec = 300.0
+    s.day_link_pass0_enabled = True
+    s.day_link_pass0_radius_m = 2.0
+    s.day_link_pass0_min_overlap_sec = 5.0
+    s.day_link_pass0_max_gap_sec = 10.0
+    s.day_link_pass0_max_dist_m = 3.0
+    s.day_link_pass0_max_speed_mps = 2.5
+    s.day_link_pass0_min_reid = 0.90
+    s.day_link_pass1_enabled = True
+    s.day_link_pass1_min_reid = 0.96
+    s.day_link_pass1_max_gap_sec = 300.0
     for k, v in overrides.items():
         setattr(s, k, v)
     return s
 
 
 class TestDayLink(unittest.TestCase):
-    def test_link_day_tracks_cross_camera(self):
+    def test_pass0_simultaneous_overlap_linked(self):
+        """Две камеры видят человека одновременно в одном месте карты >= 5с при ReID >= 0.90 -> Pass 0."""
+        reid = _emb([1.0, 0.0, 0.0, 0.0])
+        nodes = [
+            _node(
+                "01_20260401#1",
+                camera="Camera_01",
+                camera_index=1,
+                track_id=1,
+                t0=10.0,
+                t1=20.0,
+                p0=[2000.0, 2000.0],
+                p1=[2050.0, 2000.0],
+                reid=reid,
+            ),
+            _node(
+                "02_20260401#1",
+                camera="Camera_02",
+                camera_index=2,
+                track_id=1,
+                t0=12.0,
+                t1=19.0,
+                p0=[2020.0, 2000.0],
+                p1=[2060.0, 2000.0],
+                reid=reid,
+            ),
+        ]
+        result = link_day_tracks(nodes, _settings())
+        self.assertEqual(result["n_persons"], 1)
+        self.assertEqual(result["stats"]["pass0_merges"], 1)
+        self.assertEqual(result["stats"]["pass1_merges"], 0)
+        self.assertEqual(result["edges"][0]["pass"], 0)
+        self.assertIn("Pass 0 (Alone Geo)", result["edges"][0]["reason"])
+
+    def test_pass0_sequential_gap_linked(self):
+        """Последовательный переход между камерами с зазором <= 10с и ReID >= 0.90 -> Pass 0."""
         reid = _emb([1.0, 0.0, 0.0, 0.0])
         nodes = [
             _node(
@@ -106,24 +137,22 @@ class TestDayLink(unittest.TestCase):
                 camera="Camera_02",
                 camera_index=2,
                 track_id=1,
-                t0=25.0,
-                t1=40.0,
-                p0=[2160.0, 2000.0],
-                p1=[2400.0, 2000.0],
+                t0=24.0,
+                t1=35.0,
+                p0=[2160.0, 2000.0],  # 160 px = 1 метр
+                p1=[2300.0, 2000.0],
                 reid=reid,
             ),
         ]
         result = link_day_tracks(nodes, _settings())
-        self.assertEqual(result["stats"]["n_tracks_total"], 2)
         self.assertEqual(result["n_persons"], 1)
-        self.assertEqual(result["stats"]["n_multi_cam_persons"], 1)
-        self.assertEqual(len(result["edges"]), 1)
-        self.assertIn(result["edges"][0]["pass"], (1, 2))
-        self.assertIsNotNone(result["edges"][0].get("reid"))
-        self.assertNotIn("face", result["edges"][0])
+        self.assertEqual(result["stats"]["pass0_merges"], 1)
+        self.assertEqual(result["edges"][0]["pass"], 0)
 
-    def test_cross_camera_simultaneous_overlap(self):
-        reid = _emb([1.0, 0.0, 0.0, 0.0])
+    def test_pass0_rejected_when_other_person_nearby(self):
+        """Pass 0 отклоняется, если рядом (в радиусе 2м) на карте находится посторонний человек."""
+        reid_a = _emb([1.0, 0.0, 0.0, 0.0])
+        reid_other = _emb([0.0, 0.0, 1.0, 0.0])
         nodes = [
             _node(
                 "01_20260401#1",
@@ -131,10 +160,10 @@ class TestDayLink(unittest.TestCase):
                 camera_index=1,
                 track_id=1,
                 t0=10.0,
-                t1=50.0,
+                t1=20.0,
                 p0=[2000.0, 2000.0],
-                p1=[2100.0, 2000.0],
-                reid=reid,
+                p1=[2000.0, 2000.0],
+                reid=reid_a,
             ),
             _node(
                 "02_20260401#1",
@@ -142,30 +171,31 @@ class TestDayLink(unittest.TestCase):
                 camera_index=2,
                 track_id=1,
                 t0=12.0,
-                t1=48.0,
-                p0=[2160.0, 2000.0],
-                p1=[2200.0, 2000.0],
-                reid=reid,
+                t1=18.0,
+                p0=[2000.0, 2000.0],
+                p1=[2000.0, 2000.0],
+                reid=reid_a,
             ),
+            # Посторонний человек на 3-й камере в той же точке карты
             _node(
-                "03_20260401#1",
+                "03_20260401#9",
                 camera="Camera_03",
                 camera_index=3,
-                track_id=1,
-                t0=10.0,
-                t1=50.0,
-                p0=[1900.0, 2000.0],
+                track_id=9,
+                t0=11.0,
+                t1=19.0,
+                p0=[2050.0, 2000.0],  # 50px = 0.3м < 2.0м
                 p1=[2050.0, 2000.0],
-                reid=reid,
+                reid=reid_other,
             ),
         ]
-        result = link_day_tracks(nodes, _settings())
-        self.assertEqual(result["n_persons"], 1)
-        self.assertEqual(result["stats"]["n_multi_cam_persons"], 1)
-        self.assertEqual(result["persons"][0]["n_cameras"], 3)
+        # Так как ReID_A == 1.0 >= 0.96, Pass 0 отклонится из-за соседа, но Pass 1 склеит по высокому ReID
+        result = link_day_tracks(nodes, _settings(day_link_pass1_min_reid=0.99))  # чтобы Pass 1 не склеил
+        # Без Pass 1 склейки не будет
+        self.assertEqual(result["stats"]["pass0_merges"], 0)
 
-    def test_same_camera_overlap_not_merged(self):
-        reid = _emb([1.0, 0.0, 0.0, 0.0])
+    def test_pass0_rejected_low_reid(self):
+        """Pass 0 отклоняется, если ReID < 0.90."""
         nodes = [
             _node(
                 "01_20260401#1",
@@ -173,111 +203,30 @@ class TestDayLink(unittest.TestCase):
                 camera_index=1,
                 track_id=1,
                 t0=10.0,
-                t1=30.0,
-                p0=[1800.0, 2000.0],
+                t1=20.0,
+                p0=[2000.0, 2000.0],
                 p1=[2000.0, 2000.0],
-                reid=reid,
+                reid=_emb([1.0, 0.0, 0.0, 0.0]),
             ),
             _node(
                 "02_20260401#1",
                 camera="Camera_02",
                 camera_index=2,
                 track_id=1,
-                t0=35.0,
-                t1=50.0,
-                p0=[2160.0, 2000.0],
-                p1=[2400.0, 2000.0],
-                reid=reid,
-            ),
-            _node(
-                "01_20260401#2",
-                camera="Camera_01",
-                camera_index=1,
-                track_id=2,
                 t0=12.0,
-                t1=28.0,
-                p0=[1900.0, 2100.0],
-                p1=[2100.0, 2100.0],
-                reid=reid,
+                t1=18.0,
+                p0=[2000.0, 2000.0],
+                p1=[2000.0, 2000.0],
+                reid=_emb([0.0, 1.0, 0.0, 0.0]),  # ReID = 0.0
             ),
         ]
         result = link_day_tracks(nodes, _settings())
         self.assertEqual(result["n_persons"], 2)
-        cams_of_multi = [p for p in result["persons"] if p["n_tracks"] > 1]
-        self.assertTrue(cams_of_multi)
-        for person in result["persons"]:
-            by_cam: dict[str, list[tuple[float, float]]] = {}
-            for tr in person["tracks"]:
-                by_cam.setdefault(tr["camera"], []).append((tr["t0"], tr["t1"]))
-            for spans in by_cam.values():
-                spans.sort()
-                for i in range(len(spans) - 1):
-                    self.assertLessEqual(spans[i][1], spans[i + 1][0] + 1e-6)
+        self.assertEqual(result["edges"], [])
 
-    def test_pass4_handover_overlap(self):
-        reid = _emb([0.0, 1.0, 0.0, 0.0])
-        nodes = [
-            _node(
-                "01_20260401#1",
-                camera="Camera_01",
-                camera_index=1,
-                track_id=1,
-                t0=10.0,
-                t1=30.0,
-                p0=[2000.0, 2000.0],
-                p1=[2100.0, 2000.0],
-                reid=reid,
-            ),
-            _node(
-                "02_20260401#1",
-                camera="Camera_02",
-                camera_index=2,
-                track_id=1,
-                t0=25.0,
-                t1=45.0,
-                p0=[2200.0, 2000.0],
-                p1=[2300.0, 2000.0],
-                reid=reid,
-            ),
-        ]
-        result = link_day_tracks(nodes, _settings(day_link_pass1_min_score=0.99, day_link_pass1_min_reid=0.99, day_link_pass2_min_score=0.99))
-        self.assertEqual(result["n_persons"], 1)
-        self.assertTrue(result["edges"])
-        self.assertEqual(result["edges"][0]["pass"], 4)
-        self.assertTrue(result["edges"][0]["is_overlap"])
-
-    def test_long_gap_still_linked_in_pass1(self):
-        reid = _emb([0.0, 0.0, 1.0, 0.0])
-        nodes = [
-            _node(
-                "01_20260401#1",
-                camera="Camera_01",
-                camera_index=1,
-                track_id=1,
-                t0=0.0,
-                t1=400.0,
-                p0=[2000.0, 2000.0],
-                p1=[2100.0, 2000.0],
-                reid=reid,
-            ),
-            _node(
-                "02_20260401#1",
-                camera="Camera_02",
-                camera_index=2,
-                track_id=1,
-                t0=410.0,
-                t1=450.0,
-                p0=[2200.0, 2000.0],
-                p1=[2300.0, 2000.0],
-                reid=reid,
-            ),
-        ]
-        result = link_day_tracks(nodes, _settings())
-        self.assertEqual(result["n_persons"], 1)
-        self.assertEqual(result["stats"]["n_multi_cam_persons"], 1)
-
-    def test_spatial_cutoff_rejects_pair(self):
-        reid = _emb([1.0, 1.0, 0.0, 0.0])
+    def test_pass1_strict_reid_links_distant_tracks(self):
+        """Pass 1 склеивает треки по строгому ReID >= 0.96 даже при большом зазоре или без карты."""
+        reid = _emb([1.0, 0.0, 0.0, 0.0])
         nodes = [
             _node(
                 "01_20260401#1",
@@ -295,18 +244,22 @@ class TestDayLink(unittest.TestCase):
                 camera="Camera_02",
                 camera_index=2,
                 track_id=1,
-                t0=21.0,
-                t1=30.0,
-                p0=[1600.0, 0.0],
-                p1=[1700.0, 0.0],
+                t0=60.0,
+                t1=80.0,
+                p0=[5000.0, 5000.0],  # далеко на карте
+                p1=[5000.0, 5000.0],
                 reid=reid,
             ),
         ]
-        result = link_day_tracks(nodes, _settings(day_link_max_spatial_m=4.0))
-        self.assertEqual(result["n_persons"], 2)
-        self.assertEqual(result["edges"], [])
+        result = link_day_tracks(nodes, _settings())
+        self.assertEqual(result["n_persons"], 1)
+        self.assertEqual(result["stats"]["pass1_merges"], 1)
+        self.assertEqual(result["edges"][0]["pass"], 1)
+        self.assertIn("Pass 1 (ReID)", result["edges"][0]["reason"])
 
-    def test_min_reid_score_rejects_pair(self):
+    def test_same_camera_overlap_never_merged(self):
+        """Треки на одной камере, перекрывающиеся по времени, никогда не объединяются."""
+        reid = _emb([1.0, 0.0, 0.0, 0.0])
         nodes = [
             _node(
                 "01_20260401#1",
@@ -314,24 +267,24 @@ class TestDayLink(unittest.TestCase):
                 camera_index=1,
                 track_id=1,
                 t0=10.0,
-                t1=20.0,
+                t1=30.0,
                 p0=[2000.0, 2000.0],
-                p1=[2100.0, 2000.0],
-                reid=_emb([1.0, 0.0, 0.0, 0.0]),
+                p1=[2000.0, 2000.0],
+                reid=reid,
             ),
             _node(
-                "02_20260401#1",
-                camera="Camera_02",
-                camera_index=2,
-                track_id=1,
-                t0=25.0,
-                t1=40.0,
-                p0=[2160.0, 2000.0],
-                p1=[2300.0, 2000.0],
-                reid=_emb([0.0, 1.0, 0.0, 0.0]),
+                "01_20260401#2",
+                camera="Camera_01",
+                camera_index=1,
+                track_id=2,
+                t0=12.0,
+                t1=28.0,
+                p0=[2000.0, 2000.0],
+                p1=[2000.0, 2000.0],
+                reid=reid,
             ),
         ]
-        result = link_day_tracks(nodes, _settings(day_link_min_reid_score=0.85))
+        result = link_day_tracks(nodes, _settings())
         self.assertEqual(result["n_persons"], 2)
         self.assertEqual(result["edges"], [])
 

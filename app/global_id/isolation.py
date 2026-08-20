@@ -330,3 +330,213 @@ class TrackNeighborhoodIndex:
                         return False
 
         return True
+
+
+class DayNeighborhoodIndex:
+    """Пространственно-временной индекс треков дня на 2D-карте этажа для всех камер."""
+
+    def __init__(
+        self,
+        scale_px_per_m: float = METER_PX,
+        time_step_sec: float = 0.2,
+    ) -> None:
+        self.scale_px_per_m = float(scale_px_per_m or METER_PX)
+        self.time_step_sec = max(0.05, float(time_step_sec or 0.2))
+
+        # bin_index -> dict[uid, (x, y)] (точки на 2D-карте)
+        self._time_bins: dict[int, dict[str, tuple[float, float]]] = defaultdict(dict)
+        # uid -> (t0_sec, t1_sec)
+        self._spans: dict[str, tuple[float, float]] = {}
+        # uid -> camera_name / camera_idx
+        self._camera_by_uid: dict[str, int] = {}
+
+    def _t_to_bin(self, t_sec: float) -> int:
+        return int(round(t_sec / self.time_step_sec))
+
+    @classmethod
+    def from_nodes_and_feet(
+        cls,
+        nodes: list[dict[str, Any]],
+        feet_by_session: dict[str, dict[int, list[dict[str, Any]]]],
+        *,
+        scale_px_per_m: float = METER_PX,
+        time_step_sec: float = 0.2,
+    ) -> DayNeighborhoodIndex:
+        """Строит глобальный индекс дня по всем узлам и покадровым точкам ног."""
+        idx = cls(scale_px_per_m=scale_px_per_m, time_step_sec=time_step_sec)
+
+        for node in nodes:
+            uid = str(node["uid"])
+            t0 = float(node["t0"])
+            t1 = float(node["t1"])
+            idx._spans[uid] = (t0, t1)
+            idx._camera_by_uid[uid] = int(node.get("camera_index", 0))
+
+            sk = str(node.get("session_key", ""))
+            tid = int(node.get("track_id", 0))
+            ft_pts = feet_by_session.get(sk, {}).get(tid, [])
+
+            if ft_pts and len(ft_pts) >= 1:
+                # Вычисляем t_sec по позиции кадра внутри трека через интерполяцию
+                f0 = float(node.get("f0", 0))
+                duration = max(0.01, t1 - t0)
+                f_span = max(1.0, float(node.get("f1", f0)) - f0)
+
+                for pt in ft_pts:
+                    fi = float(pt.get("frame_index", f0))
+                    # Вычисляем t_sec
+                    frac = max(0.0, min(1.0, (fi - f0) / f_span))
+                    t_pt = t0 + frac * duration
+                    mp = pt.get("map")
+                    if isinstance(mp, (list, tuple)) and len(mp) >= 2:
+                        b = idx._t_to_bin(t_pt)
+                        idx._time_bins[b][uid] = (float(mp[0]), float(mp[1]))
+            else:
+                # Fallback: интерполяция между map_p0 и map_p1
+                p0 = node.get("map_p0")
+                p1 = node.get("map_p1")
+                if p0 and p1:
+                    p0x, p0y = float(p0[0]), float(p0[1])
+                    p1x, p1y = float(p1[0]), float(p1[1])
+                    b0 = idx._t_to_bin(t0)
+                    b1 = idx._t_to_bin(t1)
+                    span_b = max(1, b1 - b0)
+                    for b in range(b0, b1 + 1):
+                        alpha = (b - b0) / float(span_b)
+                        idx._time_bins[b][uid] = (p0x + alpha * (p1x - p0x), p0y + alpha * (p1y - p0y))
+
+        return idx
+
+    def get_position_at_bin(self, uid: str, b: int) -> tuple[float, float] | None:
+        """Координаты трека в бине времени b."""
+        return self._time_bins.get(b, {}).get(uid)
+
+    def check_simultaneous_proximity_and_isolation(
+        self,
+        node_a: dict[str, Any],
+        node_b: dict[str, Any],
+        *,
+        radius_m: float = 2.0,
+        max_dist_m: float = 3.0,
+        min_overlap_sec: float = 5.0,
+        exclude_uids: set[str] | None = None,
+        max_violation_bins: int = 2,
+    ) -> tuple[bool, float, float]:
+        """Проверяет одновременное нахождение рядом на 2D-карте и изоляцию от 3-х лиц на всех камерах.
+
+        Возвращает: (is_valid, avg_dist_m, overlap_sec)
+        """
+        uid_a = str(node_a["uid"])
+        uid_b = str(node_b["uid"])
+        t0_a, t1_a = float(node_a["t0"]), float(node_a["t1"])
+        t0_b, t1_b = float(node_b["t0"]), float(node_b["t1"])
+
+        ov_start = max(t0_a, t0_b)
+        ov_end = min(t1_a, t1_b)
+        overlap_sec = ov_end - ov_start
+        if overlap_sec < min_overlap_sec - 1e-6:
+            return False, 0.0, overlap_sec
+
+        b_start = self._t_to_bin(ov_start)
+        b_end = self._t_to_bin(ov_end)
+        if b_end <= b_start:
+            return False, 0.0, overlap_sec
+
+        excluded = set(exclude_uids or ()) | {uid_a, uid_b}
+        scale = self.scale_px_per_m
+
+        dists: list[float] = []
+        violations = 0
+
+        for b in range(b_start, b_end + 1):
+            pos_a = self.get_position_at_bin(uid_a, b)
+            pos_b = self.get_position_at_bin(uid_b, b)
+            if not pos_a or not pos_b:
+                continue
+
+            d_px = math.hypot(pos_a[0] - pos_b[0], pos_a[1] - pos_b[1])
+            d_m = d_px / scale
+            dists.append(d_m)
+
+            # Проверяем, нет ли вокруг третьих лиц на любой камере
+            if radius_m > 0:
+                for other_uid, pos_other in self._time_bins.get(b, {}).items():
+                    if other_uid in excluded:
+                        continue
+                    d_other_a = math.hypot(pos_other[0] - pos_a[0], pos_other[1] - pos_a[1]) / scale
+                    d_other_b = math.hypot(pos_other[0] - pos_b[0], pos_other[1] - pos_b[1]) / scale
+                    if min(d_other_a, d_other_b) < radius_m:
+                        violations += 1
+                        if violations > max_violation_bins:
+                            return False, (sum(dists) / len(dists)) if dists else 0.0, overlap_sec
+
+        if not dists:
+            return False, 0.0, overlap_sec
+
+        avg_dist = sum(dists) / len(dists)
+        if avg_dist > max_dist_m:
+            return False, avg_dist, overlap_sec
+
+        return True, avg_dist, overlap_sec
+
+    def check_transition_gap_and_isolation(
+        self,
+        node_a: dict[str, Any],
+        node_b: dict[str, Any],
+        *,
+        radius_m: float = 2.0,
+        max_dist_m: float = 3.0,
+        max_gap_sec: float = 10.0,
+        max_speed_mps: float = 2.5,
+        exclude_uids: set[str] | None = None,
+        max_violation_bins: int = 2,
+    ) -> tuple[bool, float, float, float]:
+        """Проверяет последовательный переход между камерами и чистоту зоны перехода.
+
+        Возвращает: (is_valid, dist_m, gap_sec, speed_mps)
+        """
+        uid_a = str(node_a["uid"])
+        uid_b = str(node_b["uid"])
+        t1_a = float(node_a["t1"])
+        t0_b = float(node_b["t0"])
+
+        gap_sec = t0_b - t1_a
+        if gap_sec < -0.5 or gap_sec > max_gap_sec:
+            return False, 0.0, gap_sec, 0.0
+
+        p1_a = node_a.get("map_p1")
+        p0_b = node_b.get("map_p0")
+        if not p1_a or not p0_b:
+            return False, 0.0, gap_sec, 0.0
+
+        p1x, p1y = float(p1_a[0]), float(p1_a[1])
+        p0x, p0y = float(p0_b[0]), float(p0_b[1])
+        scale = self.scale_px_per_m
+        dist_m = math.hypot(p1x - p0x, p1y - p0y) / scale
+        if max_dist_m > 0 and dist_m > max_dist_m:
+            return False, dist_m, gap_sec, 0.0
+
+        dt = max(0.5, gap_sec)
+        speed_mps = dist_m / dt
+        if max_speed_mps > 0 and speed_mps > max_speed_mps:
+            return False, dist_m, gap_sec, speed_mps
+
+        # Проверяем изоляцию в окне перехода на всех камерах
+        excluded = set(exclude_uids or ()) | {uid_a, uid_b}
+        b_start = self._t_to_bin(t1_a - 2.0)
+        b_end = self._t_to_bin(t0_b + 2.0)
+        violations = 0
+
+        for b in range(b_start, b_end + 1):
+            for other_uid, pos_other in self._time_bins.get(b, {}).items():
+                if other_uid in excluded:
+                    continue
+                # Расстояние до отрезка перехода
+                d_px = point_to_segment_dist((pos_other[0], pos_other[1]), (p1x, p1y), (p0x, p0y))
+                d_m = d_px / scale
+                if d_m < radius_m:
+                    violations += 1
+                    if violations > max_violation_bins:
+                        return False, dist_m, gap_sec, speed_mps
+
+        return True, dist_m, gap_sec, speed_mps

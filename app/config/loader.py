@@ -48,12 +48,10 @@ def _link_value(
 
 
 def _parse_day_link_cfg(dl: dict[str, Any]) -> dict[str, Any]:
-    """Nested day_link.candidates / combo / passN + fallback на плоские ключи."""
+    """Nested day_link.candidates / pass0 / pass1 + fallback на плоские ключи."""
     cand = _link_section(dl, "candidates")
-    combo = _link_section(dl, "combo")
+    p0 = _link_section(dl, "pass0")
     p1 = _link_section(dl, "pass1")
-    p2 = _link_section(dl, "pass2")
-    p4 = _link_section(dl, "pass4")
 
     def g(section: dict[str, Any], key: str, *flat: str, default: Any) -> Any:
         return _link_value(dl, section, key, *flat, default=default)
@@ -62,30 +60,25 @@ def _parse_day_link_cfg(dl: dict[str, Any]) -> dict[str, Any]:
         "day_link_enabled": bool(dl.get("enabled", True)),
         "day_link_top_k": int(dl.get("top_k", 0) or 0),
         "day_link_save_crops": bool(dl.get("save_crops", True)),
-        "day_link_min_reid_score": float(g(cand, "min_reid_score", "min_reid_score", default=0.85)),
         "day_link_max_gap_sec": float(g(cand, "max_gap_sec", "max_gap_sec", default=300.0)),
-        "day_link_max_overlap_sec": float(
-            g(p4, "max_overlap_sec", "max_overlap_sec", default=20.0)
+        # Pass 0: Alone Geo
+        "day_link_pass0_enabled": bool(g(p0, "enabled", "pass0_enabled", default=True)),
+        "day_link_pass0_radius_m": float(g(p0, "radius_m", "pass0_radius_m", default=2.0)),
+        "day_link_pass0_min_overlap_sec": float(
+            g(p0, "min_overlap_sec", "pass0_min_overlap_sec", default=5.0)
         ),
-        "day_link_max_spatial_px": float(g(cand, "max_spatial_px", "max_spatial_px", default=0.0)),
-        "day_link_max_spatial_m": float(g(cand, "max_spatial_m", "max_spatial_m", default=4.0)),
-        "day_link_motion_sigma_px": float(
-            g(cand, "motion_sigma_px", "motion_sigma_px", default=180.0)
+        "day_link_pass0_max_gap_sec": float(g(p0, "max_gap_sec", "pass0_max_gap_sec", default=10.0)),
+        "day_link_pass0_max_dist_m": float(g(p0, "max_dist_m", "pass0_max_dist_m", default=3.0)),
+        "day_link_pass0_max_speed_mps": float(
+            g(p0, "max_speed_mps", "pass0_max_speed_mps", default=2.5)
         ),
-        "day_link_motion_sigma_m": float(g(cand, "motion_sigma_m", "motion_sigma_m", default=3.0)),
-        "day_link_size_log_scale": float(g(cand, "size_log_scale", "size_log_scale", default=0.45)),
-        "day_link_w_reid": float(g(combo, "w_reid", "w_reid", default=0.65)),
-        "day_link_w_motion": float(g(combo, "w_motion", "w_motion", default=0.20)),
-        "day_link_w_size": float(g(combo, "w_size", "w_size", default=0.0)),
-        "day_link_w_gap": float(g(combo, "w_gap", "w_gap", default=0.15)),
-        "day_link_pass1_min_reid": float(g(p1, "min_reid", "pass1_min_reid", default=0.94)),
-        "day_link_pass1_min_score": float(g(p1, "min_score", "pass1_min_score", default=0.85)),
-        "day_link_pass2_min_score": float(g(p2, "min_score", "pass2_min_score", default=0.80)),
-        "day_link_pass4_max_overlap_sec": float(
-            g(p4, "max_overlap_sec", "pass4_max_overlap_sec", "max_overlap_sec", default=20.0)
+        "day_link_pass0_min_reid": float(g(p0, "min_reid", "pass0_min_reid", default=0.90)),
+        # Pass 1: Strict ReID
+        "day_link_pass1_enabled": bool(g(p1, "enabled", "pass1_enabled", default=True)),
+        "day_link_pass1_min_reid": float(g(p1, "min_reid", "pass1_min_reid", default=0.96)),
+        "day_link_pass1_max_gap_sec": float(
+            g(p1, "max_gap_sec", "pass1_max_gap_sec", default=300.0)
         ),
-        "day_link_pass4_min_reid": float(g(p4, "min_reid", "pass4_min_reid", default=0.90)),
-        "day_link_pass4_min_score": float(g(p4, "min_score", "pass4_min_score", default=0.70)),
     }
 
 

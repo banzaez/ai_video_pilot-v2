@@ -1,4 +1,4 @@
-"""Stage day_link: глобальная межкамерная склейка дня (Pass 1→2→4)."""
+"""Stage day_link: глобальная межкамерная склейка дня (Pass 0: Alone Geo, Pass 1: ReID >= 0.96)."""
 
 from __future__ import annotations
 
@@ -12,198 +12,16 @@ from typing import Any
 from app.artifact_meta import attach_artifact_meta
 from app.config import Settings, day_links_json_path, day_results_dir
 from app.global_id.group_reid import TrackGroupReid, embed_session_tracks, make_group_reid_context
+from app.global_id.isolation import DayNeighborhoodIndex
 from app.global_id.spatial import METER_PX
 from app.io.json_util import load_tracking_json, save_debug_json
 from app.session.discover import parse_day_input
-from app.tracklet.link_mcf import (
-    _gap_score,
-    _unique_groups,
-    link_hungarian_chains,
-)
+from app.tracklet.link_mcf import _unique_groups, link_hungarian_chains
 from app.util.intervals import intervals_overlap, pair_embed_score
-import numpy as np
 
 logger = logging.getLogger(__name__)
 
 _CANDIDATE_TOP_K = 50
-
-
-def _as_xy(p: Any) -> tuple[float, float]:
-    if not p or not isinstance(p, (list, tuple)) or len(p) < 2:
-        return 0.0, 0.0
-    return float(p[0]), float(p[1])
-
-
-def _tracklet_spatial_point(tracklet: dict[str, Any], key: str) -> tuple[float, float, str]:
-    suffix = key[-1] if key else ""
-    map_key = f"map_{key}"
-    mp = tracklet.get(map_key)
-    has_kpts = isinstance(tracklet.get(f"kxy{suffix}"), list)
-    src = str(tracklet.get(f"map_src{suffix}") or "")
-    use_map = isinstance(mp, (list, tuple)) and len(mp) >= 2
-    if use_map and has_kpts and not src.startswith("kpt"):
-        use_map = False
-    if use_map:
-        return float(mp[0]), float(mp[1]), "map"
-    x, y = _as_xy(tracklet.get(key))
-    return x, y, "image"
-
-
-def _pair_uses_map(a: dict[str, Any], b: dict[str, Any], key_a: str, key_b: str) -> bool:
-    _, _, sa = _tracklet_spatial_point(a, key_a)
-    _, _, sb = _tracklet_spatial_point(b, key_b)
-    return sa == "map" and sb == "map"
-
-
-def _velocity(tracklet: dict[str, Any]) -> tuple[float, float]:
-    t0 = float(tracklet["t0"])
-    t1 = float(tracklet["t1"])
-    dt = t1 - t0
-    if dt <= 1e-6:
-        return 0.0, 0.0
-    x0, y0, _ = _tracklet_spatial_point(tracklet, "p0")
-    x1, y1, _ = _tracklet_spatial_point(tracklet, "p1")
-    return (x1 - x0) / dt, (y1 - y0) / dt
-
-
-def _predict_p1(tracklet: dict[str, Any], t: float) -> tuple[float, float]:
-    x1, y1, _ = _tracklet_spatial_point(tracklet, "p1")
-    vx, vy = _velocity(tracklet)
-    dt = t - float(tracklet["t1"])
-    return x1 + vx * dt, y1 + vy * dt
-
-
-def _spatial_residual(
-    a: dict[str, Any],
-    b: dict[str, Any],
-    *,
-    sigma_px: float,
-    sigma_m: float,
-) -> tuple[float, float]:
-    p1x, p1y, _ = _tracklet_spatial_point(a, "p1")
-    b0x, b0y, space = _tracklet_spatial_point(b, "p0")
-    dist_last = math.hypot(p1x - b0x, p1y - b0y)
-    pred_x, pred_y = _predict_p1(a, float(b["t0"]))
-    dist_pred = math.hypot(pred_x - b0x, pred_y - b0y)
-    residual = min(dist_last, dist_pred)
-
-    if space == "map" and sigma_m > 0:
-        residual_m = residual / METER_PX
-        if sigma_m <= 0:
-            return 1.0, residual_m
-        return float(math.exp(-residual_m / sigma_m)), residual_m
-    if sigma_px <= 0:
-        return 1.0, residual
-    return float(math.exp(-residual / sigma_px)), residual
-
-
-def _spatial_threshold_exceeded(
-    residual: float,
-    *,
-    space: str,
-    max_px: float,
-    max_m: float,
-) -> bool:
-    if space == "map":
-        if max_m <= 0:
-            return False
-        return residual > max_m
-    if max_px <= 0:
-        return False
-    return residual > max_px
-
-
-def _motion_score(
-    a: dict[str, Any],
-    b: dict[str, Any],
-    *,
-    sigma_px: float,
-    sigma_m: float = 0.0,
-) -> tuple[float, float]:
-    motion, residual = _spatial_residual(a, b, sigma_px=sigma_px, sigma_m=sigma_m)
-    gap = max(0.0, float(b["t0"]) - float(a["t1"]))
-    if gap <= 1.5:
-        vax, vay = _velocity(a)
-        vbx, vby = _velocity(b)
-        va_norm = math.hypot(vax, vay)
-        vb_norm = math.hypot(vbx, vby)
-        if va_norm > 20.0 and vb_norm > 20.0:
-            cos_theta = (vax * vbx + vay * vby) / (va_norm * vb_norm)
-            if cos_theta < -0.4:
-                factor = max(0.4, (cos_theta + 1.0) / 0.6)
-                motion *= factor
-    return motion, residual
-
-
-def _bbox_dim(tracklet: dict[str, Any], *, axis: str) -> float:
-    key = "h" if axis == "h" else "w"
-    raw = tracklet.get(key)
-    if raw is not None and float(raw) > 1:
-        return float(raw)
-    idx0, idx1 = (1, 3) if axis == "h" else (0, 2)
-    vals: list[float] = []
-    for b in (tracklet.get("bbox0") or [], tracklet.get("bbox1") or []):
-        if isinstance(b, (list, tuple)) and len(b) >= 4:
-            vals.append(max(0.0, float(b[idx1]) - float(b[idx0])))
-    return float(np.median(vals)) if vals else 0.0
-
-
-def _height(tracklet: dict[str, Any]) -> float:
-    return _bbox_dim(tracklet, axis="h")
-
-
-def _width(tracklet: dict[str, Any]) -> float:
-    return _bbox_dim(tracklet, axis="w")
-
-
-def _dim_sim(a: float, b: float, *, log_scale: float) -> float:
-    if a <= 1 or b <= 1 or log_scale <= 0:
-        return 1.0
-    ratio = abs(math.log(a / b))
-    return float(max(0.0, 1.0 - ratio / log_scale))
-
-
-def _size_score(a: dict[str, Any], b: dict[str, Any], *, log_scale: float) -> float:
-    ha, hb = _height(a), _height(b)
-    wa, wb = _width(a), _width(b)
-    h_sim = _dim_sim(ha, hb, log_scale=log_scale)
-    if wa <= 1 or wb <= 1:
-        return h_sim
-    w_sim = _dim_sim(wa, wb, log_scale=log_scale)
-    taller = max(ha, hb)
-    shorter = min(ha, hb)
-    if taller > 1 and shorter / taller <= 0.85 and w_sim >= 0.70:
-        return w_sim
-    return h_sim
-
-
-def _combo_score(
-    reid: float,
-    motion: float,
-    size: float,
-    gap: float,
-    *,
-    w_reid: float,
-    w_motion: float,
-    w_size: float,
-    w_gap: float,
-) -> float:
-    parts = (
-        (reid, w_reid),
-        (motion, w_motion),
-        (size, w_size),
-        (gap, w_gap),
-    )
-    num = 0.0
-    den = 0.0
-    for value, weight in parts:
-        if weight <= 0:
-            continue
-        num += weight * float(value)
-        den += weight
-    if den <= 0:
-        return float(reid)
-    return float(num / den)
 
 
 def _parse_iso_to_day_sec(iso_str: str | None) -> float:
@@ -270,6 +88,7 @@ def _extract_track_data(
     session_key: str,
     session_root: str,
     reid_by_track: dict[int, TrackGroupReid],
+    feet_trajs: dict[int, list[dict[str, Any]]] | None = None,
 ) -> list[dict[str, Any]]:
     """Извлекает и выравнивает все треки сессии по единому дневному таймлайну."""
     info_path = os.path.join(session_root, "info.json")
@@ -289,7 +108,8 @@ def _extract_track_data(
         started_at_str = str(info_doc["parts"][0].get("started_at") or "")
     session_start_sec = _parse_iso_to_day_sec(started_at_str)
 
-    feet_trajs = _load_feet_map_trajectories(feet_path)
+    if feet_trajs is None:
+        feet_trajs = _load_feet_map_trajectories(feet_path)
 
     track_meta: dict[int, dict[str, Any]] = {}
     for f in tracking_doc.get("frames", []):
@@ -376,130 +196,11 @@ def _extract_track_data(
     return track_nodes
 
 
-def _score_pair(
-    u: dict[str, Any],
-    v: dict[str, Any],
-    settings: Settings,
-) -> dict[str, Any] | None:
-    """Скор перехода u → v как tracklet_link: ReID + motion + size + gap, без лиц.
-
-    На одной камере пересечение по времени запрещено. С разных камер персона
-    может быть видна одновременно — overlap не отбрасывает пару.
-    """
-    is_same_camera = int(u["camera_index"]) == int(v["camera_index"])
-    u_t0, u_t1 = float(u["t0"]), float(u["t1"])
-    v_t0, v_t1 = float(v["t0"]), float(v["t1"])
-    gap_sec = v_t0 - u_t1
-    max_gap_sec = float(settings.day_link_max_gap_sec)
-    is_overlap = intervals_overlap(u_t0, u_t1, v_t0, v_t1)
-
-    if is_same_camera:
-        if is_overlap or gap_sec < 0.0 or gap_sec > max_gap_sec:
-            return None
-    elif not is_overlap and (gap_sec < 0.0 or gap_sec > max_gap_sec):
-        return None
-
-    s_reid = pair_embed_score(u.get("reid_embs"), v.get("reid_embs"))
-    min_reid_score = float(settings.day_link_min_reid_score)
-    if s_reid is None or s_reid < min_reid_score:
-        return None
-
-    s_motion, residual = _motion_score(
-        u,
-        v,
-        sigma_px=float(settings.day_link_motion_sigma_px),
-        sigma_m=float(settings.day_link_motion_sigma_m),
-    )
-    space = "map" if _pair_uses_map(u, v, "p1", "p0") else "image"
-    if _spatial_threshold_exceeded(
-        residual,
-        space=space,
-        max_px=float(settings.day_link_max_spatial_px),
-        max_m=float(settings.day_link_max_spatial_m),
-    ):
-        return None
-
-    dist_m = float(residual) if space == "map" else float(residual) / METER_PX
-    dt = max(0.5, abs(gap_sec) if is_overlap else max(gap_sec, 1e-6))
-    p1x, p1y, _ = _tracklet_spatial_point(u, "p1")
-    b0x, b0y, _ = _tracklet_spatial_point(v, "p0")
-    dist_last = math.hypot(p1x - b0x, p1y - b0y)
-    dist_last_m = dist_last / METER_PX if space == "map" else dist_last / METER_PX
-    speed_mps = dist_last_m / dt
-
-    s_size = _size_score(u, v, log_scale=float(settings.day_link_size_log_scale))
-    gap_for_score = 0.0 if is_overlap else max(0.0, gap_sec)
-    s_gap = _gap_score(gap_for_score, max_gap_sec)
-    combo = _combo_score(
-        float(s_reid),
-        float(s_motion),
-        float(s_size),
-        float(s_gap),
-        w_reid=float(settings.day_link_w_reid),
-        w_motion=float(settings.day_link_w_motion),
-        w_size=float(settings.day_link_w_size),
-        w_gap=float(settings.day_link_w_gap),
-    )
-
-    reid_str = f"ReID={s_reid:.2f}"
-    motion_str = (
-        f"Motion={s_motion:.2f} (Δd={dist_m:.1f}м, v={speed_mps:.1f}м/с, Δt={gap_sec:.1f}с)"
-    )
-    size_str = f"Size={s_size:.2f}"
-
-    return {
-        "from": u["uid"],
-        "to": v["uid"],
-        "from_idx": int(u["_idx"]),
-        "to_idx": int(v["_idx"]),
-        "from_session": u["session_key"],
-        "from_camera": u["camera"],
-        "from_track": u["track_id"],
-        "to_session": v["session_key"],
-        "to_camera": v["camera"],
-        "to_track": v["track_id"],
-        "is_same_camera": is_same_camera,
-        "is_overlap": is_overlap,
-        "score": round(float(combo), 4),
-        "reid": round(float(s_reid), 4),
-        "motion": round(float(s_motion), 4),
-        "size": round(float(s_size), 4),
-        "dist_m": round(dist_m, 2),
-        "gap_sec": round(gap_sec, 2),
-        "speed_mps": round(speed_mps, 2),
-        "reason": f"{reid_str}, {motion_str}, {size_str}",
-    }
-
-
-def _build_candidate_edges(
-    nodes: list[dict[str, Any]],
-    settings: Settings,
-) -> list[dict[str, Any]]:
-    """Пары A→B: same-cam только после конца A; cross-cam — и overlap, и пауза ≤ max_gap."""
-    n = len(nodes)
-    if n < 2:
-        return []
-    order = sorted(range(n), key=lambda i: float(nodes[i]["t0"]))
-    t0s = [float(nodes[i]["t0"]) for i in order]
-    max_gap = float(settings.day_link_max_gap_sec)
-    edges: list[dict[str, Any]] = []
-    for u in nodes:
-        hi = float(u["t1"]) + max_gap
-        right = bisect_right(t0s, hi)
-        for pos in range(right):
-            v = nodes[order[pos]]
-            if v["_idx"] == u["_idx"]:
-                continue
-            edge = _score_pair(u, v, settings)
-            if edge is not None:
-                edges.append(edge)
-    return edges
-
-
 def _same_cam_overlap(
     ids: set[int],
     nodes: list[dict[str, Any]],
 ) -> bool:
+    """Проверяет, есть ли перекрытие во времени между треками одной и той же камеры."""
     items = sorted(ids)
     for i, a in enumerate(items):
         na = nodes[a]
@@ -516,6 +217,7 @@ def _split_same_cam_overlap(
     groups: list[list[int]],
     nodes: list[dict[str, Any]],
 ) -> list[list[int]]:
+    """Разбивает группы, если в них случайно оказались перекрывающиеся треки одной камеры."""
     spans = {i: (float(nodes[i]["t0"]), float(nodes[i]["t1"])) for i in range(len(nodes))}
     final: list[list[int]] = []
     for group in groups:
@@ -547,131 +249,21 @@ def _entry_idx(group: list[int], nodes: list[dict[str, Any]]) -> int:
     return min(group, key=lambda i: (float(nodes[i]["t0"]), i))
 
 
-def _public_edge(edge: dict[str, Any], *, pass_n: int, prefix: str) -> dict[str, Any]:
+def _public_edge(
+    edge: dict[str, Any],
+    *,
+    pass_n: int,
+    prefix: str,
+) -> dict[str, Any]:
     skip = {"from_idx", "to_idx"}
     out = {k: v for k, v in edge.items() if k not in skip}
     out["pass"] = pass_n
-    out["reason"] = f"{prefix}: {edge.get('reason') or ''}".strip()
+    reason = str(edge.get("reason") or "").strip()
+    if reason.startswith("Pass "):
+        out["reason"] = reason
+    else:
+        out["reason"] = f"{prefix}: {reason}".strip()
     return out
-
-
-def _merge_groups_by_endpoints(
-    groups: list[list[int]],
-    by_pair: dict[tuple[int, int], dict[str, Any]],
-    nodes: list[dict[str, Any]],
-    *,
-    min_score: float,
-    accept: Any,
-    solver: str,
-) -> tuple[list[list[int]], set[tuple[int, int]]]:
-    """Hungarian: стык цепочек только выход A → вход B. Overlap разных камер можно."""
-    if min_score <= 0 or len(groups) < 2:
-        return groups, set()
-
-    best: dict[tuple[int, int], tuple[float, int, int]] = {}
-    for ga, group_a in enumerate(groups):
-        if not group_a:
-            continue
-        for gb, group_b in enumerate(groups):
-            if ga == gb or not group_b:
-                continue
-            if _same_cam_overlap(set(group_a) | set(group_b), nodes):
-                continue
-            exit_id = _exit_idx(group_a, nodes)
-            entry_id = _entry_idx(group_b, nodes)
-            rec = by_pair.get((exit_id, entry_id))
-            if rec is None or not accept(rec):
-                continue
-            best[(ga, gb)] = (float(rec["score"]), exit_id, entry_id)
-
-    if not best:
-        return groups, set()
-
-    group_ids = list(range(len(groups)))
-    t0_g = {gi: _group_span(groups[gi], nodes)[0] for gi in group_ids if groups[gi]}
-    fake_edges = [(ga, gb, val) for (ga, gb), (val, _, _) in best.items()]
-    chains = link_hungarian_chains(group_ids, fake_edges, min_score=min_score, t0=t0_g)
-
-    used: set[tuple[int, int]] = set()
-    new_groups: list[list[int]] = []
-    for chain in chains:
-        merged: list[int] = []
-        for i, gi in enumerate(chain):
-            merged.extend(groups[gi])
-            if i + 1 < len(chain):
-                rec = best.get((gi, chain[i + 1]))
-                if rec:
-                    used.add((rec[1], rec[2]))
-        new_groups.append(sorted(set(merged), key=lambda tid: (float(nodes[tid]["t0"]), tid)))
-
-    new_groups = _split_same_cam_overlap(new_groups, nodes)
-    return _unique_groups(new_groups), used
-
-
-def _pass4_handover(
-    groups: list[list[int]],
-    by_pair: dict[tuple[int, int], dict[str, Any]],
-    nodes: list[dict[str, Any]],
-    *,
-    max_overlap_sec: float,
-    min_score: float,
-    min_reid: float,
-    solver: str,
-) -> tuple[list[list[int]], set[tuple[int, int]]]:
-    if max_overlap_sec <= 0 or min_score <= 0 or len(groups) < 2:
-        return groups, set()
-
-    work = [sorted(g, key=lambda tid: (float(nodes[tid]["t0"]), tid)) for g in groups if g]
-    best: dict[tuple[int, int], tuple[float, int, int]] = {}
-    for ga, group_a in enumerate(work):
-        sa = _group_span(group_a, nodes)
-        for gb, group_b in enumerate(work):
-            if ga == gb:
-                continue
-            sb = _group_span(group_b, nodes)
-            if not (sa[0] <= sb[0] < sa[1] < sb[1]):
-                continue
-            overlap = sa[1] - sb[0]
-            if overlap > max_overlap_sec + 1e-9:
-                continue
-            exit_id = _exit_idx(group_a, nodes)
-            entry_id = _entry_idx(group_b, nodes)
-            if int(nodes[exit_id]["camera_index"]) == int(nodes[entry_id]["camera_index"]):
-                continue
-            rec = by_pair.get((exit_id, entry_id))
-            if rec is None or not rec.get("is_overlap"):
-                continue
-            if float(rec["score"]) < min_score:
-                continue
-            reid = rec.get("reid")
-            if min_reid > 0 and (reid is None or float(reid) < min_reid):
-                continue
-            if _same_cam_overlap(set(group_a) | set(group_b), nodes):
-                continue
-            best[(ga, gb)] = (float(rec["score"]), exit_id, entry_id)
-
-    if not best:
-        return work, set()
-
-    group_ids = list(range(len(work)))
-    t0_g = {gi: _group_span(work[gi], nodes)[0] for gi in group_ids if work[gi]}
-    fake_edges = [(ga, gb, combo) for (ga, gb), (combo, _, _) in best.items()]
-    chains = link_hungarian_chains(group_ids, fake_edges, min_score=min_score, t0=t0_g)
-
-    used: set[tuple[int, int]] = set()
-    new_groups: list[list[int]] = []
-    for chain in chains:
-        merged: list[int] = []
-        for i, gi in enumerate(chain):
-            merged.extend(work[gi])
-            if i + 1 < len(chain):
-                rec = best.get((gi, chain[i + 1]))
-                if rec:
-                    used.add((rec[1], rec[2]))
-        new_groups.append(sorted(set(merged), key=lambda tid: (float(nodes[tid]["t0"]), tid)))
-
-    new_groups = _split_same_cam_overlap(new_groups, nodes)
-    return _unique_groups(new_groups), used
 
 
 def _crop_ref(session_key: str, file: str | None) -> dict[str, str] | None:
@@ -680,11 +272,322 @@ def _crop_ref(session_key: str, file: str | None) -> dict[str, str] | None:
     return {"session_key": session_key, "file": file}
 
 
+def _pass0_alone_geo_stitch(
+    groups: list[list[int]],
+    nodes: list[dict[str, Any]],
+    spatial_index: DayNeighborhoodIndex,
+    settings: Settings,
+) -> tuple[list[list[int]], list[dict[str, Any]]]:
+    """Pass 0: Склейка одиноких треков/групп с разных камер по 2D-карте и изоляции."""
+    if not settings.day_link_pass0_enabled or len(groups) < 2:
+        return groups, []
+
+    radius_m = float(settings.day_link_pass0_radius_m)
+    min_overlap_sec = float(settings.day_link_pass0_min_overlap_sec)
+    max_gap_sec = float(settings.day_link_pass0_max_gap_sec)
+    max_dist_m = float(settings.day_link_pass0_max_dist_m)
+    max_speed_mps = float(settings.day_link_pass0_max_speed_mps)
+    min_reid = float(settings.day_link_pass0_min_reid)
+
+    best_pairs: dict[tuple[int, int], tuple[float, int, int, dict[str, Any]]] = {}
+
+    for ga, group_a in enumerate(groups):
+        if not group_a:
+            continue
+        for gb, group_b in enumerate(groups):
+            if ga == gb or not group_b:
+                continue
+
+            # Проверяем, нет ли пересечения по времени на одной камере
+            if _same_cam_overlap(set(group_a) | set(group_b), nodes):
+                continue
+
+            # Проверяем пары узлов между группами
+            uids_a = {str(nodes[i]["uid"]) for i in group_a}
+            uids_b = {str(nodes[i]["uid"]) for i in group_b}
+            all_uids = uids_a | uids_b
+
+            best_edge: dict[str, Any] | None = None
+            best_score = -1.0
+            best_from_idx = -1
+            best_to_idx = -1
+
+            for ia in group_a:
+                node_a = nodes[ia]
+                for ib in group_b:
+                    node_b = nodes[ib]
+                    if int(node_a["camera_index"]) == int(node_b["camera_index"]):
+                        continue
+
+                    # Проверка 1: Одновременное нахождение рядом на 2D-карте
+                    ok_sim, avg_d, ov_sec = spatial_index.check_simultaneous_proximity_and_isolation(
+                        node_a,
+                        node_b,
+                        radius_m=radius_m,
+                        max_dist_m=max_dist_m,
+                        min_overlap_sec=min_overlap_sec,
+                        exclude_uids=all_uids,
+                    )
+                    if ok_sim:
+                        reid = pair_embed_score(node_a.get("reid_embs"), node_b.get("reid_embs"))
+                        if min_reid <= 0 or (reid is not None and float(reid) >= min_reid):
+                            r_val = float(reid) if reid is not None else 1.0
+                            geo_score = 0.5 * max(0.0, 1.0 - avg_d / max(max_dist_m, 1.0)) + 0.5 * r_val
+                            if geo_score > best_score:
+                                best_score = geo_score
+                                best_from_idx = ia
+                                best_to_idx = ib
+                                best_edge = {
+                                    "from": node_a["uid"],
+                                    "to": node_b["uid"],
+                                    "from_idx": ia,
+                                    "to_idx": ib,
+                                    "from_session": node_a["session_key"],
+                                    "from_camera": node_a["camera"],
+                                    "from_track": node_a["track_id"],
+                                    "to_session": node_b["session_key"],
+                                    "to_camera": node_b["camera"],
+                                    "to_track": node_b["track_id"],
+                                    "is_same_camera": False,
+                                    "is_overlap": True,
+                                    "score": round(float(geo_score), 4),
+                                    "reid": round(float(r_val), 4),
+                                    "dist_m": round(float(avg_d), 2),
+                                    "gap_sec": round(-float(ov_sec), 2),
+                                    "pass": 0,
+                                    "reason": (
+                                        f"Pass 0 (Alone Geo): совпадение {ov_sec:.1f}с "
+                                        f"(d={avg_d:.2f}м, ReID={r_val:.2f}, чистота R={radius_m:.1f}м)"
+                                    ),
+                                }
+
+                    # Проверка 2: Последовательный переход между камерами
+                    ok_gap, dist_m, gap_sec, speed_mps = spatial_index.check_transition_gap_and_isolation(
+                        node_a,
+                        node_b,
+                        radius_m=radius_m,
+                        max_dist_m=max_dist_m,
+                        max_gap_sec=max_gap_sec,
+                        max_speed_mps=max_speed_mps,
+                        exclude_uids=all_uids,
+                    )
+                    if ok_gap:
+                        reid = pair_embed_score(node_a.get("reid_embs"), node_b.get("reid_embs"))
+                        if min_reid <= 0 or (reid is not None and float(reid) >= min_reid):
+                            r_val = float(reid) if reid is not None else 1.0
+                            geo_score = 0.5 * max(0.0, 1.0 - dist_m / max(max_dist_m, 1.0)) + 0.5 * r_val
+                            if geo_score > best_score:
+                                best_score = geo_score
+                                best_from_idx = ia
+                                best_to_idx = ib
+                                best_edge = {
+                                    "from": node_a["uid"],
+                                    "to": node_b["uid"],
+                                    "from_idx": ia,
+                                    "to_idx": ib,
+                                    "from_session": node_a["session_key"],
+                                    "from_camera": node_a["camera"],
+                                    "from_track": node_a["track_id"],
+                                    "to_session": node_b["session_key"],
+                                    "to_camera": node_b["camera"],
+                                    "to_track": node_b["track_id"],
+                                    "is_same_camera": False,
+                                    "is_overlap": False,
+                                    "score": round(float(geo_score), 4),
+                                    "reid": round(float(r_val), 4),
+                                    "dist_m": round(float(dist_m), 2),
+                                    "gap_sec": round(float(gap_sec), 2),
+                                    "speed_mps": round(float(speed_mps), 2),
+                                    "pass": 0,
+                                    "reason": (
+                                        f"Pass 0 (Alone Geo): переход Δt={gap_sec:.1f}с "
+                                        f"(d={dist_m:.2f}м, v={speed_mps:.2f}м/с, ReID={r_val:.2f}, чистота R={radius_m:.1f}м)"
+                                    ),
+                                }
+
+            if best_edge is not None and best_score > 0:
+                best_pairs[(ga, gb)] = (best_score, best_from_idx, best_to_idx, best_edge)
+
+    if not best_pairs:
+        return groups, []
+
+    group_ids = list(range(len(groups)))
+    t0_g = {gi: _group_span(groups[gi], nodes)[0] for gi in group_ids if groups[gi]}
+    fake_edges = [(ga, gb, val) for (ga, gb), (val, _, _, _) in best_pairs.items()]
+    chains = link_hungarian_chains(group_ids, fake_edges, min_score=0.1, t0=t0_g)
+
+    accepted_edges: list[dict[str, Any]] = []
+    new_groups: list[list[int]] = []
+    for chain in chains:
+        merged: list[int] = []
+        for i, gi in enumerate(chain):
+            merged.extend(groups[gi])
+            if i + 1 < len(chain):
+                rec = best_pairs.get((gi, chain[i + 1]))
+                if rec:
+                    accepted_edges.append(rec[3])
+        new_groups.append(sorted(set(merged), key=lambda tid: (float(nodes[tid]["t0"]), tid)))
+
+    new_groups = _split_same_cam_overlap(new_groups, nodes)
+    return _unique_groups(new_groups), accepted_edges
+
+
+def _pass1_strict_reid_stitch(
+    groups: list[list[int]],
+    nodes: list[dict[str, Any]],
+    settings: Settings,
+) -> tuple[list[list[int]], list[dict[str, Any]]]:
+    """Pass 1: Строгая склейка по ReID тела (ReID >= min_reid)."""
+    if not settings.day_link_pass1_enabled or len(groups) < 2:
+        return groups, []
+
+    min_reid = float(settings.day_link_pass1_min_reid)
+    max_gap_sec = float(settings.day_link_pass1_max_gap_sec)
+
+    best_pairs: dict[tuple[int, int], tuple[float, int, int, dict[str, Any]]] = {}
+
+    for ga, group_a in enumerate(groups):
+        if not group_a:
+            continue
+        for gb, group_b in enumerate(groups):
+            if ga == gb or not group_b:
+                continue
+
+            if _same_cam_overlap(set(group_a) | set(group_b), nodes):
+                continue
+
+            # Стык: выход group_a -> вход group_b
+            exit_id = _exit_idx(group_a, nodes)
+            entry_id = _entry_idx(group_b, nodes)
+            node_a = nodes[exit_id]
+            node_b = nodes[entry_id]
+
+            t1_a = float(node_a["t1"])
+            t0_b = float(node_b["t0"])
+            gap_sec = t0_b - t1_a
+            is_same_cam = int(node_a["camera_index"]) == int(node_b["camera_index"])
+
+            # На одной камере overlap запрещен
+            if is_same_cam and gap_sec < 0.0:
+                continue
+            if not is_same_cam and gap_sec < -60.0:
+                continue
+            if gap_sec > max_gap_sec:
+                continue
+
+            reid = pair_embed_score(node_a.get("reid_embs"), node_b.get("reid_embs"))
+            if reid is None or float(reid) < min_reid:
+                continue
+
+            score = float(reid)
+            edge_info = {
+                "from": node_a["uid"],
+                "to": node_b["uid"],
+                "from_idx": exit_id,
+                "to_idx": entry_id,
+                "from_session": node_a["session_key"],
+                "from_camera": node_a["camera"],
+                "from_track": node_a["track_id"],
+                "to_session": node_b["session_key"],
+                "to_camera": node_b["camera"],
+                "to_track": node_b["track_id"],
+                "is_same_camera": is_same_cam,
+                "is_overlap": gap_sec < 0.0,
+                "score": round(score, 4),
+                "reid": round(score, 4),
+                "gap_sec": round(float(gap_sec), 2),
+                "pass": 1,
+                "reason": f"Pass 1 (ReID): ReID={score:.2f}, Δt={gap_sec:.1f}с",
+            }
+            best_pairs[(ga, gb)] = (score, exit_id, entry_id, edge_info)
+
+    if not best_pairs:
+        return groups, []
+
+    group_ids = list(range(len(groups)))
+    t0_g = {gi: _group_span(groups[gi], nodes)[0] for gi in group_ids if groups[gi]}
+    fake_edges = [(ga, gb, val) for (ga, gb), (val, _, _, _) in best_pairs.items()]
+    chains = link_hungarian_chains(group_ids, fake_edges, min_score=min_reid, t0=t0_g)
+
+    accepted_edges: list[dict[str, Any]] = []
+    new_groups: list[list[int]] = []
+    for chain in chains:
+        merged: list[int] = []
+        for i, gi in enumerate(chain):
+            merged.extend(groups[gi])
+            if i + 1 < len(chain):
+                rec = best_pairs.get((gi, chain[i + 1]))
+                if rec:
+                    accepted_edges.append(rec[3])
+        new_groups.append(sorted(set(merged), key=lambda tid: (float(nodes[tid]["t0"]), tid)))
+
+    new_groups = _split_same_cam_overlap(new_groups, nodes)
+    return _unique_groups(new_groups), accepted_edges
+
+
+def _build_debug_candidate_edges(
+    nodes: list[dict[str, Any]],
+    settings: Settings,
+) -> list[dict[str, Any]]:
+    """Строит список кандидатных связей между треками для отображения в UI/отладки."""
+    n = len(nodes)
+    if n < 2:
+        return []
+    order = sorted(range(n), key=lambda i: float(nodes[i]["t0"]))
+    t0s = [float(nodes[i]["t0"]) for i in order]
+    max_gap = float(settings.day_link_max_gap_sec)
+    candidates: list[dict[str, Any]] = []
+
+    for u in nodes:
+        hi = float(u["t1"]) + max_gap
+        right = bisect_right(t0s, hi)
+        for pos in range(right):
+            v = nodes[order[pos]]
+            if v["_idx"] == u["_idx"]:
+                continue
+            is_same_cam = int(u["camera_index"]) == int(v["camera_index"])
+            u_t0, u_t1 = float(u["t0"]), float(u["t1"])
+            v_t0, v_t1 = float(v["t0"]), float(v["t1"])
+            gap_sec = v_t0 - u_t1
+            is_overlap = intervals_overlap(u_t0, u_t1, v_t0, v_t1)
+
+            if is_same_cam and (is_overlap or gap_sec < 0.0 or gap_sec > max_gap):
+                continue
+            if not is_same_cam and not is_overlap and (gap_sec < 0.0 or gap_sec > max_gap):
+                continue
+
+            s_reid = pair_embed_score(u.get("reid_embs"), v.get("reid_embs"))
+            if s_reid is None or s_reid < 0.50:
+                continue
+
+            candidates.append({
+                "from": u["uid"],
+                "to": v["uid"],
+                "from_idx": int(u["_idx"]),
+                "to_idx": int(v["_idx"]),
+                "from_session": u["session_key"],
+                "from_camera": u["camera"],
+                "from_track": u["track_id"],
+                "to_session": v["session_key"],
+                "to_camera": v["camera"],
+                "to_track": v["track_id"],
+                "is_same_camera": is_same_cam,
+                "is_overlap": is_overlap,
+                "score": round(float(s_reid), 4),
+                "reid": round(float(s_reid), 4),
+                "gap_sec": round(gap_sec, 2),
+                "reason": f"Candidate: ReID={s_reid:.2f}, Δt={gap_sec:.1f}с",
+            })
+
+    return candidates
+
+
 def link_day_tracks(
     nodes: list[dict[str, Any]],
     settings: Settings,
+    feet_by_session: dict[str, dict[int, list[dict[str, Any]]]] | None = None,
 ) -> dict[str, Any]:
-    """Межкамерный солвер дня: Pass 1 (стык по ReID) → 2 → 4."""
+    """Межкамерный солвер дня: Pass 0 (Alone Geo по 2D-карте) → Pass 1 (ReID >= 0.96)."""
     if not nodes:
         return {
             "n_persons": 0,
@@ -697,70 +600,50 @@ def link_day_tracks(
     for i, node in enumerate(nodes):
         node["_idx"] = i
 
-    candidate_edges = _build_candidate_edges(nodes, settings)
-    by_pair = {(int(e["from_idx"]), int(e["to_idx"])): e for e in candidate_edges}
-    groups = [[i] for i in range(len(nodes))]
+    feet_data = feet_by_session or {}
+    spatial_index = DayNeighborhoodIndex.from_nodes_and_feet(nodes, feet_data)
 
-    def _pass1_ok(rec: dict[str, Any]) -> bool:
-        if float(rec["score"]) < float(settings.day_link_pass1_min_score):
-            return False
-        reid = rec.get("reid")
-        return reid is not None and float(reid) >= float(settings.day_link_pass1_min_reid)
+    initial_groups = [[i] for i in range(len(nodes))]
 
-    def _pass2_ok(rec: dict[str, Any]) -> bool:
-        return float(rec["score"]) >= float(settings.day_link_pass2_min_score)
+    # --- Pass 0: Alone Geo ---
+    groups_p0, p0_edges = _pass0_alone_geo_stitch(
+        initial_groups,
+        nodes,
+        spatial_index,
+        settings,
+    )
+    pass0_count = len(p0_edges)
+    logger.info("STAGE day_link Pass 0 (Alone Geo): склеено %d ребер", pass0_count)
 
-    pass1_used: set[tuple[int, int]] = set()
-    if settings.day_link_pass1_min_reid > 0 or settings.day_link_pass1_min_score > 0:
-        groups, pass1_used = _merge_groups_by_endpoints(
-            groups,
-            by_pair,
-            nodes,
-            min_score=float(settings.day_link_pass1_min_score),
-            accept=_pass1_ok,
-            solver="hungarian",
-        )
+    # --- Pass 1: Strict ReID ---
+    groups_p1, p1_edges = _pass1_strict_reid_stitch(
+        groups_p0,
+        nodes,
+        settings,
+    )
+    pass1_count = len(p1_edges)
+    logger.info(
+        "STAGE day_link Pass 1 (ReID >= %.2f): склеено %d ребер",
+        settings.day_link_pass1_min_reid,
+        pass1_count,
+    )
 
-    pass2_used: set[tuple[int, int]] = set()
-    if settings.day_link_pass2_min_score > 0:
-        groups, pass2_used = _merge_groups_by_endpoints(
-            groups,
-            by_pair,
-            nodes,
-            min_score=float(settings.day_link_pass2_min_score),
-            accept=_pass2_ok,
-            solver="hungarian",
-        )
+    all_accepted_edges: list[dict[str, Any]] = []
+    for e in p0_edges:
+        all_accepted_edges.append(_public_edge(e, pass_n=0, prefix="Pass 0 (Alone Geo)"))
+    for e in p1_edges:
+        all_accepted_edges.append(_public_edge(e, pass_n=1, prefix="Pass 1 (ReID)"))
 
-    pass4_used: set[tuple[int, int]] = set()
-    if settings.day_link_pass4_max_overlap_sec > 0:
-        groups, pass4_used = _pass4_handover(
-            groups,
-            by_pair,
-            nodes,
-            max_overlap_sec=float(settings.day_link_pass4_max_overlap_sec),
-            min_score=float(settings.day_link_pass4_min_score),
-            min_reid=float(settings.day_link_pass4_min_reid),
-            solver="hungarian",
-        )
-
+    # Формирование финальных персон
     node_map = {node["uid"]: node for node in nodes}
     idx_to_person: dict[int, int] = {}
     sorted_groups = sorted(
-        groups,
+        groups_p1,
         key=lambda g: min(float(nodes[i]["t0"]) for i in g) if g else 0.0,
     )
 
     persons: list[dict[str, Any]] = []
     person_track_mapping: dict[str, int] = {}
-    accepted_edges: list[dict[str, Any]] = []
-    used_pairs: dict[tuple[int, int], int] = {}
-    for pair in pass4_used:
-        used_pairs[pair] = 4
-    for pair in pass2_used:
-        used_pairs.setdefault(pair, 2)
-    for pair in pass1_used:
-        used_pairs.setdefault(pair, 1)
 
     for gid, group in enumerate(sorted_groups, start=1):
         members = sorted((nodes[i] for i in group), key=lambda n: float(n["t0"]))
@@ -831,29 +714,14 @@ def link_day_tracks(
             ],
         })
 
-    pass_prefix = {
-        1: "Pass 1 (Direct Match)",
-        2: "Pass 2 (Chain Stitch)",
-        4: "Pass 4 (Multi-Camera Handover)",
-    }
-    for pair, pass_n in used_pairs.items():
-        rec = by_pair.get(pair)
-        if rec is None:
-            continue
-        if idx_to_person.get(pair[0]) != idx_to_person.get(pair[1]):
-            continue
-        accepted_edges.append(_public_edge(rec, pass_n=pass_n, prefix=pass_prefix.get(pass_n, "Link")))
+    all_accepted_edges.sort(key=lambda e: node_map.get(e["from"], {}).get("t1", 0.0))
 
-    accepted_edges.sort(key=lambda e: node_map.get(e["from"], {}).get("t1", 0.0))
-    pass1_count = sum(1 for e in accepted_edges if e.get("pass") == 1)
-    pass2_count = sum(1 for e in accepted_edges if e.get("pass") == 2)
-    pass4_count = sum(1 for e in accepted_edges if e.get("pass") == 4)
-
-    accepted_set = set(used_pairs.keys())
+    candidate_edges = _build_debug_candidate_edges(nodes, settings)
+    accepted_pairs = {(e["from"], e["to"]) for e in all_accepted_edges}
     leftover = [
         _public_edge(e, pass_n=-1, prefix="Candidate")
         for e in sorted(candidate_edges, key=lambda x: -float(x["score"]))
-        if (int(e["from_idx"]), int(e["to_idx"])) not in accepted_set
+        if (e["from"], e["to"]) not in accepted_pairs
     ][:_CANDIDATE_TOP_K]
     for e in leftover:
         e.pop("pass", None)
@@ -864,16 +732,24 @@ def link_day_tracks(
         "n_persons": len(persons),
         "n_multi_cam_persons": sum(1 for p in persons if p["n_cameras"] > 1),
         "n_solo_persons": sum(1 for p in persons if p["n_cameras"] == 1 and p["n_tracks"] == 1),
-        "n_merges_total": len(accepted_edges),
+        "n_merges_total": len(all_accepted_edges),
+        "pass0_merges": pass0_count,
         "pass1_merges": pass1_count,
-        "pass2_merges": pass2_count,
-        "pass4_merges": pass4_count,
     }
+
+    logger.info(
+        "STAGE day_link ИТОГО: персон=%d (мультикамерных=%d), склеек=%d (Pass 0=%d, Pass 1=%d)",
+        stats["n_persons"],
+        stats["n_multi_cam_persons"],
+        stats["n_merges_total"],
+        stats["pass0_merges"],
+        stats["pass1_merges"],
+    )
 
     return {
         "n_persons": len(persons),
         "persons": persons,
-        "edges": accepted_edges,
+        "edges": all_accepted_edges,
         "candidate_edges": leftover,
         "person_track_mapping": person_track_mapping,
         "stats": stats,
@@ -889,6 +765,7 @@ def run_day_link(settings: Settings, target_day: str | None = None) -> None:
     day_clean = target_day or parse_day_input(str(settings.input_path))
     if not day_clean:
         from app.session.discover import resolve_sessions_for_input
+
         mode, sessions, _ = resolve_sessions_for_input(str(settings.input_path))
         _ = mode
         if sessions and sessions[0].day:
@@ -932,10 +809,17 @@ def run_day_link(settings: Settings, target_day: str | None = None) -> None:
 
     all_nodes: list[dict[str, Any]] = []
     cameras_list: list[str] = []
+    feet_by_session: dict[str, dict[int, list[dict[str, Any]]]] = {}
+
     for sk in sessions_for_day:
         s_root = os.path.join(results_root, sk)
+        feet_fp = os.path.join(s_root, "feet.json")
+        feet_trajs = _load_feet_map_trajectories(feet_fp)
+        feet_by_session[sk] = feet_trajs
+
+        # Пересчет ReID по лучшим кадрам группы/трека
         reid_by_track = embed_session_tracks(s_root, settings, reid_ctx, session_key=sk)
-        nodes = _extract_track_data(sk, s_root, reid_by_track)
+        nodes = _extract_track_data(sk, s_root, reid_by_track, feet_trajs=feet_trajs)
         if nodes:
             cam_name = nodes[0]["camera"]
             if cam_name not in cameras_list:
@@ -954,7 +838,7 @@ def run_day_link(settings: Settings, target_day: str | None = None) -> None:
         ", ".join(cameras_list),
     )
 
-    result = link_day_tracks(all_nodes, settings)
+    result = link_day_tracks(all_nodes, settings, feet_by_session=feet_by_session)
 
     out_dir = day_results_dir(settings, day_clean)
     os.makedirs(out_dir, exist_ok=True)
@@ -979,12 +863,11 @@ def run_day_link(settings: Settings, target_day: str | None = None) -> None:
     save_debug_json(out_json, payload)
 
     logger.info(
-        "STAGE day_link: готово! Персон=%s (мультикамерных=%s), склеек=%s (Pass1=%s, Pass2=%s, Pass4=%s) → %s",
+        "STAGE day_link: готово! Персон=%s (мультикамерных=%s), склеек=%s (Pass 0=%s, Pass 1=%s) → %s",
         result["stats"]["n_persons"],
         result["stats"]["n_multi_cam_persons"],
         result["stats"]["n_merges_total"],
+        result["stats"]["pass0_merges"],
         result["stats"]["pass1_merges"],
-        result["stats"]["pass2_merges"],
-        result["stats"]["pass4_merges"],
         out_json,
     )
