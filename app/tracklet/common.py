@@ -67,24 +67,3 @@ def tracklet_frames_to_tracked(frames_data: dict) -> dict[int, list[dict[str, An
         if dets:
             out[fi] = dets
     return out
-
-
-def filter_tracklet_summaries(
-    summaries: list[dict[str, Any]],
-    *,
-    min_obs: int,
-    min_sec: float,
-) -> tuple[list[dict[str, Any]], set[int]]:
-    """Отсечь короткие треклеты. Возвращает (оставшиеся, dropped_ids)."""
-    kept: list[dict[str, Any]] = []
-    dropped: set[int] = set()
-    for rec in summaries:
-        tid = int(rec["tracklet_id"])
-        if int(rec.get("n_obs") or 0) < min_obs:
-            dropped.add(tid)
-            continue
-        if min_sec > 0 and float(rec.get("t1", 0)) - float(rec.get("t0", 0)) < min_sec:
-            dropped.add(tid)
-            continue
-        kept.append(rec)
-    return kept, dropped

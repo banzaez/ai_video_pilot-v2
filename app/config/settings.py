@@ -78,8 +78,6 @@ class Settings:
     tracklet_local_tracker: str = "bytetrack"
     tracklet_local_config: str | None = None
     tracklet_local_params: dict[str, Any] = field(default_factory=dict)
-    tracklet_min_obs: int = 2
-    tracklet_min_sec: float = 0.0
     tracklet_reid_top_k: int = 3
     tracklet_reid_pick: str = "spread"
     tracklet_reid_backend: str = "solider"

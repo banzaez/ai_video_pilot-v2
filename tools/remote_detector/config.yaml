@@ -12,12 +12,12 @@
 
 detection:
   # Веса модели (поиск: текущая папка, data/models/detect/, data/models/)
-  #model: "rtdetr-l.pt"
-  model: "rtdetr-x.pt"
-  #model: "yolo26x.pt"
+  model: "rtdetr-l.pt"
+  # model: "rtdetr-x.pt"
+  # model: "yolo26x.pt"
 
   # Порог уверенности детекции (0.0..1.0)
-  conf: 0.10
+  conf: 0.20
 
   # Порог NMS IoU для подавления перекрывающихся боксов
   iou: 0.50
@@ -29,13 +29,10 @@ detection:
   classes: [0]
 
   # Размер длинной стороны кадра при инференсе
-  imgsz: 1280
+  imgsz: 960
 
   # Размер батча (на RTX 4090 24GB оптимально 32-64)
-  batch_size: 32
-
-  # Число параллельных потоков на GPU для каждого видео (нарезка на чанки)
-  workers: 2
+  batch_size: 64
 
   # Устройство (0, cuda:0, cpu, mps)
   device: "0"

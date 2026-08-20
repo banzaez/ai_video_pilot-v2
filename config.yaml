@@ -7,6 +7,8 @@
 # Склейка кусков ByteTrack — стадия tracklet_link (tracklet_pipeline.link → tracklet_links.json).
 # Вкладка «Склейки» читает эти группы, отдельной стадии link нет.
 
+# ./venv/bin/python3 -m app.main --input session:024_20260817 --from tracklets --to track
+
 pipeline:
   # all / no_merge = detect→feet (no_merge — алиас all)
   stage: "all"
@@ -81,7 +83,7 @@ detection:
   # rtdetr_v2: Hugging Face RT-DETRv2 (PekingU/rtdetr_v2_*), pip install transformers
   backend: yolo
   # Порог уверенности детекции (0..1). Ниже — больше боксов, выше — чище, но можно пропустить людей
-  conf: 0.10
+  conf: 0.25
   # NMS IoU похожих боксов. Вложенные (торс в полном росте) — IoS; широкий бокс на двоих выкидывается
   iou: 0.5
   # Каждый N-й кадр (1 = все). Трекер получает только эти наблюдения; fps видео ему не нужен.
@@ -105,21 +107,15 @@ detection:
 
 # --- Stage 2: tracklets → pose → feet → ReID → link ---
 tracklet_pipeline:
-  # Мин. число наблюдений у треклета на 2a. Короче — выкинуть до ReID.
-  min_obs: 2
-  # Мин. длительность треклета, сек (t1−t0). 0 = не фильтровать по времени.
-  min_sec: 0
-  # Stage 2a → tracklet_frames.json. Шаг трекера = кадр детекции (detect_every_n), не видеокадр.
-  # Кадры в update не подаём: GMC выключен в коде, with_reid бесполезен.
   tracker:
     # bytetrack | botsort | ocsort | deepocsort | fasttrack | tracktrack
     type: tracktrack
     # Conf ≥ этого → первый матч. Детекции уже ≥0.35; 0.40 = типичный человек в high, слабые — во второй проход.
-    track_high_thresh: 0.50
+    track_high_thresh: 0.30
     # low < conf < high: только продлевают живой трек, новый ID не заводят.
     track_low_thresh: 0.25
     # Мин. conf нового ID + TAI-NMS. Выше 0.25 (OC-SORT) — меньше дублей вроде #1+#72; 0.70 дефолт TrackTrack режет слабых.
-    new_track_thresh: 0.60
+    new_track_thresh: 0.35
     # Шагов помнить lost. 30 (дефолт TT) ≈ 3.6 с при every_n=3 — чужой ID. 12 ≈ 1.4 с: дыры да, длинные окклюзии нет.
     track_buffer: 6
     # COST, не IoU: матч если cost < порога. 0.85 от OC-SORT здесь НАОБОРОТ слабее (склеивает лишнее).

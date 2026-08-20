@@ -135,32 +135,28 @@ def _boxes_from_result(res: Any, nms_iou: float) -> list[dict[str, Any]]:
     return nms_detections(frame_boxes, nms_iou)
 
 
-def _detect_video_chunk(
+def _detect_video(
     video_path: str,
-    start_frame: int,
-    end_frame: int,
+    total_frames: int,
     model: Any,
     predict_kw: dict[str, Any],
     batch_size: int,
     stride: int,
     nms_iou: float,
     pbar: tqdm,
-    lock: threading.Lock,
 ) -> dict[int, list[dict[str, Any]]]:
-    """Обработка диапазона кадров [start_frame, end_frame) в отдельном потоке."""
+    """Последовательная обработка видеокадров батчами."""
     cap = cv2.VideoCapture(video_path)
-    if start_frame > 0:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
 
     reader = FrameReaderThread(
         cap,
-        start_frame=start_frame,
-        end_frame=end_frame,
+        start_frame=0,
+        end_frame=total_frames,
         detect_every_n=stride,
         queue_size=max(64, batch_size * 2),
     )
 
-    chunk_dets: dict[int, list[dict[str, Any]]] = {}
+    detections_by_frame: dict[int, list[dict[str, Any]]] = {}
     batch_frames: list[np.ndarray] = []
     batch_indices: list[int] = []
 
@@ -168,16 +164,15 @@ def _detect_video_chunk(
         if not batch_frames:
             return
         results = model.predict(source=batch_frames, **predict_kw)
-        with lock:
-            for idx, res in zip(batch_indices, results):
-                boxes = _boxes_from_result(res, nms_iou)
-                if boxes:
-                    chunk_dets[idx] = boxes
-            pbar.update(len(batch_frames) * stride)
-            pbar.set_postfix(
-                dets=len(chunk_dets),
-                batch=len(batch_frames),
-            )
+        for idx, res in zip(batch_indices, results):
+            boxes = _boxes_from_result(res, nms_iou)
+            if boxes:
+                detections_by_frame[idx] = boxes
+        pbar.update(len(batch_frames) * stride)
+        pbar.set_postfix(
+            dets=len(detections_by_frame),
+            batch=len(batch_frames),
+        )
         batch_frames.clear()
         batch_indices.clear()
 
@@ -197,7 +192,7 @@ def _detect_video_chunk(
         reader.drain()
         cap.release()
 
-    return chunk_dets
+    return detections_by_frame
 
 
 def build_detections_payload(
@@ -292,7 +287,6 @@ def process_video_file(
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
     cap.release()
 
-    workers = max(1, int(getattr(args, "workers", 2) or 2))
     stride = max(1, int(args.detect_every_n))
     batch_size = max(1, int(args.batch_size))
     conf_thresh = float(args.conf)
@@ -300,7 +294,7 @@ def process_video_file(
     classes = [int(c) for c in args.classes.split(",")] if args.classes else [0]
 
     logger.info(
-        "Начало детекции: session=%s, файл=%s (%sx%s, %.1f сек, %d кадров, fps=%.2f, потоков=%d)",
+        "Начало детекции: session=%s, файл=%s (%sx%s, %.1f сек, %d кадров, fps=%.2f)",
         session_key,
         os.path.basename(video_path),
         width,
@@ -308,7 +302,6 @@ def process_video_file(
         total_frames / fps if fps > 0 else 0,
         total_frames,
         fps,
-        workers,
     )
 
     predict_kw = dict(
@@ -322,61 +315,29 @@ def process_video_file(
         stream=True,
     )
 
+    model_basename = os.path.basename(args.weights or "").lower()
+    model_family = "RT-DETR" if "rtdetr" in model_basename else ("YOLO" if "yolo" in model_basename else "Detector")
+    backend_name = "rtdetr" if "rtdetr" in model_basename else "yolo"
+
     t_start = time.time()
     pbar = tqdm(
         total=total_frames,
-        desc=f"[{session_key}] RT-DETR x{workers}",
+        desc=f"[{session_key}] {model_family}",
         unit="fr",
         dynamic_ncols=True,
         leave=True,
     )
 
-    detections_by_frame: dict[int, list[dict[str, Any]]] = {}
-    lock = threading.Lock()
-
-    if workers > 1 and total_frames > workers * batch_size * 2:
-        chunk_size = int(np.ceil(total_frames / workers))
-        chunks = []
-        for w in range(workers):
-            sf = w * chunk_size
-            ef = min((w + 1) * chunk_size, total_frames)
-            if sf < total_frames:
-                chunks.append((sf, ef))
-
-        import concurrent.futures
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(chunks)) as executor:
-            futures = [
-                executor.submit(
-                    _detect_video_chunk,
-                    video_path,
-                    sf,
-                    ef,
-                    model,
-                    predict_kw,
-                    batch_size,
-                    stride,
-                    nms_iou,
-                    pbar,
-                    lock,
-                )
-                for sf, ef in chunks
-            ]
-            for fut in concurrent.futures.as_completed(futures):
-                chunk_res = fut.result()
-                detections_by_frame.update(chunk_res)
-    else:
-        detections_by_frame = _detect_video_chunk(
-            video_path,
-            0,
-            total_frames,
-            model,
-            predict_kw,
-            batch_size,
-            stride,
-            nms_iou,
-            pbar,
-            lock,
-        )
+    detections_by_frame = _detect_video(
+        video_path,
+        total_frames,
+        model,
+        predict_kw,
+        batch_size,
+        stride,
+        nms_iou,
+        pbar,
+    )
 
     pbar.close()
 
@@ -385,7 +346,7 @@ def process_video_file(
     boxes_total = sum(len(dets) for dets in detections_by_frame.values())
 
     detector_meta = {
-        "backend": "rtdetr",
+        "backend": backend_name,
         "path": args.weights,
         "classes": classes,
         "imgsz": args.imgsz,
@@ -466,12 +427,12 @@ def list_video_files(directory: str) -> list[str]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Автономный worker детекции RT-DETR на GPU.")
+    parser = argparse.ArgumentParser(description="Автономный worker детекции (RT-DETR / YOLO) на GPU.")
     parser.add_argument("--config", type=str, help="Путь к config.yaml (по умолчанию tools/remote_detector/config.yaml)")
     parser.add_argument("--video", type=str, help="Путь к конкретному видеофайлу")
     parser.add_argument("--input-dir", type=str, help="Путь к директории с видео (поиск mp4/mov/mkv/avi)")
     parser.add_argument("--day", type=str, help="День в формате YYYYMMDD (поиск внутри input-dir или data/video)")
-    parser.add_argument("--weights", type=str, help="Веса RT-DETR (rtdetr-l.pt или rtdetr-x.pt)")
+    parser.add_argument("--weights", type=str, help="Веса модели (например: rtdetr-x.pt, yolo26x.pt)")
     parser.add_argument("--output-dir", type=str, help="Корневая директория сохранения results")
     parser.add_argument("--batch-size", type=int, help="Размер батча для predict")
     parser.add_argument("--imgsz", type=int, help="Размер длинной стороны кадра")
@@ -480,7 +441,6 @@ def main() -> None:
     parser.add_argument("--detect-every-n", type=int, help="Шаг прореживания кадров (1 = все кадры)")
     parser.add_argument("--classes", type=str, help="Классы COCO через запятую (0 = person)")
     parser.add_argument("--device", type=str, help="Устройство инференса (0, cuda:0, cpu, mps)")
-    parser.add_argument("--workers", type=int, help="Число параллельных потоков обработки одного видео (по умолчанию: 2)")
     parser.add_argument("--fp16", action="store_true", default=None, help="Использовать FP16 точность")
     parser.add_argument("--overwrite", action="store_true", default=True, help="Перезаписывать существующие detections.json (по умолчанию: всегда True)")
 
@@ -494,8 +454,6 @@ def main() -> None:
 
     # Применение значений: CLI > config.yaml > hardcoded defaults
     args.overwrite = True if args.overwrite else bool(det_cfg.get("overwrite", True))
-    if getattr(args, "workers", None) is None:
-        args.workers = int(det_cfg.get("workers") or 2)
     if args.weights is None:
         args.weights = str(det_cfg.get("model") or "rtdetr-l.pt")
     if args.output_dir is None:
@@ -554,7 +512,7 @@ def main() -> None:
         sys.exit(1)
 
     logger.info("=" * 70)
-    logger.info("Удаленный воркер детекции RT-DETR")
+    logger.info("Удаленный воркер детекции")
     logger.info("Найдено видеофайлов: %d", len(video_files))
     logger.info("Модель весов: %s", args.weights)
     # Оптимизации PyTorch/CUDA под архитектуру Ada Lovelace (RTX 4090)

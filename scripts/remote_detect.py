@@ -194,7 +194,6 @@ def main() -> None:
     cfg_iou = float(det_cfg.get("iou") if det_cfg.get("iou") is not None else 0.50)
     cfg_stride = int(det_cfg.get("detect_every_n") or 1)
     cfg_device = str(det_cfg.get("device") or "0")
-    cfg_workers = int(det_cfg.get("workers") or 2)
     cfg_remote_dir = str(paths_cfg.get("remote_dir") or "/workspace/remote_detector")
 
     parser = argparse.ArgumentParser(
@@ -271,12 +270,6 @@ def main() -> None:
         help=f"Шаг кадров (по умолчанию: {cfg_stride})",
     )
     parser.add_argument(
-        "--workers",
-        type=int,
-        default=cfg_workers,
-        help=f"Число параллельных потоков обработки одного видео (по умолчанию: {cfg_workers})",
-    )
-    parser.add_argument(
         "--device",
         type=str,
         default=cfg_device,
@@ -327,13 +320,13 @@ def main() -> None:
     total_size = sum(os.path.getsize(v) for v in videos) if videos else 0
 
     logger.info("=" * 75)
-    logger.info("  AI VIDEO PILOT: УДАЛЕННАЯ ДЕТЕКЦИЯ RT-DETR ЧЕРЕЗ SSH")
+    logger.info("  AI VIDEO PILOT: УДАЛЕННАЯ ДЕТЕКЦИЯ (%s) ЧЕРЕЗ SSH", args.weights)
     logger.info("=" * 75)
     logger.info("SSH хост:             %s", args.host)
     logger.info("Удаленная директория: %s", args.remote_dir)
     logger.info("Модель / Веса:        %s", args.weights)
-    logger.info("Параметры инференса:  batch=%d, imgsz=%d, conf=%.2f, iou=%.2f, workers=%d, device=%s",
-                args.batch_size, args.imgsz, args.conf, args.iou, args.workers, args.device)
+    logger.info("Параметры инференса:  batch=%d, imgsz=%d, conf=%.2f, iou=%.2f, device=%s",
+                args.batch_size, args.imgsz, args.conf, args.iou, args.device)
     logger.info("Найдено видеофайлов:  %d (%s)", len(videos), human_size(total_size))
     for idx, v in enumerate(videos, 1):
         logger.info("  [%d] %s (%s)", idx, os.path.basename(v), human_size(os.path.getsize(v)))
@@ -424,9 +417,9 @@ def main() -> None:
             sys.exit(1)
         logger.info("Загрузка видео завершена за %.1f сек.", time.time() - t0_up)
 
-    # 5. Запуск инференса RT-DETR на удаленном GPU
+    # 5. Запуск инференса на удаленном GPU
     if not args.skip_detect:
-        logger.info("\n--- ШАГ: Запуск удаленной детекции RT-DETR на GPU ---")
+        logger.info("\n--- ШАГ: Запуск удаленной детекции (%s) на GPU ---", args.weights)
         
         day_param = ""
         if args.day:
@@ -449,14 +442,13 @@ def main() -> None:
             f"--conf {args.conf} "
             f"--iou {args.iou} "
             f"--detect-every-n {args.detect_every_n} "
-            f"--workers {args.workers} "
             f"--device {args.device} "
             f"{overwrite_param}"
         )
 
         ssh_exec_cmd = ["ssh", "-t", args.host, remote_cmd]
         t0_detect = time.time()
-        ret = run_streaming_cmd(ssh_exec_cmd, desc="Выполнение инференса RT-DETR на GPU")
+        ret = run_streaming_cmd(ssh_exec_cmd, desc=f"Выполнение инференса ({args.weights}) на GPU")
         if ret != 0:
             logger.error("Ошибка выполнения детекции на удаленном сервере (код %d)", ret)
             sys.exit(1)
