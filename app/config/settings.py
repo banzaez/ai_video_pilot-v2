@@ -132,7 +132,6 @@ class Settings:
     pose_model: str = "yolo26s-pose.pt"
     pose_conf: float = 0.25
     pose_kpt_min: float = 0.25
-    pose_every_n: int = 4
 
     camera_link_enabled: bool = False
     camera_link_model: str = "buffalo_l"

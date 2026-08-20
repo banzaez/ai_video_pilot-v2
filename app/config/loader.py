@@ -569,7 +569,6 @@ def settings_from_sources(args: argparse.Namespace | None = None) -> Settings:
         pose_model=str(pose_cfg.get("model") or "yolo26s-pose.pt"),
         pose_conf=float(pose_cfg.get("conf", 0.25)),
         pose_kpt_min=float(pose_cfg.get("kpt_min", 0.25)),
-        pose_every_n=max(1, int(pose_cfg.get("every_n", 4))),
         camera_link_enabled=bool((cfg.get("camera_link") or {}).get("enabled", False)),
         camera_link_model=str(
             ((cfg.get("camera_link") or {}).get("face_models") or [None])[0]

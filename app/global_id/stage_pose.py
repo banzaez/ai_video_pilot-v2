@@ -1,4 +1,4 @@
-"""Stage pose: YOLO-pose S на прореженных кадрах tracking → poses.json."""
+"""Stage pose: YOLO-pose S на кадрах tracking → poses.json."""
 
 from __future__ import annotations
 
@@ -201,10 +201,7 @@ def run_pose(settings: Settings) -> None:
         )
 
     frames_in = tracking.get("frames") or []
-    every_n = max(1, int(settings.pose_every_n))
-    selected: list[dict[str, Any]] = [fr for i, fr in enumerate(frames_in) if i % every_n == 0]
-    if not selected:
-        selected = list(frames_in)
+    selected: list[dict[str, Any]] = list(frames_in)
 
     cam_dir = cameras_dir(settings)
     camera_key = camera_key_for_settings(settings)
@@ -325,7 +322,6 @@ def run_pose(settings: Settings) -> None:
     payload: dict[str, Any] = {
         "stage": "pose",
         "pose_model": model_path,
-        "every_n": every_n,
         "kpt_min": float(settings.pose_kpt_min),
         "frame_count": tracking.get("frame_count"),
         "width": tracking.get("width"),
