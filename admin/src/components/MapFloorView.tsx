@@ -271,6 +271,20 @@ export function MapFloorView({
 
       const markerR = Math.max(14, mw / 55);
       const trailW = Math.max(4, mw / 280);
+      const fontPx = Math.max(16, mw / 42);
+      ctx.font = `800 ${fontPx}px "IBM Plex Mono", monospace`;
+
+      let mergeMap: Map<number, { track_id: number; group_id?: number }> | null = null;
+      if (mergeTimeline && mergeTimeline.tracks.length) {
+        mergeMap = new Map();
+        for (const tr of mergeTimeline.tracks) {
+          if (t >= tr.t0 - 0.5 && t <= tr.t1 + 0.5) {
+            const entry = { track_id: tr.track_id, group_id: tr.group_id ?? undefined };
+            if (tr.global_id != null) mergeMap.set(tr.global_id, entry);
+            mergeMap.set(tr.track_id, entry);
+          }
+        }
+      }
 
       for (const det of ordered) {
         const camKey = activeCameraKey ?? homography?.camera_key ?? "";
@@ -281,7 +295,7 @@ export function MapFloorView({
           feetDoc,
           feetIndex,
           detectEveryN: every,
-          personHeightM: feetDoc?.person_height_m,
+          personHeightM: feetDoc?.person_height_m ?? undefined,
         });
         if (!projected) continue;
         const [u, v] = projected.map;
@@ -289,13 +303,8 @@ export function MapFloorView({
 
         let fragTrackId = det.track_id;
         let gid = groupByTrack[det.track_id];
-        if (mergeTimeline && mergeTimeline.tracks.length) {
-          const match = mergeTimeline.tracks.find(
-            (tr) =>
-              (tr.global_id === det.track_id || tr.track_id === det.track_id) &&
-              t >= tr.t0 - 0.5 &&
-              t <= tr.t1 + 0.5,
-          );
+        if (mergeMap) {
+          const match = mergeMap.get(det.track_id);
           if (match) {
             fragTrackId = match.track_id;
             if (match.group_id != null) gid = match.group_id;
@@ -354,8 +363,6 @@ export function MapFloorView({
         ctx.fill();
 
         const label = typeof gid === "number" ? `t${fragTrackId} g${gid}` : `t${fragTrackId}`;
-        const fontPx = Math.max(16, mw / 42);
-        ctx.font = `800 ${fontPx}px "IBM Plex Mono", monospace`;
         const tw = ctx.measureText(label).width;
         const padX = 8;
         const padY = 5;

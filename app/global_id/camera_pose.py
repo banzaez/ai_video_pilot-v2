@@ -635,6 +635,3 @@ def project_bbox_feet_to_map(
             return mapped, "h_bbox", 0.55
     return None
 
-
-# Обратная совместимость со старым именем
-project_bbox_center_to_map = project_bbox_feet_to_map

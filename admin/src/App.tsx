@@ -42,7 +42,6 @@ import {
 import { sessionDays, sessionsForDay, formatSessionDay, cameraLabel, sessionLabel, type MediaSession, type SessionPart } from "./session";
 import "./App.css";
 import type { MapCameraMark, MapCalibPoint, MapLiveMarker } from "./components/MapFloorView";
-import { normalizeBodyCalib } from "./feet";
 import type { CountersDoc } from "./counters";
 import { emptyCountersDoc, normalizeCountersDoc } from "./counters";
 import { normalizePlacement } from "./homography";
@@ -332,7 +331,6 @@ export default function App() {
         setHomography({
           ...doc,
           placement: normalizePlacement(doc.placement),
-          body_calib: normalizeBodyCalib(doc.body_calib) ?? undefined,
         });
         if (doc.floorplan === "grid" || !doc.floorplan || /\.svg$/i.test(doc.floorplan)) {
           setFloorplanUrl("grid");

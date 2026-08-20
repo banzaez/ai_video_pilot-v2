@@ -473,5 +473,3 @@ export function projectBboxFeetToMap(
   return null;
 }
 
-/** @deprecated use projectBboxFeetToMap */
-export const projectBboxCenterToMap = projectBboxFeetToMap;

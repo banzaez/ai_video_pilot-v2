@@ -29,7 +29,6 @@ import {
   type Mat3,
   type Pt,
 } from "../homography";
-import { normalizeBodyCalib } from "../feet";
 import {
   countersFingerprint,
   emptyCountersDoc,
@@ -639,7 +638,6 @@ export function MapCalibratePanel({
         floorplan: fp,
         map_size: isGridFloorplan(fp) ? MAP_SIZE : homo.map_size,
         placement: normalizePlacement(homo.placement),
-        body_calib: normalizeBodyCalib(homo.body_calib) ?? undefined,
       };
       docRef.current = normalized;
       setDoc(normalized);
@@ -2422,23 +2420,16 @@ export function MapCalibratePanel({
             <strong>{doc?.placement ? `${doc.placement.yaw_deg.toFixed(0)}°` : "—"}</strong>
           </div>
           <div>
+            <span>h/pitch</span>
+            <strong>
+              {doc?.placement
+                ? `${doc.placement.height_m != null ? `${doc.placement.height_m.toFixed(1)}m` : "—"} / ${doc.placement.pitch_deg != null ? `${doc.placement.pitch_deg.toFixed(0)}°` : "—"}`
+                : "—"}
+            </strong>
+          </div>
+          <div>
             <span>файл</span>
             <strong className={dirty ? "bad" : "ok"}>{dirty ? "dirty" : "ok"}</strong>
-          </div>
-          <div title="Историческое поле body_calib в cameras/*.json (больше не считается из pose)">
-            <span>рост</span>
-            <strong className={(doc?.body_calib?.n_samples ?? 0) >= 30 ? "ok" : ""}>
-              {(doc?.body_calib?.n_samples ?? 0) >= 30
-                ? doc?.body_calib?.k_shoulder_to_feet != null
-                  ? `k ${doc.body_calib.k_shoulder_to_feet.toFixed(2)}`
-                  : "—"
-                : `fallback k ${doc?.body_calib?.fallback_k?.toFixed(2) ?? "2.00"}`}
-            </strong>
-            <em>
-              {doc?.body_calib?.n_samples != null
-                ? ` · n=${doc.body_calib.n_samples}${(doc.body_calib.n_samples ?? 0) < 30 ? " (<30)" : ""}`
-                : " · нет калибровки"}
-            </em>
           </div>
         </div>
       </div>

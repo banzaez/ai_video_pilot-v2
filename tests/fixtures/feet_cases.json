@@ -1,17 +1,5 @@
 [
   {
-    "name": "pick_k default",
-    "fn": "pick_k",
-    "args": {
-      "y_shoulder": 500,
-      "calib": {
-        "n_samples": 50,
-        "k_shoulder_to_feet": 2.1
-      }
-    },
-    "expect": 2.1
-  },
-  {
     "name": "ray_pair_err test",
     "fn": "ray_pair_err",
     "pose": {

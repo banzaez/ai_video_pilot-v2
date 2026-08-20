@@ -35,7 +35,7 @@ export type HomographyDoc = {
   /** Где стоит камера и куда смотрит на плане */
   placement: CameraPlacement | null;
   /** Калибровка роста (историческое поле cameras/*.json, больше не считается из pose) */
-  body_calib?: import("./feet").BodyCalib | null;
+  body_calib?: Record<string, unknown> | null;
   updated_at?: string;
 };
 
