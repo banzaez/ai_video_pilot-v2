@@ -42,7 +42,7 @@ from app.session.discover import SESSION_PREFIX, parse_day_input, resolve_sessio
 from app.session.manifest import build_session_manifest, is_session_manifest
 from app.tracker_config import tracker_params_dict
 from app.tracklet import run_tracklet_link, run_tracklet_reid, run_tracklets
-from app.tracklet.common import load_detection_meta
+from app.tracklet.common import load_detection_meta, session_manifest
 from app.tracklet.remap import remap_tracklet_frames
 from app.global_id.stage_feet import run_feet
 from app.global_id.stage_pose import run_pose
@@ -327,6 +327,7 @@ def run_track(settings: Settings) -> None:
         raise ValueError(f"Нет detections JSON: {det_path}. Сначала --stage detect")
 
     meta = load_detection_meta(settings, det_path)
+    manifest = session_manifest(settings)
     logger.info("STAGE 2: трекинг (%s) из %s", settings.tracker_type, det_path)
     tracked = associate_tracks(
         meta["all_detections"],
@@ -335,6 +336,8 @@ def run_track(settings: Settings) -> None:
         tracker_overrides=tracker_params_dict(settings),
         nms_iou=settings.nms_iou,
         detect_every_n=meta["detect_every_n"],
+        video_source=meta.get("video_source") or str(settings.input_path),
+        manifest=manifest,
     )
     _write_tracking_outputs(settings, tracked, meta)
 

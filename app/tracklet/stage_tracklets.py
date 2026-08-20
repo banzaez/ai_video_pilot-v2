@@ -15,7 +15,7 @@ from app.config import (
 )
 from app.io.json_util import save_debug_json
 from app.parallel_tracker import associate_tracks
-from app.tracklet.common import load_detection_meta
+from app.tracklet.common import load_detection_meta, session_manifest
 from app.tracklet.summaries import build_tracklet_summaries
 from app.tracker_config import tracklet_tracker_params_dict
 
@@ -86,6 +86,7 @@ def run_tracklets(settings: Settings) -> None:
         det_path,
     )
 
+    manifest = session_manifest(settings)
     tracked = associate_tracks(
         meta["all_detections"],
         tracker_type=settings.tracklet_local_tracker,
@@ -93,6 +94,8 @@ def run_tracklets(settings: Settings) -> None:
         tracker_overrides=tracklet_tracker_params_dict(settings),
         nms_iou=settings.nms_iou,
         detect_every_n=meta["detect_every_n"],
+        video_source=meta.get("video_source") or str(settings.input_path),
+        manifest=manifest,
     )
 
     summaries = build_tracklet_summaries(

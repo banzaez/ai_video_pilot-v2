@@ -22,6 +22,8 @@ def _normalize_tracker_params(
             continue
         params[str(key)] = value
     params["tracker_type"] = tracker_type
+    if "with_reid" in params:
+        params["with_reid"] = bool(params["with_reid"])
     if "gmc_method" in params:
         params["gmc_method"] = "none"
     params["_config_path"] = source

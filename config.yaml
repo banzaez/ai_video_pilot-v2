@@ -123,18 +123,35 @@ tracklet_pipeline:
     match_thresh: 0.45
     # Ослабленный rebind lost. 0 = выкл. Иначе lost легко садится на соседнего человека.
     lost_match_thr: 0.0
-    # Веса cost (без ReID cost = HMIoU + conf + угол). Угол чуть выше — не склеивать встречных.
-    iou_weight: 0.55
-    reid_weight: 0.0
+    # --- Веса многофакторной матрицы стоимости (Cost Matrix) ---
+    # cost = iou_weight·HMIoU + reid_weight·Cosine(ReID) + conf_weight·Δconf + angle_weight·Δangle
+    # Вес пространственного расстояния (IoU / HMIoU). При активном ReID обычно 0.50
+    iou_weight: 0.45
+    # Вес расстояния по внешности (ReID). Влияние сходства эмбеддингов людей при матче (0.20-0.35)
+    reid_weight: 0.35
+    # Вес разницы в confidence детекций (0.05-0.15)
     conf_weight: 0.10
-    angle_weight: 0.20
+    # Вес расхождения направления движения (защита от склеивания встречных людей)
+    angle_weight: 0.15
+
+    # --- Штрафы и шаги итеративной ассоциации ---
+    # Штраф к cost для детекций второго прохода (low_thresh < conf < high_thresh)
     penalty_p: 0.25
-    penalty_q: 0.4
+    # Штраф к cost для восстановленных/интерполированных детекций
+    penalty_q: 0.40
+    # Шаг снижения порога стоимости при итеративном жадном сопоставлении
     reduce_step: 0.05
-    # TAI: не плодить новый ID поверх уже живого трека (дубль на входе в кадр). Ниже 0.55 = строже.
+
+    # TAI (Track-Aware IoU): порог NMS против создания дублирующего трека поверх уже живого. Ниже = строже.
     tai_thr: 0.55
+    # Минимальная длина трека (в кадрах) для подтверждения
     min_track_len: 4
-    with_reid: false
+
+    # --- ReID модуль трекера ---
+    # with_reid: true считывает кадры видео и использует сходство внешности при сопоставлении боксов
+    with_reid: true
+    # Модель ReID для трекера (yolo26n-reid.onnx в data/models/reid/ или путь к весам)
+    model: yolo26s-reid.onnx
 
   # Stage pose: YOLO-pose на кадрах треклетов → poses.json
   pose:

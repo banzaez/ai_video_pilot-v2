@@ -29,6 +29,8 @@
 | `--detection-backend` | `yolo` \| `rtdetr` \| `rtdetr_v2` | из YAML (`yolo`) | Архитектура/движок детектора объектов |
 | `--model` | `str` | из YAML | Путь к файлу весов модели детекции |
 | `--tracker` | `bytetrack` \| `botsort` \| `ocsort` \| `deepocsort` \| `fasttrack` \| `tracktrack` | из YAML (`bytetrack`) | Алгоритм трекинга |
+| `--tracker-with-reid` / `--no-tracker-with-reid` | `flag` | из YAML (`false`) | Включить/выключить ReID-ассоциацию внутри трекера |
+| `--tracker-reid-model` | `str` | из YAML (`yolo26n-reid.onnx`) | Модель ReID для онлайн-трекера |
 | `--conf` | `float` (0.0 .. 1.0) | из YAML (`0.35`) | Порог уверенности детектора (confidence) |
 | `--device` | `auto` \| `cuda` \| `mps` \| `cpu` | `auto` | Вычислительное устройство для инференса |
 | `--batch-size` | `int` | из YAML (`16`) | Размер батча кадров при детекции |

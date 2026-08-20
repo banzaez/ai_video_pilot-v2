@@ -15,6 +15,7 @@ from __future__ import annotations
 import concurrent.futures
 import logging
 import multiprocessing
+import os
 import queue
 import sys
 import threading
@@ -245,6 +246,63 @@ def tracks_to_detections(tracks: np.ndarray) -> list[dict[str, Any]]:
     return detections
 
 
+def _resolve_tracker_device(device: Any) -> str:
+    if device is not None and str(device).lower() not in ("", "auto", "none"):
+        return str(device).lower()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return "cuda"
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return "mps"
+    except Exception:
+        pass
+    return "cpu"
+
+
+class TickFrameReader:
+    """Последовательное чтение кадров для списка целевых индексов ticks с cap.grab()."""
+
+    def __init__(self, video_source: str):
+        self.video_source = str(video_source)
+        self.cap: cv2.VideoCapture | None = open_video_capture(self.video_source)
+        self.current_idx = 0
+        if self.cap is None or not self.cap.isOpened():
+            logger.warning("ReID frame reader: не удалось открыть видео %s", self.video_source)
+
+    def is_opened(self) -> bool:
+        return self.cap is not None and self.cap.isOpened()
+
+    def get_frame(self, target_idx: int) -> np.ndarray | None:
+        if self.cap is None or not self.cap.isOpened():
+            return None
+        if target_idx < self.current_idx:
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, target_idx)
+            self.current_idx = target_idx
+        elif target_idx - self.current_idx > 30:
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, target_idx)
+            self.current_idx = target_idx
+
+        while self.current_idx < target_idx:
+            if not self.cap.grab():
+                return None
+            self.current_idx += 1
+
+        ret, frame = self.cap.read()
+        if not ret:
+            return None
+        self.current_idx += 1
+        return frame
+
+    def close(self) -> None:
+        if self.cap is not None:
+            try:
+                self.cap.release()
+            except Exception:
+                pass
+            self.cap = None
+
+
 def create_tracker(tracker_type: str = "bytetrack", overrides: dict | None = None):
     """Создать трекер Ultralytics по типу + overrides из config.yaml."""
     tracker_type = str(tracker_type).lower()
@@ -262,6 +320,20 @@ def create_tracker(tracker_type: str = "bytetrack", overrides: dict | None = Non
                 continue
             setattr(cfg, key, value)
     cfg.tracker_type = tracker_type
+
+    # Нормализация ReID настроек
+    if hasattr(cfg, "with_reid"):
+        cfg.with_reid = bool(cfg.with_reid)
+        if cfg.with_reid:
+            if not getattr(cfg, "model", None) or str(cfg.model).strip().lower() in ("auto", "none", ""):
+                cfg.model = "yolo26n-reid.onnx"
+            model_str = str(cfg.model).strip()
+            if not os.path.isfile(model_str):
+                cand = os.path.join("data", "models", "reid", model_str)
+                if os.path.isfile(cand):
+                    cfg.model = cand
+            cfg.device = _resolve_tracker_device(getattr(cfg, "device", None))
+
     # Пайплайн без GMC
     if hasattr(cfg, "gmc_method"):
         cfg.gmc_method = "none"
@@ -306,6 +378,72 @@ def _observation_ticks(
     return ticks
 
 
+class SessionTickReader:
+    """Адаптер SessionFrameReader для associate_tracks."""
+
+    def __init__(self, manifest: dict[str, Any]):
+        from app.session.reader import SessionFrameReader
+        self.manifest = manifest
+        self._reader = SessionFrameReader(manifest)
+
+    def is_opened(self) -> bool:
+        return True
+
+    def get_frame(self, target_idx: int) -> np.ndarray | None:
+        try:
+            return self._reader.read_frame(target_idx)
+        except Exception as exc:
+            logger.debug("SessionTickReader: ошибка чтения кадра %s (%s)", target_idx, exc)
+            return None
+
+    def close(self) -> None:
+        try:
+            self._reader.close()
+        except Exception:
+            pass
+
+
+def _resolve_reader(
+    video_source: str | None = None,
+    manifest: dict[str, Any] | None = None,
+) -> Any:
+    """Создать читатель кадров: SessionFrameReader (если сессия/манифест) или TickFrameReader (видеофайл)."""
+    if manifest and isinstance(manifest, dict) and "parts" in manifest:
+        return SessionTickReader(manifest)
+
+    if not video_source:
+        return None
+
+    v_str = str(video_source).strip()
+
+    # 1. Проверяем, не ключ ли это сессии (session:<key> или <key>)
+    sess_key = v_str.split("session:", 1)[1].strip() if v_str.startswith("session:") else v_str
+    cand_info = os.path.join("data", "results", sess_key, "info.json")
+    if os.path.isfile(cand_info):
+        try:
+            from app.io.json_util import load_tracking_json
+            info_data = load_tracking_json(cand_info)
+            if isinstance(info_data, dict) and "parts" in info_data:
+                return SessionTickReader(info_data)
+        except Exception as exc:
+            logger.warning("ReID: не удалось загрузить info.json для %s (%s)", sess_key, exc)
+
+    # 2. Одиночный файл
+    for cand in (
+        v_str,
+        os.path.join(os.getcwd(), v_str),
+        os.path.join("data", "video", v_str),
+        os.path.join("data", "video", os.path.basename(v_str)),
+    ):
+        if cand and os.path.isfile(cand):
+            reader = TickFrameReader(cand)
+            if reader.is_opened():
+                return reader
+
+    logger.warning("ReID: video_source не найден (%s). Трекинг без кадров.", video_source)
+    return None
+
+
 def associate_tracks(
     all_detections: dict[int, list[dict[str, Any]]],
     *,
@@ -315,8 +453,10 @@ def associate_tracks(
     nms_iou: float = 0.5,
     detect_every_n: int = 1,
     fill_empty_ticks: bool = False,
+    video_source: str | None = None,
+    manifest: dict[str, Any] | None = None,
 ) -> dict[int, list[dict[str, Any]]]:
-    """Stage 2: трекинг по готовым боксам. Кадры видео не нужны.
+    """Stage 2: трекинг по готовым боксам (с опциональным ReID по кадрам видео при with_reid=True).
 
     fill_empty_ticks: если True — между наблюдениями подаём пустые update
     с шагом detect_every_n (эксперимент; на TrackTrack/ByteTrack A/B не улучшил ID).
@@ -330,14 +470,24 @@ def associate_tracks(
         ticks = det_indices
     n_empty = max(0, len(ticks) - len(det_indices))
 
+    needs_reid = bool(
+        getattr(getattr(tracker, "args", None), "with_reid", False)
+        and getattr(tracker, "encoder", None) is not None
+    )
+
     if total_frames > len(det_indices):
         logger.info(
-            "STAGE 2: %s наблюдений%s (видеокадров %s, detect_every_n=%s)",
+            "STAGE 2: %s наблюдений%s (видеокадров %s, detect_every_n=%s%s)",
             len(det_indices),
             f" + {n_empty} пустых тиков" if n_empty else "",
             total_frames,
             max(1, int(detect_every_n)),
+            ", with_reid=True" if needs_reid else "",
         )
+
+    reader: Any = None
+    if needs_reid:
+        reader = _resolve_reader(video_source=video_source, manifest=manifest)
 
     empty_ds = boxes_to_detection_set([])
     tracked: dict[int, list[dict[str, Any]]] = {}
@@ -350,12 +500,19 @@ def associate_tracks(
                 ds = boxes_to_detection_set(raw)
             else:
                 ds = empty_ds
-            dets = tracks_to_detections(tracker.update(ds))
+
+            img: np.ndarray | None = None
+            if reader is not None and (raw or frame_idx in obs_set):
+                img = reader.get_frame(frame_idx)
+
+            dets = tracks_to_detections(tracker.update(ds, img=img))
             if frame_idx in obs_set:
                 tracked[frame_idx] = dets
                 pbar.set_postfix(dets=len(raw), tracks=len(dets))
                 pbar.update(1)
     finally:
+        if reader is not None:
+            reader.close()
         pbar.close()
 
     return tracked

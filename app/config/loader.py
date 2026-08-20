@@ -297,6 +297,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="yolo | rtdetr | rtdetr_v2 (иначе detection.backend из YAML)",
     )
     parser.add_argument("--tracker", type=str, choices=list(TRACKER_CHOICES), default=None)
+    parser.add_argument(
+        "--tracker-with-reid",
+        dest="tracker_with_reid",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Включить/выключить ReID внутри трекера (TrackTrack / BoT-SORT / DeepOC-SORT)",
+    )
+    parser.add_argument(
+        "--tracker-reid-model",
+        dest="tracker_reid_model",
+        type=str,
+        default=None,
+        help="Модель ReID для трекера (например yolo26n-reid.onnx или путь к весам)",
+    )
     parser.add_argument("--conf", type=float, default=None)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
@@ -420,6 +434,13 @@ def settings_from_sources(args: argparse.Namespace | None = None) -> Settings:
         tracklet_local_tracker,
         inline_params=tracklet_inline or None,
     )
+
+    if args.tracker_with_reid is not None:
+        tracker_params["with_reid"] = bool(args.tracker_with_reid)
+        tracklet_local_params["with_reid"] = bool(args.tracker_with_reid)
+    if args.tracker_reid_model is not None:
+        tracker_params["model"] = str(args.tracker_reid_model)
+        tracklet_local_params["model"] = str(args.tracker_reid_model)
 
     settings = Settings(
         models_dir=models_dir,
