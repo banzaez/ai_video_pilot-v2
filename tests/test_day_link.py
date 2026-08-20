@@ -297,6 +297,59 @@ class TestDayLink(unittest.TestCase):
             self.assertEqual(groups[2], [2])
             self.assertEqual(groups[9], [9])
 
+    def test_day_reid_caching_and_invalidation(self):
+        from app.global_id.group_reid import (
+            DAY_REID_CACHE_NAME,
+            TrackGroupReid,
+            is_day_reid_cache_valid,
+            load_day_reid_cache,
+            save_day_reid_cache,
+        )
+        import time
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tracking_fp = os.path.join(tmp, "tracking.json")
+            with open(tracking_fp, "w", encoding="utf-8") as f:
+                json.dump({"frames": [{"frame_index": 1, "detections": [{"track_id": 1}, {"track_id": 2}]}]}, f)
+
+            settings = _settings()
+            track_ids = {1, 2}
+            top_k = 3
+            cache_fp = os.path.join(tmp, DAY_REID_CACHE_NAME)
+
+            # 1. Сначала кэша нет
+            is_valid, _ = is_day_reid_cache_valid(tmp, settings, track_ids, top_k)
+            self.assertFalse(is_valid)
+
+            # 2. Сохраняем кэш
+            embs1 = np.ones((3, 512), dtype=np.float32)
+            embs2 = np.zeros((3, 512), dtype=np.float32)
+            sample_out = {
+                1: TrackGroupReid(track_id=1, embs=embs1, crop_files=["c1.jpg"], n_tracklets=1),
+                2: TrackGroupReid(track_id=2, embs=embs2, crop_files=["c2.jpg"], n_tracklets=2),
+            }
+            save_day_reid_cache(cache_fp, sample_out, track_ids, top_k, settings)
+
+            # 3. Кэш валиден и загружается мгновенно
+            is_valid, meta = is_day_reid_cache_valid(tmp, settings, track_ids, top_k)
+            self.assertTrue(is_valid)
+            self.assertIsNotNone(meta)
+
+            loaded = load_day_reid_cache(cache_fp, meta, track_ids)
+            self.assertEqual(len(loaded), 2)
+            self.assertEqual(loaded[1].crop_files, ["c1.jpg"])
+            self.assertEqual(loaded[2].n_tracklets, 2)
+            np.testing.assert_array_equal(loaded[1].embs, embs1)
+
+            # 4. Обновляем tracking.json (симуляция перезапуска ранних стадий)
+            time.sleep(0.01)
+            with open(tracking_fp, "w", encoding="utf-8") as f:
+                json.dump({"frames": [{"frame_index": 1, "detections": [{"track_id": 1}, {"track_id": 2}, {"track_id": 3}]}]}, f)
+
+            # Кэш автоматически инвалидируется!
+            is_valid_after_touch, _ = is_day_reid_cache_valid(tmp, settings, {1, 2, 3}, top_k)
+            self.assertFalse(is_valid_after_touch)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -11,7 +11,14 @@ from typing import Any
 
 from app.artifact_meta import attach_artifact_meta
 from app.config import Settings, day_links_json_path, day_results_dir
-from app.global_id.group_reid import TrackGroupReid, embed_session_tracks, make_group_reid_context
+from app.global_id.group_reid import (
+    GroupReidContext,
+    TrackGroupReid,
+    _track_ids_from_tracking,
+    embed_session_tracks,
+    is_day_reid_cache_valid,
+    make_group_reid_context,
+)
 from app.global_id.isolation import DayNeighborhoodIndex
 from app.global_id.spatial import METER_PX
 from app.io.json_util import load_tracking_json, save_debug_json
@@ -803,13 +810,12 @@ def run_day_link(settings: Settings, target_day: str | None = None) -> None:
 
     logger.info("STAGE day_link: найдено сессий за день %s: %s", day_clean, ", ".join(sessions_for_day))
 
-    reid_ctx = make_group_reid_context(settings)
-    if not reid_ctx.available:
-        logger.warning("STAGE day_link: ReID недоступен, пары без эмбеддингов не склеятся")
-
+    reid_ctx: GroupReidContext | None = None
     all_nodes: list[dict[str, Any]] = []
     cameras_list: list[str] = []
     feet_by_session: dict[str, dict[int, list[dict[str, Any]]]] = {}
+
+    top_k = max(1, int(settings.day_link_top_k) or int(settings.tracklet_reid_top_k) or 3)
 
     for sk in sessions_for_day:
         s_root = os.path.join(results_root, sk)
@@ -817,7 +823,25 @@ def run_day_link(settings: Settings, target_day: str | None = None) -> None:
         feet_trajs = _load_feet_map_trajectories(feet_fp)
         feet_by_session[sk] = feet_trajs
 
-        # Пересчет ReID по лучшим кадрам группы/трека
+        # Проверяем, нужна ли инициализация моделей ReID для этой сессии
+        tracking_path = os.path.join(s_root, "tracking.json")
+        need_recompute = True
+        if os.path.isfile(tracking_path):
+            try:
+                t_doc = load_tracking_json(tracking_path)
+                t_ids = _track_ids_from_tracking(t_doc)
+                is_valid, _ = is_day_reid_cache_valid(s_root, settings, t_ids, top_k)
+                if is_valid:
+                    need_recompute = False
+            except Exception:
+                pass
+
+        if need_recompute and reid_ctx is None:
+            reid_ctx = make_group_reid_context(settings)
+            if not reid_ctx.available:
+                logger.warning("STAGE day_link: ReID недоступен, пары без эмбеддингов не склеятся")
+
+        # Пересчет ReID по лучшим кадрам группы/трека (или мгновенная загрузка из кэша)
         reid_by_track = embed_session_tracks(s_root, settings, reid_ctx, session_key=sk)
         nodes = _extract_track_data(sk, s_root, reid_by_track, feet_trajs=feet_trajs)
         if nodes:

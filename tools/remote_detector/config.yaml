@@ -1,0 +1,64 @@
+# Конфигурация автономного воркера детекции RT-DETR (GPU Server)
+# Приоритет: CLI аргументы > этот YAML > значения по умолчанию
+
+# ./venv/bin/python3 scripts/remote_detect.py --day 20260817
+
+# ./venv/bin/python3 scripts/remote_detect.py --session 024_20260817
+
+detection:
+  # Веса модели (поиск: текущая папка, data/models/detect/, data/models/)
+  model: "rtdetr-l.pt"
+  #model: "yolo26x.pt"
+
+  # Порог уверенности детекции (0.0..1.0)
+  conf: 0.10
+
+  # Порог NMS IoU для подавления перекрывающихся боксов
+  iou: 0.50
+
+  # Шаг детекции по кадрам (1 = каждый кадр, 2 = через один)
+  detect_every_n: 1
+
+  # Классы COCO для фильтрации (0 = person)
+  classes: [0]
+
+  # Размер длинной стороны кадра при инференсе
+  imgsz: 1280
+
+  # Размер батча (на RTX 4090 24GB оптимально 32-64)
+  batch_size: 64
+
+  # Устройство (0, cuda:0, cpu, mps)
+  device: "0"
+
+  # Использование FP16 (Tensor Cores на CUDA)
+  fp16: true
+
+cuda_optimizations:
+  # Автотьюнинг алгоритмов cuDNN под фиксированное разрешение и батч
+  cudnn_benchmark: true
+
+  # Включение TF32 для матричных умножений и сверток (Ada Lovelace / RTX 4090)
+  allow_tf32: true
+
+  # Точность вычислений float32 ("high" / "medium")
+  matmul_precision: "high"
+
+  # Предварительный прогрев CUDA-ядер тестовым батчем перед стартом
+  warmup: true
+
+  # Количество потоков OpenCV для декодирования видео на CPU
+  opencv_threads: 4
+
+  # Размер буфера очереди кадров (CPU decoder -> GPU)
+  queue_size: 128
+
+paths:
+  # Папка с видеофайлами на сервере
+  video_dir: "data/video"
+
+  # Папка для сохранения результатов detections.json
+  results_dir: "data/results"
+
+  # Папка с локальными весами
+  models_dir: "data/models/detect"

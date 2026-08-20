@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from collections import defaultdict
@@ -24,6 +25,7 @@ from app.tracklet.stage_reid import _advance_capture, _preselect_candidate_frame
 logger = logging.getLogger(__name__)
 
 DAY_GROUP_CROPS_DIR = "day_group_crops"
+DAY_REID_CACHE_NAME = "day_reid.npz"
 
 
 @dataclass
@@ -219,12 +221,109 @@ def _pick_best_frames(
     )
 
 
+def is_day_reid_cache_valid(
+    session_root: str,
+    settings: Settings,
+    track_ids: set[int],
+    top_k: int,
+) -> tuple[bool, dict[str, Any] | None]:
+    """Проверяет актуальность кэша day_reid.npz относительно tracking.json, links и настроек."""
+    cache_path = os.path.join(session_root, DAY_REID_CACHE_NAME)
+    if not os.path.isfile(cache_path):
+        return False, None
+    try:
+        data = np.load(cache_path, allow_pickle=False)
+        if "_meta" not in data:
+            return False, None
+        meta = json.loads(str(data["_meta"]))
+
+        # 1. Проверяем состав треков
+        cached_tids = set(int(x) for x in meta.get("track_ids", []))
+        if cached_tids != track_ids:
+            return False, None
+
+        # 2. Проверяем параметры отбора кадров и модель ReID
+        if int(meta.get("top_k", 0)) != top_k:
+            return False, None
+        if str(meta.get("backend", "")) != str(settings.tracklet_reid_backend):
+            return False, None
+
+        # 3. Проверяем mtime исходных файлов (tracking.json, tracklet_links.json, tracklet_frames.json)
+        cache_mtime = os.path.getmtime(cache_path)
+        for fname in ("tracking.json", "tracklet_links.json", "tracklet_frames.json", "feet.json"):
+            fp = os.path.join(session_root, fname)
+            if os.path.isfile(fp) and os.path.getmtime(fp) > cache_mtime:
+                return False, None
+
+        return True, meta
+    except Exception as exc:
+        logger.debug("Ошибка проверки кэша day_reid в %s: %s", session_root, exc)
+        return False, None
+
+
+def load_day_reid_cache(
+    cache_path: str,
+    meta: dict[str, Any],
+    track_ids: set[int],
+) -> dict[int, TrackGroupReid]:
+    """Загружает TrackGroupReid из валидного day_reid.npz."""
+    data = np.load(cache_path, allow_pickle=False)
+    out: dict[int, TrackGroupReid] = {}
+    crops_meta = meta.get("crops_by_tid", {})
+    n_tracklets_meta = meta.get("n_tracklets_by_tid", {})
+    for tid in sorted(track_ids):
+        emb_key = f"emb_{tid}"
+        embs = data[emb_key] if emb_key in data else None
+        crops = crops_meta.get(str(tid), [])
+        n_tl = n_tracklets_meta.get(str(tid), 1)
+        out[tid] = TrackGroupReid(
+            track_id=tid,
+            embs=embs,
+            crop_files=list(crops),
+            n_tracklets=int(n_tl),
+        )
+    return out
+
+
+def save_day_reid_cache(
+    cache_path: str,
+    out: dict[int, TrackGroupReid],
+    track_ids: set[int],
+    top_k: int,
+    settings: Settings,
+) -> None:
+    """Сохраняет эмбеддинги и метаданные треков в day_reid.npz."""
+    try:
+        arrays_to_save: dict[str, Any] = {}
+        crops_by_tid: dict[str, list[str]] = {}
+        n_tracklets_by_tid: dict[str, int] = {}
+
+        for tid, rec in out.items():
+            if rec.embs is not None:
+                arrays_to_save[f"emb_{tid}"] = rec.embs
+            crops_by_tid[str(tid)] = rec.crop_files
+            n_tracklets_by_tid[str(tid)] = rec.n_tracklets
+
+        meta = {
+            "track_ids": sorted(list(track_ids)),
+            "top_k": top_k,
+            "backend": str(settings.tracklet_reid_backend),
+            "crops_by_tid": crops_by_tid,
+            "n_tracklets_by_tid": n_tracklets_by_tid,
+        }
+        arrays_to_save["_meta"] = np.array(json.dumps(meta))
+        np.savez_compressed(cache_path, **arrays_to_save)
+    except Exception as exc:
+        logger.warning("Не удалось сохранить кэш day_reid: %s", exc)
+
+
 def embed_session_tracks(
     session_root: str,
     settings: Settings,
-    ctx: GroupReidContext,
+    ctx: GroupReidContext | None,
     *,
     session_key: str = "",
+    force_recompute: bool = False,
 ) -> dict[int, TrackGroupReid]:
     """Для каждого track_id сессии выбирает лучшие кадры и считает ReID (без лиц)."""
     tracking_path = os.path.join(session_root, "tracking.json")
@@ -235,6 +334,26 @@ def embed_session_tracks(
     track_ids = _track_ids_from_tracking(tracking_doc)
     if not track_ids:
         return {}
+
+    top_k = max(1, int(settings.day_link_top_k) or int(settings.tracklet_reid_top_k) or 3)
+    cache_path = os.path.join(session_root, DAY_REID_CACHE_NAME)
+
+    if not force_recompute:
+        is_valid, meta = is_day_reid_cache_valid(session_root, settings, track_ids, top_k)
+        if is_valid and meta is not None:
+            logger.info(
+                "  - Session %s: ReID загружен из кэша (%d треков)",
+                session_key or os.path.basename(session_root),
+                len(track_ids),
+            )
+            return load_day_reid_cache(cache_path, meta, track_ids)
+
+    if ctx is None or not ctx.available:
+        logger.warning(
+            "day_link: ReID контекст недоступен для пересчета сессии %s",
+            session_key or os.path.basename(session_root),
+        )
+        return {tid: TrackGroupReid(track_id=tid, embs=None, crop_files=[], n_tracklets=1) for tid in track_ids}
 
     groups = _tracklet_groups(session_root, track_ids)
     frames_path = os.path.join(session_root, "tracklet_frames.json")
@@ -423,4 +542,6 @@ def embed_session_tracks(
             crop_files=list(files_by_tid.get(tid) or []),
             n_tracklets=len(groups.get(tid) or [tid]),
         )
+
+    save_day_reid_cache(cache_path, out, track_ids, top_k, settings)
     return out

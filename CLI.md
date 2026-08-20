@@ -114,7 +114,7 @@ python -m app.main --config my_config.yaml --input data/video/Camera_01_20260601
 python -m app.main --input data/video/cam1.mp4 --from detect --to feet
 
 # Использовать RT-DETRv2 на Apple Silicon GPU (mps) с батчем 32
-python -m app.main --detection-backend rtdetr_v2 --device mps --batch-size 32
+python -m app.main --detection-backend rtdetr_v2 --device mps --batch-size 64
 
 # Детекция каждый 2-й кадр с трекером BotSORT и порогом conf=0.4
 python -m app.main --detect-every-n 2 --tracker botsort --conf 0.4
