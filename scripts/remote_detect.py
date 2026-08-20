@@ -82,19 +82,30 @@ def check_ssh_connection(host: str) -> bool:
     return False
 
 
+def list_video_files(directory: str) -> list[str]:
+    """Рекурсивный поиск видео с игнорированием папок '_orig', 'lite', '_' и '.'."""
+    if not directory or not os.path.isdir(directory):
+        return []
+    valid_exts = {".mp4", ".mkv", ".mov", ".avi", ".webm"}
+    videos: list[str] = []
+    for root, dirs, files in os.walk(directory):
+        # Игнорируем служебные папки (_orig, .git, lite и т.д.)
+        dirs[:] = [d for d in sorted(dirs) if not d.startswith(("_", ".")) and d.lower() != "lite"]
+        for name in sorted(files):
+            if name.startswith(("_", ".")):
+                continue
+            ext = os.path.splitext(name)[1].lower()
+            if ext in valid_exts:
+                videos.append(os.path.abspath(os.path.join(root, name)))
+    return videos
+
+
 def find_local_videos(input_arg: str, day_arg: str | None) -> list[str]:
     """Поиск локальных видеофайлов по аргументам."""
-    videos: list[str] = []
-    exts = ("*.mp4", "*.mkv", "*.mov", "*.avi", "*.MP4", "*.MKV", "*.MOV", "*.AVI")
-
     # Если передан конкретный файл
     if os.path.isfile(input_arg):
         return [os.path.abspath(input_arg)]
 
-    search_dirs: list[str] = []
-    if os.path.isdir(input_arg):
-        search_dirs.append(input_arg)
-    
     # Разбор дня
     day_clean = None
     if day_arg:
@@ -102,29 +113,29 @@ def find_local_videos(input_arg: str, day_arg: str | None) -> list[str]:
     elif input_arg.startswith("day:"):
         day_clean = input_arg.replace("day:", "").replace("-", "").strip()
 
+    search_dirs: list[str] = []
     if day_clean:
         cand_day_dirs = [
             os.path.join("data", "video", day_clean),
             os.path.join("data", "video", f"day_{day_clean}"),
-            os.path.join("data", "video"),
         ]
-        for cd in cand_day_dirs:
-            if os.path.isdir(cd) and cd not in search_dirs:
-                search_dirs.append(cd)
+        search_dirs.extend([d for d in cand_day_dirs if os.path.isdir(d)])
+
+    if not search_dirs and os.path.isdir(input_arg):
+        search_dirs.append(input_arg)
 
     if not search_dirs and os.path.isdir("data/video"):
         search_dirs.append("data/video")
 
+    videos: list[str] = []
     for sdir in search_dirs:
-        for ext in exts:
-            videos.extend(glob.glob(os.path.join(sdir, ext)))
-            videos.extend(glob.glob(os.path.join(sdir, "**", ext), recursive=True))
+        videos.extend(list_video_files(sdir))
 
     unique_videos = sorted(list(set(videos)))
     if day_clean:
         unique_videos = [v for v in unique_videos if day_clean in os.path.basename(v)]
 
-    return [os.path.abspath(v) for v in unique_videos]
+    return unique_videos
 
 
 def human_size(size_bytes: int) -> str:
@@ -157,7 +168,35 @@ def validate_detection_json(json_path: str) -> dict[str, Any] | None:
         return None
 
 
+def load_remote_detector_config() -> dict[str, Any]:
+    """Чтение конфигурации из tools/remote_detector/config.yaml."""
+    cfg_path = os.path.join("tools", "remote_detector", "config.yaml")
+    if os.path.isfile(cfg_path):
+        try:
+            import yaml
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                return yaml.safe_load(f) or {}
+        except Exception:
+            pass
+    return {}
+
+
 def main() -> None:
+    # Загружаем базовые значения из tools/remote_detector/config.yaml
+    cfg = load_remote_detector_config()
+    det_cfg = cfg.get("detection", {})
+    paths_cfg = cfg.get("paths", {})
+
+    cfg_model = str(det_cfg.get("model") or "rtdetr-l.pt")
+    cfg_batch = int(det_cfg.get("batch_size") or 32)
+    cfg_imgsz = int(det_cfg.get("imgsz") or 1280)
+    cfg_conf = float(det_cfg.get("conf") if det_cfg.get("conf") is not None else 0.10)
+    cfg_iou = float(det_cfg.get("iou") if det_cfg.get("iou") is not None else 0.50)
+    cfg_stride = int(det_cfg.get("detect_every_n") or 1)
+    cfg_device = str(det_cfg.get("device") or "0")
+    cfg_workers = int(det_cfg.get("workers") or 2)
+    cfg_remote_dir = str(paths_cfg.get("remote_dir") or "/workspace/remote_detector")
+
     parser = argparse.ArgumentParser(
         description="Скрипт для удаленной детекции RT-DETR на GPU-сервере (SSH aivideo)."
     )
@@ -186,8 +225,8 @@ def main() -> None:
     parser.add_argument(
         "--remote-dir",
         type=str,
-        default="/workspace/remote_detector",
-        help="Путь к директории мини-проекта на сервере (по умолчанию: /workspace/remote_detector)",
+        default=cfg_remote_dir,
+        help=f"Путь к директории мини-проекта на сервере (по умолчанию: {cfg_remote_dir})",
     )
     parser.add_argument(
         "--remote-python",
@@ -198,44 +237,50 @@ def main() -> None:
     parser.add_argument(
         "--weights",
         type=str,
-        default="rtdetr-l.pt",
-        help="Веса RT-DETR (по умолчанию: rtdetr-l.pt)",
+        default=cfg_model,
+        help=f"Веса модели детекции (по умолчанию из config.yaml: {cfg_model})",
     )
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=32,
-        help="Размер батча для инференса на GPU (по умолчанию: 32)",
+        default=cfg_batch,
+        help=f"Размер батча для инференса на GPU (по умолчанию из config.yaml: {cfg_batch})",
     )
     parser.add_argument(
         "--imgsz",
         type=int,
-        default=1280,
-        help="Размер длинной стороны кадра (по умолчанию: 1280)",
+        default=cfg_imgsz,
+        help=f"Размер длинной стороны кадра (по умолчанию: {cfg_imgsz})",
     )
     parser.add_argument(
         "--conf",
         type=float,
-        default=0.10,
-        help="Порог уверенности детекции (по умолчанию: 0.10)",
+        default=cfg_conf,
+        help=f"Порог уверенности детекции (по умолчанию: {cfg_conf})",
     )
     parser.add_argument(
         "--iou",
         type=float,
-        default=0.50,
-        help="NMS IoU порог (по умолчанию: 0.50)",
+        default=cfg_iou,
+        help=f"NMS IoU порог (по умолчанию: {cfg_iou})",
     )
     parser.add_argument(
         "--detect-every-n",
         type=int,
-        default=1,
-        help="Шаг кадров (1 = все кадры)",
+        default=cfg_stride,
+        help=f"Шаг кадров (по умолчанию: {cfg_stride})",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=cfg_workers,
+        help=f"Число параллельных потоков обработки одного видео (по умолчанию: {cfg_workers})",
     )
     parser.add_argument(
         "--device",
         type=str,
-        default="0",
-        help="Устройство инференса на GPU сервере (по умолчанию: 0)",
+        default=cfg_device,
+        help=f"Устройство инференса на GPU сервере (по умолчанию: {cfg_device})",
     )
     parser.add_argument(
         "--skip-sync-code",
@@ -260,7 +305,8 @@ def main() -> None:
     parser.add_argument(
         "--overwrite",
         action="store_true",
-        help="Перезаписывать существующие результаты",
+        default=True,
+        help="Перезаписывать существующие результаты детекции (по умолчанию: True)",
     )
     parser.add_argument(
         "--dry-run",
@@ -286,8 +332,8 @@ def main() -> None:
     logger.info("SSH хост:             %s", args.host)
     logger.info("Удаленная директория: %s", args.remote_dir)
     logger.info("Модель / Веса:        %s", args.weights)
-    logger.info("Параметры инференса:  batch=%d, imgsz=%d, conf=%.2f, iou=%.2f, device=%s",
-                args.batch_size, args.imgsz, args.conf, args.iou, args.device)
+    logger.info("Параметры инференса:  batch=%d, imgsz=%d, conf=%.2f, iou=%.2f, workers=%d, device=%s",
+                args.batch_size, args.imgsz, args.conf, args.iou, args.workers, args.device)
     logger.info("Найдено видеофайлов:  %d (%s)", len(videos), human_size(total_size))
     for idx, v in enumerate(videos, 1):
         logger.info("  [%d] %s (%s)", idx, os.path.basename(v), human_size(os.path.getsize(v)))
@@ -403,6 +449,7 @@ def main() -> None:
             f"--conf {args.conf} "
             f"--iou {args.iou} "
             f"--detect-every-n {args.detect_every_n} "
+            f"--workers {args.workers} "
             f"--device {args.device} "
             f"{overwrite_param}"
         )

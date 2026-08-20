@@ -5,9 +5,15 @@
 
 # ./venv/bin/python3 scripts/remote_detect.py --session 024_20260817
 
+# local
+# ./venv/bin/python3 -m app.main --day 20260817 --from tracklets --to track
+
+# ./venv/bin/python3 -m app.main --session 024_20260817 --from tracklets --to track
+
 detection:
   # Веса модели (поиск: текущая папка, data/models/detect/, data/models/)
-  model: "rtdetr-l.pt"
+  #model: "rtdetr-l.pt"
+  model: "rtdetr-x.pt"
   #model: "yolo26x.pt"
 
   # Порог уверенности детекции (0.0..1.0)
@@ -26,13 +32,19 @@ detection:
   imgsz: 1280
 
   # Размер батча (на RTX 4090 24GB оптимально 32-64)
-  batch_size: 64
+  batch_size: 32
+
+  # Число параллельных потоков на GPU для каждого видео (нарезка на чанки)
+  workers: 2
 
   # Устройство (0, cuda:0, cpu, mps)
   device: "0"
 
   # Использование FP16 (Tensor Cores на CUDA)
   fp16: true
+
+  # Всегда пересоздавать детекции (не пропускать существующие)
+  overwrite: true
 
 cuda_optimizations:
   # Автотьюнинг алгоритмов cuDNN под фиксированное разрешение и батч

@@ -73,21 +73,23 @@ class FrameReaderThread:
     def __init__(
         self,
         cap: cv2.VideoCapture,
-        total_frames: int,
+        start_frame: int = 0,
+        end_frame: int | None = None,
         detect_every_n: int = 1,
         queue_size: int = 64,
     ):
         self._cap = cap
-        self._total = total_frames
+        self._start = max(0, int(start_frame))
+        self._end = int(end_frame) if end_frame is not None else int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
         self._stride = max(1, detect_every_n)
         self._q: queue.Queue[tuple[int, np.ndarray] | None] = queue.Queue(maxsize=max(8, queue_size))
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
     def _run(self) -> None:
-        current = 0
+        current = self._start
         try:
-            while current < self._total:
+            while current < self._end:
                 decode = (current % self._stride == 0)
                 if decode:
                     ret, frame = self._cap.read()
@@ -131,6 +133,71 @@ def _boxes_from_result(res: Any, nms_iou: float) -> list[dict[str, Any]]:
                 }
             )
     return nms_detections(frame_boxes, nms_iou)
+
+
+def _detect_video_chunk(
+    video_path: str,
+    start_frame: int,
+    end_frame: int,
+    model: Any,
+    predict_kw: dict[str, Any],
+    batch_size: int,
+    stride: int,
+    nms_iou: float,
+    pbar: tqdm,
+    lock: threading.Lock,
+) -> dict[int, list[dict[str, Any]]]:
+    """Обработка диапазона кадров [start_frame, end_frame) в отдельном потоке."""
+    cap = cv2.VideoCapture(video_path)
+    if start_frame > 0:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+
+    reader = FrameReaderThread(
+        cap,
+        start_frame=start_frame,
+        end_frame=end_frame,
+        detect_every_n=stride,
+        queue_size=max(64, batch_size * 2),
+    )
+
+    chunk_dets: dict[int, list[dict[str, Any]]] = {}
+    batch_frames: list[np.ndarray] = []
+    batch_indices: list[int] = []
+
+    def flush() -> None:
+        if not batch_frames:
+            return
+        results = model.predict(source=batch_frames, **predict_kw)
+        with lock:
+            for idx, res in zip(batch_indices, results):
+                boxes = _boxes_from_result(res, nms_iou)
+                if boxes:
+                    chunk_dets[idx] = boxes
+            pbar.update(len(batch_frames) * stride)
+            pbar.set_postfix(
+                dets=len(chunk_dets),
+                batch=len(batch_frames),
+            )
+        batch_frames.clear()
+        batch_indices.clear()
+
+    try:
+        with torch.inference_mode():
+            while True:
+                item = reader.get()
+                if item is _SENTINEL:
+                    break
+                frame_idx, frame = item
+                batch_frames.append(frame)
+                batch_indices.append(frame_idx)
+                if len(batch_frames) >= batch_size:
+                    flush()
+            flush()
+    finally:
+        reader.drain()
+        cap.release()
+
+    return chunk_dets
 
 
 def build_detections_payload(
@@ -182,18 +249,30 @@ def build_detections_payload(
     return payload
 
 
+def load_detector_model(weights_path: str) -> Any:
+    """Загрузка RT-DETR или YOLO в зависимости от весов."""
+    basename = os.path.basename(weights_path).lower()
+    if "rtdetr" in basename:
+        from ultralytics import RTDETR
+        logger.info("Загрузка модели RT-DETR (%s)...", weights_path)
+        return RTDETR(weights_path)
+    from ultralytics import YOLO
+    logger.info("Загрузка модели YOLO (%s)...", weights_path)
+    return YOLO(weights_path, task="detect")
+
+
 def process_video_file(
     video_path: str,
-    model: RTDETR,
+    model: Any,
     args: argparse.Namespace,
 ) -> str:
-    """Обработка одного видеофайла с детекцией RT-DETR."""
+    """Обработка одного видеофайла с детекцией RT-DETR/YOLO."""
     if not os.path.isfile(video_path):
         raise FileNotFoundError(f"Видеофайл не найден: {video_path}")
 
     stem = os.path.splitext(os.path.basename(video_path))[0]
     session_key = extract_session_key(video_path)
-    
+
     # Путь для сохранения detections.json
     out_dir = os.path.join(args.output_dir, session_key)
     os.makedirs(out_dir, exist_ok=True)
@@ -211,9 +290,17 @@ def process_video_file(
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    cap.release()
+
+    workers = max(1, int(getattr(args, "workers", 2) or 2))
+    stride = max(1, int(args.detect_every_n))
+    batch_size = max(1, int(args.batch_size))
+    conf_thresh = float(args.conf)
+    nms_iou = float(args.iou)
+    classes = [int(c) for c in args.classes.split(",")] if args.classes else [0]
 
     logger.info(
-        "Начало детекции: session=%s, файл=%s (%sx%s, %.1f сек, %d кадров, fps=%.2f)",
+        "Начало детекции: session=%s, файл=%s (%sx%s, %.1f сек, %d кадров, fps=%.2f, потоков=%d)",
         session_key,
         os.path.basename(video_path),
         width,
@@ -221,25 +308,8 @@ def process_video_file(
         total_frames / fps if fps > 0 else 0,
         total_frames,
         fps,
+        workers,
     )
-
-    stride = max(1, int(args.detect_every_n))
-    batch_size = max(1, int(args.batch_size))
-    conf_thresh = float(args.conf)
-    nms_iou = float(args.iou)
-    classes = [int(c) for c in args.classes.split(",")] if args.classes else [0]
-    quantize = 16 if args.fp16 else None
-
-    reader = FrameReaderThread(
-        cap,
-        total_frames=total_frames,
-        detect_every_n=stride,
-        queue_size=max(128, batch_size * 4),
-    )
-
-    detections_by_frame: dict[int, list[dict[str, Any]]] = {}
-    boxes_total = 0
-    frames_processed = 0
 
     predict_kw = dict(
         classes=classes,
@@ -247,7 +317,7 @@ def process_video_file(
         iou=nms_iou if nms_iou > 0 else 0.7,
         device=args.device,
         imgsz=args.imgsz,
-        half=bool(args.fp16),
+        quantize=16 if args.fp16 else None,
         verbose=False,
         stream=True,
     )
@@ -255,55 +325,64 @@ def process_video_file(
     t_start = time.time()
     pbar = tqdm(
         total=total_frames,
-        desc=f"[{session_key}] RT-DETR",
+        desc=f"[{session_key}] RT-DETR x{workers}",
         unit="fr",
         dynamic_ncols=True,
         leave=True,
     )
 
-    batch_frames: list[np.ndarray] = []
-    batch_indices: list[int] = []
+    detections_by_frame: dict[int, list[dict[str, Any]]] = {}
+    lock = threading.Lock()
 
-    def flush_batch() -> None:
-        nonlocal boxes_total, frames_processed
-        if not batch_frames:
-            return
-        results = model.predict(source=batch_frames, **predict_kw)
-        for idx, res in zip(batch_indices, results):
-            frame_boxes = _boxes_from_result(res, nms_iou)
-            if frame_boxes:
-                detections_by_frame[idx] = frame_boxes
-                boxes_total += len(frame_boxes)
-            frames_processed += 1
-        
-        pbar.set_postfix(
-            boxes=boxes_total,
-            batch=len(batch_frames),
-            dets_fr=f"{len(detections_by_frame)}",
+    if workers > 1 and total_frames > workers * batch_size * 2:
+        chunk_size = int(np.ceil(total_frames / workers))
+        chunks = []
+        for w in range(workers):
+            sf = w * chunk_size
+            ef = min((w + 1) * chunk_size, total_frames)
+            if sf < total_frames:
+                chunks.append((sf, ef))
+
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(chunks)) as executor:
+            futures = [
+                executor.submit(
+                    _detect_video_chunk,
+                    video_path,
+                    sf,
+                    ef,
+                    model,
+                    predict_kw,
+                    batch_size,
+                    stride,
+                    nms_iou,
+                    pbar,
+                    lock,
+                )
+                for sf, ef in chunks
+            ]
+            for fut in concurrent.futures.as_completed(futures):
+                chunk_res = fut.result()
+                detections_by_frame.update(chunk_res)
+    else:
+        detections_by_frame = _detect_video_chunk(
+            video_path,
+            0,
+            total_frames,
+            model,
+            predict_kw,
+            batch_size,
+            stride,
+            nms_iou,
+            pbar,
+            lock,
         )
-        pbar.update(len(batch_frames) * stride)
-        batch_frames.clear()
-        batch_indices.clear()
 
-    try:
-        with torch.inference_mode():
-            while True:
-                item = reader.get()
-                if item is _SENTINEL:
-                    break
-                frame_idx, frame = item
-                batch_frames.append(frame)
-                batch_indices.append(frame_idx)
-                if len(batch_frames) >= batch_size:
-                    flush_batch()
-            flush_batch()
-    finally:
-        reader.drain()
-        cap.release()
-        pbar.close()
+    pbar.close()
 
     elapsed = time.time() - t_start
     fps_infer = total_frames / elapsed if elapsed > 0 else 0.0
+    boxes_total = sum(len(dets) for dets in detections_by_frame.values())
 
     detector_meta = {
         "backend": "rtdetr",
@@ -369,6 +448,23 @@ def load_yaml_config(config_path: str | None = None) -> dict[str, Any]:
         return {}
 
 
+def list_video_files(directory: str) -> list[str]:
+    """Рекурсивный поиск видео с игнорированием папок '_orig', 'lite', '_' и '.'."""
+    if not directory or not os.path.isdir(directory):
+        return []
+    valid_exts = {".mp4", ".mkv", ".mov", ".avi", ".webm"}
+    videos: list[str] = []
+    for root, dirs, files in os.walk(directory):
+        dirs[:] = [d for d in sorted(dirs) if not d.startswith(("_", ".")) and d.lower() != "lite"]
+        for name in sorted(files):
+            if name.startswith(("_", ".")):
+                continue
+            ext = os.path.splitext(name)[1].lower()
+            if ext in valid_exts:
+                videos.append(os.path.abspath(os.path.join(root, name)))
+    return videos
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Автономный worker детекции RT-DETR на GPU.")
     parser.add_argument("--config", type=str, help="Путь к config.yaml (по умолчанию tools/remote_detector/config.yaml)")
@@ -384,8 +480,9 @@ def main() -> None:
     parser.add_argument("--detect-every-n", type=int, help="Шаг прореживания кадров (1 = все кадры)")
     parser.add_argument("--classes", type=str, help="Классы COCO через запятую (0 = person)")
     parser.add_argument("--device", type=str, help="Устройство инференса (0, cuda:0, cpu, mps)")
+    parser.add_argument("--workers", type=int, help="Число параллельных потоков обработки одного видео (по умолчанию: 2)")
     parser.add_argument("--fp16", action="store_true", default=None, help="Использовать FP16 точность")
-    parser.add_argument("--overwrite", action="store_true", help="Перезаписывать существующие detections.json")
+    parser.add_argument("--overwrite", action="store_true", default=True, help="Перезаписывать существующие detections.json (по умолчанию: всегда True)")
 
     args = parser.parse_args()
 
@@ -396,6 +493,9 @@ def main() -> None:
     cuda_cfg = cfg.get("cuda_optimizations", {})
 
     # Применение значений: CLI > config.yaml > hardcoded defaults
+    args.overwrite = True if args.overwrite else bool(det_cfg.get("overwrite", True))
+    if getattr(args, "workers", None) is None:
+        args.workers = int(det_cfg.get("workers") or 2)
     if args.weights is None:
         args.weights = str(det_cfg.get("model") or "rtdetr-l.pt")
     if args.output_dir is None:
@@ -426,24 +526,20 @@ def main() -> None:
         video_files.append(os.path.abspath(args.video))
     elif args.day or args.input_dir:
         base_dir = args.input_dir or "data/video"
+        search_dirs: list[str] = []
         if args.day:
             day_clean = args.day.replace("-", "").strip()
             cand_dirs = [
                 os.path.join(base_dir, day_clean),
                 os.path.join(base_dir, f"day_{day_clean}"),
-                base_dir,
             ]
-            search_dirs = [d for d in cand_dirs if os.path.isdir(d)]
-            if not search_dirs:
-                search_dirs = [base_dir]
-        else:
-            search_dirs = [base_dir]
+            search_dirs.extend([d for d in cand_dirs if os.path.isdir(d)])
 
-        exts = ("*.mp4", "*.mkv", "*.mov", "*.avi", "*.MP4", "*.MKV", "*.MOV", "*.AVI")
+        if not search_dirs and os.path.isdir(base_dir):
+            search_dirs.append(base_dir)
+
         for sdir in search_dirs:
-            for ext in exts:
-                video_files.extend(glob.glob(os.path.join(sdir, ext)))
-                video_files.extend(glob.glob(os.path.join(sdir, "**", ext), recursive=True))
+            video_files.extend(list_video_files(sdir))
 
         if args.day:
             day_clean = args.day.replace("-", "").strip()
@@ -495,10 +591,8 @@ def main() -> None:
             weights_path = cand
             break
 
-    # Загрузка модели
-    logger.info("Загрузка весов RT-DETR (%s)...", weights_path)
-    model = RTDETR(weights_path)
-    logger.info("Модель RT-DETR успешно загружена!")
+    model = load_detector_model(weights_path)
+    logger.info("Модель детекции успешно загружена!")
 
     # Прогрев CUDA ядер и выделение видеопамяти
     if torch.cuda.is_available() and str(args.device).lower() not in ("cpu", "mps"):
@@ -510,7 +604,7 @@ def main() -> None:
                 source=dummy,
                 device=args.device,
                 imgsz=args.imgsz,
-                half=bool(args.fp16),
+                quantize=16 if args.fp16 else None,
                 verbose=False,
             )
         torch.cuda.synchronize()
