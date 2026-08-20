@@ -1,0 +1,1616 @@
+/* =========================================================================
+   MAP & CALIBRATION STYLES (MapFloorView & MapCalibratePanel v2)
+   ========================================================================= */
+
+/* --- Floating Map / Floor View --- */
+.map-floor {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  background: #090e0b;
+  overflow: hidden;
+  user-select: none;
+  cursor: grab;
+}
+
+.map-floor:active {
+  cursor: grabbing;
+}
+
+.map-floor-world {
+  position: absolute;
+  pointer-events: none;
+}
+
+.map-floor-bg-layer {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  display: block;
+  object-fit: fill;
+}
+
+.map-floor-canvas-layer {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
+.map-floor-hud {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 15;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  pointer-events: auto;
+  user-select: none;
+}
+
+.map-floor-hud-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  background: rgba(13, 20, 16, 0.92);
+  backdrop-filter: blur(8px);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 8px;
+  padding: 3px 5px;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.45);
+}
+
+.map-floor-hud-btn {
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 3px 7px;
+  border-radius: 5px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(255, 255, 255, 0.08);
+  color: #e2e8e4;
+  cursor: pointer;
+  line-height: 1.3;
+  transition: all 0.12s ease;
+}
+
+.map-floor-hud-btn:hover {
+  background: rgba(255, 255, 255, 0.22);
+  color: #fff;
+  border-color: rgba(255, 255, 255, 0.25);
+}
+
+.map-floor-hud-btn:active {
+  transform: scale(0.96);
+}
+
+.map-floor-hud-btn.is-toggle.is-on {
+  background: #1b5e20;
+  color: #c8e6c9;
+  border-color: #4caf50;
+  box-shadow: 0 0 6px rgba(76, 175, 80, 0.35);
+}
+
+.map-floor-hud-label {
+  font-family: var(--mono, monospace);
+  font-size: 11px;
+  font-weight: 700;
+  color: #90caf9;
+  min-width: 2.5em;
+  text-align: center;
+}
+
+.map-floor-hint {
+  position: absolute;
+  left: 12px;
+  bottom: 12px;
+  margin: 0;
+  padding: 6px 12px;
+  font-size: 11px;
+  color: #d7e4db;
+  background: rgba(13, 18, 16, 0.88);
+  backdrop-filter: blur(6px);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 6px;
+  pointer-events: none;
+  z-index: 5;
+}
+
+/* Camera Color Legend Overlay */
+.map-floor-cam-legend,
+.map-pane-cam-legend {
+  position: absolute;
+  left: 12px;
+  bottom: 12px;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 5px 10px;
+  background: rgba(13, 18, 16, 0.84);
+  backdrop-filter: blur(8px);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 8px;
+  font-size: 11px;
+  color: #d7e4db;
+  z-index: 10;
+  pointer-events: auto;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25);
+}
+
+.map-floor-cam-legend-title,
+.map-pane-cam-legend-title {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  color: #8da396;
+  letter-spacing: 0.04em;
+  margin-right: 2px;
+}
+
+.map-floor-cam-legend-item,
+.map-pane-cam-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 7px;
+  border-radius: 5px;
+  background: rgba(255, 255, 255, 0.06);
+  font-family: var(--mono, monospace);
+  font-size: 11px;
+  font-weight: 600;
+  color: #e2e8e4;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.map-floor-cam-legend-item.is-active,
+.map-pane-cam-legend-item.is-active {
+  background: rgba(255, 255, 255, 0.18);
+  border-color: rgba(255, 255, 255, 0.35);
+  color: #fff;
+  box-shadow: 0 0 6px rgba(255, 255, 255, 0.15);
+}
+
+.map-floor-cam-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  box-shadow: 0 0 0 1.5px rgba(0, 0, 0, 0.4);
+  flex-shrink: 0;
+}
+
+/* =========================================================================
+   MAP CALIBRATION V2 (Studio Layout: Topbar, 2-Col Canvases + Inspector)
+   ========================================================================= */
+.map-calib-v2 {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  height: 100%;
+  min-height: 0;
+  width: 100%;
+  background: var(--bg0, #e8ece7);
+  overflow: hidden;
+  border-radius: 12px;
+  border: 1px solid var(--line, #c5cec4);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.05);
+}
+
+/* --- Topbar --- */
+.map-calib-topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 14px;
+  background: rgba(255, 255, 255, 0.85);
+  backdrop-filter: blur(10px);
+  border-bottom: 1px solid var(--line, #c5cec4);
+  flex-shrink: 0;
+}
+
+.map-calib-topbar-left,
+.map-calib-topbar-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.map-calib-cam-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 12px;
+  border-radius: 8px;
+  background: rgba(15, 110, 86, 0.08);
+  border: 1px solid rgba(15, 110, 86, 0.18);
+  font-size: 13px;
+  color: var(--ink, #152018);
+}
+
+.map-calib-cam-pills {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.map-calib-cam-pill {
+  appearance: none;
+  font: inherit;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.04);
+  border: 1px solid var(--line, #c5cec4);
+  font-size: 11px;
+  color: var(--muted, #5a675e);
+  cursor: pointer;
+  line-height: 1.3;
+  transition: all 0.15s ease;
+}
+
+.map-calib-cam-pill:hover {
+  background: rgba(0, 0, 0, 0.08);
+  border-color: #9cb09e;
+  color: var(--ink, #152018);
+  transform: translateY(-1px);
+}
+
+.map-calib-cam-pill:active {
+  transform: translateY(0);
+}
+
+.map-calib-cam-pill strong {
+  font-family: var(--mono, monospace);
+  font-size: 11px;
+  color: var(--ink, #152018);
+}
+
+.map-calib-cam-pill.is-active {
+  background: #fff;
+  border-color: var(--accent, #0f6e56);
+  box-shadow: 0 0 0 1.5px var(--accent, #0f6e56), 0 2px 6px rgba(15, 110, 86, 0.12);
+  color: var(--ink, #152018);
+}
+
+.map-calib-cam-pill.is-active strong {
+  color: var(--accent, #0f6e56);
+}
+
+.map-calib-cam-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  box-shadow: 0 0 0 2px #fff;
+}
+
+.map-calib-main-tabs {
+  display: inline-flex;
+  background: rgba(0, 0, 0, 0.06);
+  border-radius: 8px;
+  padding: 3px;
+  gap: 3px;
+}
+
+.map-calib-main-tabs button {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  padding: 5px 12px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted, #5a675e);
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.map-calib-main-tabs button.is-active {
+  background: #fff;
+  color: var(--ink, #152018);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.1);
+}
+
+.map-calib-save-status {
+  font-size: 12px;
+}
+
+.map-calib-clean-pill {
+  color: #2e7d32;
+  font-weight: 600;
+  background: rgba(46, 125, 50, 0.08);
+  padding: 4px 10px;
+  border-radius: 6px;
+  border: 1px solid rgba(46, 125, 50, 0.16);
+}
+
+.map-calib-dirty-pill {
+  color: #c45c26;
+  font-weight: 700;
+  background: rgba(196, 92, 38, 0.12);
+  padding: 4px 10px;
+  border-radius: 6px;
+  border: 1px solid rgba(196, 92, 38, 0.3);
+  animation: map-calib-pulse 1.4s ease-in-out infinite;
+}
+
+.map-calib-btn-feet {
+  appearance: none;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 6px 12px;
+  border-radius: 8px;
+  border: 1px solid rgba(15, 110, 86, 0.25);
+  background: rgba(15, 110, 86, 0.08);
+  color: var(--accent, #0f6e56);
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.map-calib-btn-feet:hover {
+  background: rgba(15, 110, 86, 0.16);
+}
+
+.map-calib-btn-save {
+  appearance: none;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 700;
+  padding: 6px 14px;
+  border-radius: 8px;
+  border: 1px solid var(--accent, #0f6e56);
+  background: var(--accent, #0f6e56);
+  color: #fff;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.map-calib-btn-save:hover {
+  filter: brightness(1.1);
+}
+
+.map-calib-btn-save.needs-save {
+  background: #c45c26;
+  border-color: #c45c26;
+  box-shadow: 0 0 0 2px rgba(196, 92, 38, 0.35);
+}
+
+.map-calib-btn-save:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.map-calib-more-actions {
+  display: inline-flex;
+  gap: 4px;
+}
+
+.map-calib-btn-sub {
+  font: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 5px 9px;
+  border-radius: 6px;
+  border: 1px solid var(--line, #c5cec4);
+  background: rgba(255, 255, 255, 0.8);
+  color: var(--muted, #5a675e);
+  cursor: pointer;
+}
+
+.map-calib-btn-sub:hover {
+  background: #fff;
+  color: var(--ink, #152018);
+}
+
+.map-calib-file-btn {
+  display: inline-flex;
+  align-items: center;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 5px 9px;
+  border-radius: 6px;
+  border: 1px solid var(--line, #c5cec4);
+  background: rgba(255, 255, 255, 0.8);
+  color: var(--muted, #5a675e);
+  cursor: pointer;
+}
+
+.map-calib-file-btn input {
+  display: none;
+}
+
+.map-calib-file-btn:hover {
+  background: #fff;
+  color: var(--ink, #152018);
+}
+
+.map-calib-error-banner {
+  background: #ffebee;
+  color: #c62828;
+  padding: 6px 16px;
+  font-size: 12px;
+  font-weight: 600;
+  border-bottom: 1px solid #ffcdd2;
+}
+
+/* --- Main Workspace Layout (2 Columns) --- */
+.map-calib-workspace {
+  display: grid;
+  grid-template-columns: 1fr 360px;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
+  height: 100%;
+}
+
+@media (max-width: 1100px) {
+  .map-calib-workspace {
+    grid-template-columns: 1fr 310px;
+  }
+}
+
+@media (max-width: 900px) {
+  .map-calib-workspace {
+    grid-template-columns: 1fr;
+    grid-template-rows: 1fr auto;
+    overflow-y: auto;
+  }
+  .map-calib-canvases {
+    grid-template-columns: 1fr;
+    height: auto;
+    min-height: 520px;
+  }
+}
+
+/* --- Left Canvases Column --- */
+.map-calib-canvases {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  padding: 10px;
+  min-height: 0;
+  overflow: hidden;
+  height: 100%;
+}
+
+.map-calib-pane {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  background: #0d1210;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  overflow: hidden;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.15);
+}
+
+.map-calib-pane-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 12px;
+  background: #141c18;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  flex-shrink: 0;
+  gap: 8px;
+  color: #e2e8e4;
+}
+
+.map-calib-pane-title {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  font-size: 12px;
+}
+
+.map-calib-pane-title strong {
+  font-weight: 700;
+  color: #fff;
+}
+
+.map-calib-pane-meta {
+  font-family: var(--mono, monospace);
+  font-size: 11px;
+  color: #9cb09e;
+}
+
+.map-calib-pane-hud {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.map-calib-pane-hud button {
+  appearance: none;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  color: #e2e8e4;
+  padding: 3px 8px;
+  cursor: pointer;
+  line-height: 1.3;
+  transition: all 0.12s ease;
+}
+
+.map-calib-pane-hud button:hover {
+  background: rgba(255, 255, 255, 0.18);
+  color: #fff;
+  border-color: rgba(255, 255, 255, 0.3);
+}
+
+.map-calib-hud-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  color: #a0aba4;
+  margin-left: 6px;
+  cursor: pointer;
+}
+
+.map-calib-rot-label {
+  font-family: var(--mono, monospace);
+  font-size: 11px;
+  font-weight: 700;
+  color: #81c784;
+  min-width: 2.2em;
+  text-align: center;
+}
+
+.map-calib-stage {
+  position: relative;
+  flex: 1 1 auto;
+  height: 100%;
+  min-height: 0;
+  width: 100%;
+  background: #090e0b;
+  overflow: hidden;
+  cursor: crosshair;
+  touch-action: none;
+}
+
+.map-calib-stage.is-armed {
+  box-shadow: inset 0 0 0 2px rgba(15, 110, 86, 0.6);
+}
+
+.map-calib-stage.is-test {
+  box-shadow: inset 0 0 0 2px rgba(196, 92, 38, 0.6);
+}
+
+.map-calib-stage.is-place {
+  cursor: crosshair;
+  box-shadow: inset 0 0 0 2px rgba(42, 90, 138, 0.6);
+}
+
+.map-calib-stage.is-draw {
+  cursor: crosshair;
+  box-shadow: inset 0 0 0 2px rgba(90, 90, 90, 0.6);
+}
+
+/* --- Right Inspector Sidebar --- */
+.map-calib-sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  background: #fff;
+  border-left: 1px solid var(--line, #c5cec4);
+  overflow-y: auto;
+  overflow-x: hidden;
+  height: 100%;
+}
+
+/* Quality Card */
+.map-calib-quality-card {
+  border-radius: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--line, #c5cec4);
+  background: #fbfdfa;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.map-calib-quality-card.is-good {
+  background: #f1f8f3;
+  border-color: #c8e6c9;
+}
+
+.map-calib-quality-card.is-warn {
+  background: #fffdf6;
+  border-color: #ffe0b2;
+}
+
+.map-calib-quality-card.is-bad {
+  background: #fdf6f4;
+  border-color: #ffcdd2;
+}
+
+.map-calib-quality-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.map-calib-quality-title {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted, #5a675e);
+}
+
+.map-calib-quality-badge {
+  font-size: 11px;
+  font-weight: 700;
+  padding: 2px 8px;
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.06);
+}
+
+.map-calib-quality-card.is-good .map-calib-quality-badge {
+  background: #2e7d32;
+  color: #fff;
+}
+
+.map-calib-quality-card.is-warn .map-calib-quality-badge {
+  background: #e65100;
+  color: #fff;
+}
+
+.map-calib-quality-card.is-bad .map-calib-quality-badge {
+  background: #c62828;
+  color: #fff;
+}
+
+.map-calib-quality-metrics {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 4px;
+  background: rgba(0, 0, 0, 0.04);
+  padding: 6px 4px;
+  border-radius: 6px;
+}
+
+.map-calib-q-metric {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+}
+
+.map-calib-q-metric label {
+  font-size: 9px;
+  font-weight: 600;
+  color: var(--muted, #5a675e);
+  text-transform: uppercase;
+}
+
+.map-calib-q-metric strong {
+  font-family: var(--mono, monospace);
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--ink, #152018);
+}
+
+.map-calib-quality-hint {
+  font-size: 11px;
+  line-height: 1.35;
+  color: var(--ink, #152018);
+  margin: 0;
+}
+
+/* Accordion Stepper Sections */
+.map-calib-section {
+  border: 1px solid var(--line, #c5cec4);
+  border-radius: 10px;
+  overflow: hidden;
+  background: #fff;
+  transition: all 0.15s ease;
+}
+
+.map-calib-section.is-open {
+  border-color: #81c784;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.04);
+}
+
+.map-calib-section-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  background: #fafbfa;
+  cursor: pointer;
+  user-select: none;
+}
+
+.map-calib-section.is-open .map-calib-section-head {
+  background: #f0f7f4;
+  border-bottom: 1px solid #e0ece6;
+}
+
+.map-calib-step-num {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: #ebf0ec;
+  color: #3b4d41;
+  font-size: 11px;
+  font-weight: 700;
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+}
+
+.map-calib-section.is-open .map-calib-step-num {
+  background: #1b5e20;
+  color: #fff;
+}
+
+.map-calib-section-title {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+}
+
+.map-calib-section-title strong {
+  font-size: 12px;
+  color: var(--ink, #152018);
+}
+
+.map-calib-section-title small {
+  font-size: 10px;
+  color: var(--muted, #5a675e);
+}
+
+.map-calib-step-arrow {
+  font-size: 9px;
+  color: var(--muted, #8a9890);
+}
+
+.map-calib-section-body {
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* Control elements */
+.map-calib-control-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.map-calib-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--muted, #5a675e);
+}
+
+.map-calib-select-input {
+  font: inherit;
+  font-size: 12px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--line, #c5cec4);
+  background: #fff;
+}
+
+.map-calib-btn-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.map-calib-btn {
+  appearance: none;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 6px 11px;
+  border-radius: 6px;
+  border: 1px solid var(--line, #c5cec4);
+  background: #fff;
+  color: var(--ink, #152018);
+  cursor: pointer;
+  transition: all 0.12s ease;
+}
+
+.map-calib-btn:hover {
+  background: #f4f6f4;
+  border-color: #9cb09e;
+}
+
+.map-calib-btn.primary {
+  background: #1b5e20;
+  border-color: #1b5e20;
+  color: #fff;
+}
+
+.map-calib-btn.primary:hover {
+  background: #2e7d32;
+}
+
+.map-calib-btn.is-active {
+  background: #2a5a8a;
+  border-color: #2a5a8a;
+  color: #fff;
+}
+
+.map-calib-btn.is-full {
+  width: 100%;
+  text-align: center;
+  padding: 8px 12px;
+}
+
+.map-calib-btn-danger {
+  appearance: none;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 6px 10px;
+  border-radius: 6px;
+  border: 1px solid #ffcdd2;
+  background: #ffebee;
+  color: #c62828;
+  cursor: pointer;
+}
+
+.map-calib-btn-danger:hover {
+  background: #ffcdd2;
+}
+
+/* Pairs list and section expansion */
+.map-calib-section.is-pairs.is-open {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 220px;
+}
+
+.map-calib-section.is-pairs.is-open .map-calib-section-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.map-calib-pairs-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  flex: 1 1 auto;
+  min-height: 140px;
+  max-height: none;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.map-calib-pair-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  background: #f9fbf9;
+  border: 1px solid #eef2ed;
+  font-size: 11px;
+  cursor: pointer;
+  transition: all 0.1s ease;
+}
+
+.map-calib-pair-item:hover,
+.map-calib-pair-item.is-hot {
+  background: #eef7f0;
+  border-color: #81c784;
+  box-shadow: 0 0 0 1.5px rgba(76, 175, 80, 0.35), 0 2px 6px rgba(0, 0, 0, 0.05);
+}
+
+.map-calib-pair-item:hover .map-calib-pair-index,
+.map-calib-pair-item.is-hot .map-calib-pair-index {
+  color: #1b5e20;
+  font-weight: 800;
+}
+
+.map-calib-pair-item.is-bad {
+  background: #fff8f6;
+  border-color: #ffcdd2;
+}
+
+.map-calib-pair-index {
+  font-family: var(--mono, monospace);
+  font-weight: 700;
+  color: var(--muted, #5a675e);
+  width: 22px;
+}
+
+.map-calib-pair-coords {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  font-family: var(--mono, monospace);
+  font-size: 10px;
+  color: var(--ink, #152018);
+}
+
+.map-calib-pair-err {
+  font-family: var(--mono, monospace);
+  font-size: 10px;
+  font-weight: 700;
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+
+.map-calib-pair-err.is-ok {
+  background: rgba(46, 125, 50, 0.1);
+  color: #2e7d32;
+}
+
+.map-calib-pair-err.is-bad {
+  background: rgba(198, 40, 40, 0.12);
+  color: #c62828;
+}
+
+.map-calib-pair-del {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: #a0aba4;
+  font-size: 12px;
+  padding: 2px 4px;
+  cursor: pointer;
+  border-radius: 4px;
+}
+
+.map-calib-pair-del:hover {
+  color: #c62828;
+  background: rgba(198, 40, 40, 0.08);
+}
+
+.map-calib-empty-pairs {
+  font-size: 11px;
+  color: var(--muted, #5a675e);
+  line-height: 1.4;
+  padding: 16px 8px;
+  text-align: center;
+  background: #fafbfa;
+  border-radius: 6px;
+  border: 1px dashed #dce2d9;
+}
+
+/* 3D Inputs */
+.map-calib-inputs-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6px;
+}
+
+.map-calib-field {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.map-calib-field span {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--muted, #5a675e);
+}
+
+.map-calib-field input {
+  font: inherit;
+  font-size: 12px;
+  padding: 5px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--line, #c5cec4);
+  width: 100%;
+}
+
+.map-calib-checkbox-row {
+  margin: 4px 0;
+}
+
+.map-calib-checkbox-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--ink, #152018);
+  cursor: pointer;
+}
+
+/* Test result */
+.map-calib-text-muted {
+  font-size: 11px;
+  color: var(--muted, #5a675e);
+  line-height: 1.35;
+  margin: 0;
+}
+
+.map-calib-test-result {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  border-radius: 6px;
+  background: #f0f4f8;
+  font-size: 11px;
+}
+
+.map-calib-test-result strong {
+  font-family: var(--mono, monospace);
+  font-size: 12px;
+}
+
+.map-calib-test-result strong.is-ok {
+  color: #2e7d32;
+}
+
+.map-calib-test-result strong.is-bad {
+  color: #c62828;
+}
+
+/* Counters panel in sidebar */
+.map-calib-counters-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.map-calib-counters-head strong {
+  font-size: 13px;
+  color: var(--ink, #152018);
+}
+
+.map-calib-counters-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex: 1 1 auto;
+  min-height: 180px;
+  max-height: none;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.map-calib-counter-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  border-radius: 8px;
+  background: #f8faf8;
+  border: 1px solid var(--line, #c5cec4);
+  cursor: pointer;
+  transition: all 0.12s ease;
+}
+
+.map-calib-counter-card:hover,
+.map-calib-counter-card.is-selected {
+  background: #e8f5e9;
+  border-color: #81c784;
+}
+
+.map-calib-counter-info {
+  display: flex;
+  flex-direction: column;
+}
+
+.map-calib-counter-info strong {
+  font-size: 12px;
+}
+
+.map-calib-counter-info small {
+  font-size: 10px;
+  color: var(--muted, #5a675e);
+}
+
+/* Footer Status Bar */
+.map-calib-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 16px;
+  background: rgba(255, 255, 255, 0.85);
+  backdrop-filter: blur(10px);
+  border-top: 1px solid var(--line, #c5cec4);
+  font-size: 11px;
+  color: var(--muted, #5a675e);
+  flex-shrink: 0;
+}
+
+.map-calib-footer-status {
+  font-family: var(--mono, monospace);
+  color: var(--ink, #152018);
+  font-weight: 600;
+}
+
+.map-calib-footer-hotkeys {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.map-calib-kbd {
+  display: inline-block;
+  padding: 1px 5px;
+  border-radius: 4px;
+  border: 1px solid rgba(42, 58, 46, 0.18);
+  background: rgba(42, 58, 46, 0.06);
+  font-family: var(--mono, monospace);
+  font-size: 10px;
+  font-weight: 600;
+  color: rgba(42, 58, 46, 0.75);
+  vertical-align: 0.5px;
+}
+
+.map-calib-rot,
+.map-floor-rot {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.map-calib-rot button,
+.map-floor-rot button {
+  font: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 7px;
+  border-radius: 6px;
+  border: 1px solid var(--line, #c8d0c4);
+  background: #fff;
+  color: #2a3a2e;
+  cursor: pointer;
+  line-height: 1.3;
+}
+
+.map-calib-rot button:hover,
+.map-floor-rot button:hover {
+  border-color: #2a5a8a;
+  color: #2a5a8a;
+}
+
+.map-floor-rot {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 5;
+  padding: 3px 5px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.92);
+  border: 1px solid rgba(0, 0, 0, 0.08);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12);
+}
+
+.map-floor-rot span {
+  font-family: var(--mono, monospace);
+  font-size: 11px;
+  font-weight: 700;
+  min-width: 2.5em;
+  text-align: center;
+  color: #2a3a2e;
+}
+
+.map-calib-counters {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 3;
+  overflow: visible;
+}
+
+.map-calib-counter-poly {
+  fill: rgba(90, 90, 90, 0.18);
+  stroke: #6a6a6a;
+}
+
+.map-calib-counter-poly.is-hot {
+  fill: rgba(70, 70, 70, 0.32);
+  stroke: #3a3a3a;
+}
+
+.map-calib-counter-draft {
+  fill: none;
+  stroke: #5a5a5a;
+  stroke-dasharray: 10 8;
+}
+
+.map-calib-counter-vert {
+  fill: #7a7a7a;
+  stroke: #fff;
+}
+
+.map-calib-counter-vert.is-hot,
+.map-calib-counter-vert.is-draft {
+  fill: #4a4a4a;
+  stroke: #fff;
+}
+
+.map-calib-dot.is-dim {
+  opacity: 0.72;
+  z-index: 4;
+}
+
+.map-calib-cam-pin {
+  position: absolute;
+  left: 0;
+  top: 0;
+  z-index: 7;
+  width: 18px;
+  height: 18px;
+  pointer-events: none;
+  transform-origin: center center;
+}
+
+.map-calib-cam-pin-body {
+  position: absolute;
+  inset: 2px;
+  border-radius: 50%;
+  background: var(--cam-color, #2a5a8a);
+  box-shadow: 0 0 0 2px #fff;
+}
+
+.map-calib-cam-pin-dir {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 0;
+  height: 0;
+  border-style: solid;
+  border-width: 5px 0 5px 14px;
+  border-color: transparent transparent transparent var(--cam-color, #2a5a8a);
+  transform: translate(2px, -50%);
+  filter: drop-shadow(0 0 1px #fff);
+}
+
+.map-calib-cam-pin-label {
+  position: absolute;
+  left: 0;
+  top: 0;
+  z-index: 12;
+  /* якорь 0×0 — сдвиг в CSS px/% самой подписи, не % родителя */
+  transform: translate(calc(-50% + var(--label-dx, 0px)), calc(-100% - 20px)) rotate(var(--pin-rot, 0deg));
+  transform-origin: center center;
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--cam-color, #2a5a8a);
+  background: rgba(255, 255, 255, 0.96);
+  padding: 2px 6px;
+  border-radius: 5px;
+  border: 1px solid color-mix(in srgb, var(--cam-color, #2a5a8a) 45%, #fff);
+  white-space: nowrap;
+  pointer-events: none;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.18);
+  opacity: 1;
+  line-height: 1.2;
+}
+
+.map-calib-cam-pin-label.is-active {
+  box-shadow:
+    0 1px 4px rgba(0, 0, 0, 0.18),
+    0 0 0 2px color-mix(in srgb, var(--cam-color, #0f6e56) 35%, transparent);
+}
+
+.map-calib-cam-pin.is-dim .map-calib-cam-pin-body,
+.map-calib-cam-pin.is-dim .map-calib-cam-pin-dir {
+  opacity: 0.4;
+}
+
+.map-calib-cam-pin.is-active .map-calib-cam-pin-body {
+  box-shadow:
+    0 0 0 2px #fff,
+    0 0 0 4px color-mix(in srgb, var(--cam-color, #0f6e56) 40%, transparent);
+}
+
+.map-calib-cam-pin.is-active {
+  opacity: 1;
+  z-index: 8;
+}
+
+.map-calib-tile-mark {
+  position: absolute;
+  left: 0;
+  top: 0;
+  transform: translate(-50%, -50%);
+  z-index: 9;
+  pointer-events: none;
+  min-width: 24px;
+  height: 24px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: #c45c26;
+  color: #fff;
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 700;
+  display: grid;
+  place-items: center;
+  box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.95), 0 2px 8px rgba(0, 0, 0, 0.25);
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.map-calib-measure {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  z-index: 2;
+  overflow: visible;
+}
+
+.map-calib-measure-line {
+  stroke: currentColor;
+  stroke-width: 3;
+  stroke-dasharray: 10 8;
+  opacity: 0.9;
+}
+
+.map-calib-measure-line.is-wall {
+  stroke: #2a7ab8;
+  stroke-width: 2.5;
+  stroke-dasharray: 6 7;
+  opacity: 0.85;
+}
+
+.map-calib-measure-label {
+  --measure-color: #c45c26;
+  position: absolute;
+  left: 0;
+  top: 0;
+  transform: translate(-50%, -50%) rotate(var(--measure-rot, 0deg));
+  transform-origin: center center;
+  z-index: 11;
+  pointer-events: none;
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1px;
+  padding: 4px 8px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.96);
+  border: 1px solid var(--measure-color);
+  color: var(--measure-color);
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 700;
+  white-space: nowrap;
+  line-height: 1.15;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.16);
+}
+
+.map-calib-measure-label.is-wall {
+  --measure-color: #2a7ab8;
+  z-index: 11;
+  background: rgba(235, 245, 252, 0.95);
+  border-color: #2a7ab8;
+  color: #1a4f78;
+}
+
+.map-calib-measure-label.is-wall em {
+  color: #3d7ab0;
+}
+
+.map-calib-measure-label em {
+  font-style: normal;
+  font-weight: 500;
+  font-size: 9px;
+  color: color-mix(in srgb, var(--measure-color) 75%, #333);
+}
+
+.map-calib-floor-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
+.map-calib-cam-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
+.map-calib-cam.has-pl strong {
+  color: var(--cam-color, #2a5a8a);
+}
+
+.map-calib-stage img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: fill;
+  user-select: none;
+}
+
+.map-calib-dot {
+  position: absolute;
+  left: 0;
+  top: 0;
+  transform: translate(-50%, -50%) scale(var(--dot-hud, 1));
+  transform-origin: center center;
+  min-width: 28px;
+  height: 20px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: var(--accent);
+  color: #fff;
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 700;
+  display: grid;
+  place-items: center;
+  box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.9);
+  border: 0;
+  z-index: 3;
+  white-space: nowrap;
+  line-height: 1;
+}
+
+.map-calib-dot.is-other {
+  opacity: 0.45;
+  z-index: 2;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.75);
+}
+
+.map-calib-dot.is-hot {
+  z-index: 25 !important;
+  transform: translate(-50%, -50%) rotate(var(--dot-rot, 0deg)) scale(calc(var(--dot-hud, 1) * 1.08));
+  font-weight: 800;
+  animation: mapCalibDotBlink 0.9s infinite ease-in-out;
+}
+
+@keyframes mapCalibDotBlink {
+  0%, 100% {
+    box-shadow:
+      0 0 0 2px #ffffff,
+      0 0 0 4.5px #ff1744,
+      0 0 14px rgba(255, 23, 68, 0.85),
+      0 2px 6px rgba(0, 0, 0, 0.35);
+  }
+  50% {
+    box-shadow:
+      0 0 0 2px #ffffff,
+      0 0 0 4.5px #00e676,
+      0 0 16px rgba(0, 230, 118, 0.95),
+      0 2px 6px rgba(0, 0, 0, 0.35);
+  }
+}
+
+.map-calib-dot.is-bad {
+  box-shadow: 0 0 0 2px #fff, 0 0 0 4px var(--danger);
+}
+
+.map-calib-dot.pending {
+  background: var(--merge);
+  pointer-events: none;
+}
+
+.map-calib-ghost {
+  position: absolute;
+  left: 0;
+  top: 0;
+  transform: translate(-50%, -50%);
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  border: 2px dashed #c45c26;
+  background: transparent;
+  pointer-events: none;
+  z-index: 2;
+}
+
+.map-calib-grid-pt {
+  position: absolute;
+  left: 0;
+  top: 0;
+  transform: translate(-50%, -50%);
+  width: 4px;
+  height: 4px;
+  border-radius: 1px;
+  background: rgba(15, 110, 86, 0.55);
+  pointer-events: none;
+  z-index: 1;
+}
+
+.map-calib-test,
+.map-calib-test-h {
+  position: absolute;
+  left: 0;
+  top: 0;
+  transform: translate(-50%, -50%);
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #c45c26;
+  box-shadow: 0 0 0 3px rgba(196, 92, 38, 0.35);
+  pointer-events: none;
+  z-index: 5;
+}
+
+.map-calib-test-ray {
+  position: absolute;
+  left: 0;
+  top: 0;
+  transform: translate(-50%, -50%);
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #2a6fd4;
+  box-shadow: 0 0 0 3px rgba(42, 111, 212, 0.35);
+  pointer-events: none;
+  z-index: 6;
+}
+
+.map-calib-test-gap-svg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  z-index: 4;
+}
+
+.map-calib-table-wrap {
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: rgba(255,255,255,0.55);
+}
+
+.map-calib-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.map-calib-table th,
+.map-calib-table td {
+  text-align: left;
+  padding: 6px 10px;
+  border-bottom: 1px solid rgba(197, 206, 196, 0.55);
+}
+
+.map-calib-table th {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  background: rgba(255,255,255,0.5);
+}
+
+.map-calib-table tr.is-hot {
+  background: var(--merge-bg);
+}
+
+.map-calib-table td.bad {
+  color: var(--danger);
+  font-weight: 700;
+}

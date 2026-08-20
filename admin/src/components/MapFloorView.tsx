@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import type { FeetDoc, TrackingData } from "../types";
 import {
+  colorForCameraKey,
   drawCameraPlacement,
   normalizePlacement,
   type CameraPlacement,
@@ -19,6 +20,7 @@ import {
   resolveDetectEveryN,
   type MergeTimeline,
 } from "../utils";
+import type { FeetSource } from "../feet";
 
 export type MapCameraMark = {
   key: string;
@@ -30,8 +32,6 @@ export type MapCalibPoint = {
   index: number;
   map: Pt;
 };
-
-import type { FeetSource } from "../feet";
 
 /** Точка человека на плане (мультикам, вкладка «Люди»). */
 export type MapLiveMarker = {
@@ -65,7 +65,21 @@ type Props = {
   /** Готовые точки на плане — без привязки к одному tracking/H */
   markers?: MapLiveMarker[];
   feetDoc?: FeetDoc | null;
+  /** Режим источника данных: "day" (только мультикам-маркеры дня) или "video" (только трекинг активного видео). */
+  sourceMode?: "day" | "video";
 };
+
+type ViewState = {
+  scale: number;
+  tx: number;
+  ty: number;
+};
+
+const IDENTITY_VIEW: ViewState = { scale: 1, tx: 0, ty: 0 };
+
+function normRot(deg: number): number {
+  return ((Math.round(deg / 45) * 45) % 360 + 360) % 360;
+}
 
 export function MapFloorView({
   floorplanUrl,
@@ -74,7 +88,7 @@ export function MapFloorView({
   videoRef,
   videoActive = false,
   currentFrame,
-  showTrails,
+  showTrails: defaultShowTrails = true,
   focusTrackIds = null,
   groupByTrack = {},
   mergeTimeline = null,
@@ -86,13 +100,22 @@ export function MapFloorView({
   compact = false,
   markers = [],
   feetDoc = null,
+  sourceMode,
 }: Props) {
   const stageRef = useRef<HTMLDivElement>(null);
   const imgRef = useRef<HTMLImageElement>(null);
   const gridRef = useRef<HTMLCanvasElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const trailRef = useRef<Map<number, Pt[]>>(new Map());
+
   const [rotDeg, setRotDeg] = useState(0);
+  const [view, setView] = useState<ViewState>(IDENTITY_VIEW);
+  const [showTrailsState, setShowTrailsState] = useState(defaultShowTrails);
+  const [showCameras, setShowCameras] = useState(true);
+  const [showCounters, setShowCounters] = useState(true);
+  const [imgNatSize, setImgNatSize] = useState<[number, number]>([MAP_W, MAP_H]);
+  const [stageSize, setStageSize] = useState<{ width: number; height: number }>({ width: 0, height: 0 });
+
   const useGrid = isGridFloorplan(floorplanUrl) || floorplanUrl === "grid" || !floorplanUrl;
   const feetIndex = useMemo(() => buildFeetIndex(feetDoc), [feetDoc]);
   const currentFrameRef = useRef(currentFrame);
@@ -100,14 +123,60 @@ export function MapFloorView({
   const drawRef = useRef<() => void>(() => {});
   const videoRefProp = videoRef;
 
-  function normRot(deg: number): number {
-    return ((Math.round(deg / 45) * 45) % 360 + 360) % 360;
-  }
+  useLayoutEffect(() => {
+    const el = stageRef.current;
+    if (!el) return;
+    const update = () => {
+      const rect = el.getBoundingClientRect();
+      const width = Math.round(rect.width);
+      const height = Math.round(rect.height);
+      if (width > 0 && height > 0) {
+        setStageSize((prev) => (prev.width === width && prev.height === height ? prev : { width, height }));
+      }
+    };
+    update();
+    const raf = requestAnimationFrame(update);
+    const ro = typeof ResizeObserver !== "undefined" ? new ResizeObserver(update) : null;
+    ro?.observe(el);
+    window.addEventListener("resize", update);
+    return () => {
+      cancelAnimationFrame(raf);
+      ro?.disconnect();
+      window.removeEventListener("resize", update);
+    };
+  }, []);
+
+  const panDragRef = useRef<{
+    startX: number;
+    startY: number;
+    startTx: number;
+    startTy: number;
+    moved: boolean;
+  } | null>(null);
 
   useEffect(() => {
     trailRef.current.clear();
-  }, [tracking, homography?.H, floorplanUrl, markers]);
+  }, [sourceMode, tracking, homography?.H, floorplanUrl, markers]);
 
+  // Загрузка размеров растрового изображения
+  useEffect(() => {
+    if (useGrid) {
+      setImgNatSize([MAP_W, MAP_H]);
+      return;
+    }
+    const img = new Image();
+    img.src = floorplanUrl;
+    if (img.complete && img.naturalWidth > 0 && img.naturalHeight > 0) {
+      setImgNatSize([img.naturalWidth, img.naturalHeight]);
+    }
+    img.onload = () => {
+      if (img.naturalWidth > 0 && img.naturalHeight > 0) {
+        setImgNatSize([img.naturalWidth, img.naturalHeight]);
+      }
+    };
+  }, [useGrid, floorplanUrl]);
+
+  // Отрисовка базовой сетки
   useEffect(() => {
     if (!useGrid) return;
     const grid = gridRef.current;
@@ -120,272 +189,283 @@ export function MapFloorView({
     if (ctx) drawFloorGrid(ctx, MAP_W, MAP_H);
   }, [useGrid, floorplanUrl]);
 
+  // Главная процедура отрисовки и позиционирования
   useEffect(() => {
-    const img = imgRef.current;
-    const grid = gridRef.current;
     const canvas = canvasRef.current;
     const stage = stageRef.current;
     if (!canvas || !stage) return;
-    const bg = useGrid ? grid : img;
-    if (!bg) return;
 
     let raf = 0;
 
     const draw = () => {
       const ctx = canvas.getContext("2d");
       if (!ctx) return;
-      const mw = useGrid ? MAP_W : img?.naturalWidth || MAP_W;
-      const mh = useGrid ? MAP_H : img?.naturalHeight || MAP_H;
+
+      const mw = useGrid ? MAP_W : imgNatSize[0];
+      const mh = useGrid ? MAP_H : imgNatSize[1];
       if (!mw || !mh) return;
 
-      const rect = stage.getBoundingClientRect();
-      if (rect.width < 2 || rect.height < 2) return;
-      const fit = Math.min(rect.width / mw, rect.height / mh);
-      const cw = Math.max(1, Math.round(mw * fit));
-      const ch = Math.max(1, Math.round(mh * fit));
       if (canvas.width !== mw || canvas.height !== mh) {
         canvas.width = mw;
         canvas.height = mh;
       }
-      canvas.style.width = `${cw}px`;
-      canvas.style.height = `${ch}px`;
-      canvas.style.left = `${(rect.width - cw) / 2}px`;
-      canvas.style.top = `${(rect.height - ch) / 2}px`;
-      canvas.style.transform = rotDeg ? `rotate(${rotDeg}deg)` : "";
-      canvas.style.transformOrigin = "50% 50%";
-
-      if (useGrid && grid) {
-        grid.style.width = `${cw}px`;
-        grid.style.height = `${ch}px`;
-        grid.style.left = `${(rect.width - cw) / 2}px`;
-        grid.style.top = `${(rect.height - ch) / 2}px`;
-        grid.style.transform = rotDeg ? `rotate(${rotDeg}deg)` : "";
-        grid.style.transformOrigin = "50% 50%";
-      } else if (img) {
-        img.style.transform = rotDeg ? `rotate(${rotDeg}deg)` : "";
-        img.style.transformOrigin = "50% 50%";
-      }
 
       ctx.clearRect(0, 0, mw, mh);
 
-      for (const c of counters?.counters ?? []) {
-        if (!c.map || c.map.length < 3) continue;
-        ctx.beginPath();
-        ctx.moveTo(c.map[0]![0], c.map[0]![1]);
-        for (let i = 1; i < c.map.length; i++) ctx.lineTo(c.map[i]![0], c.map[i]![1]);
-        ctx.closePath();
-        ctx.fillStyle = "rgba(90, 90, 90, 0.18)";
-        ctx.fill();
-        ctx.strokeStyle = "#5a5a5a";
-        ctx.lineWidth = Math.max(2, mw / 900);
-        ctx.stroke();
-      }
-
-      const livePlacement = normalizePlacement(homography?.placement);
-      const byKey = new Map<string, CameraPlacement>();
-      for (const c of camerasOnMap) {
-        const pl = normalizePlacement(c.placement);
-        if (pl) byKey.set(c.key, pl);
-      }
-      const activeKey = activeCameraKey ?? homography?.camera_key ?? null;
-      if (livePlacement && activeKey) byKey.set(activeKey, livePlacement);
-
-      for (const [key, pl] of byKey) {
-        drawCameraPlacement(ctx, pl, `cam ${key}`, {
-          active: key === activeKey,
-          dimmed: activeKey != null && key !== activeKey,
-          mapW: mw,
-          cameraKey: key,
-        });
-      }
-
-      const H = (homography?.H?.length === 9 ? (homography.H as Mat3) : null) ?? null;
-      const useMarkers = markers.length > 0;
-
-      if (useMarkers) {
-        const markerR = Math.max(12, mw / 60);
-        for (const mk of markers) {
-          const [u, v] = mk.map;
-          if (u < -mw * 0.2 || v < -mh * 0.2 || u > mw * 1.2 || v > mh * 1.2) continue;
-          const dimmed = mk.dimmed ?? !mk.live;
-          const lowConf = (mk.confidence ?? 1) < 0.65;
-          const color = dimmed ? "#8a9188" : colorForTrackId(mk.trackId);
-          const r = dimmed ? markerR * 0.75 : lowConf ? markerR * 0.85 : markerR;
-
-          ctx.globalAlpha = dimmed ? 0.5 : lowConf ? 0.82 : 1;
+      // 1. Полигоны прилавков
+      if (showCounters && counters?.counters) {
+        for (const c of counters.counters) {
+          if (!c.map || c.map.length < 3) continue;
           ctx.beginPath();
-          ctx.arc(u, v, r + 3, 0, Math.PI * 2);
+          ctx.moveTo(c.map[0]![0], c.map[0]![1]);
+          for (let i = 1; i < c.map.length; i++) ctx.lineTo(c.map[i]![0], c.map[i]![1]);
+          ctx.closePath();
+          ctx.fillStyle = "rgba(76, 175, 80, 0.18)";
+          ctx.fill();
+          ctx.strokeStyle = "#4caf50";
+          ctx.lineWidth = Math.max(2, mw / 900);
+          ctx.stroke();
+
+          if (c.name) {
+            const fontPx = Math.max(12, mw / 65);
+            ctx.save();
+            ctx.translate(c.map[0]![0], c.map[0]![1]);
+            if (rotDeg) {
+              ctx.rotate((-rotDeg * Math.PI) / 180);
+            }
+            ctx.font = `600 ${fontPx}px "IBM Plex Sans", sans-serif`;
+            ctx.fillStyle = "rgba(255,255,255,0.85)";
+            ctx.fillText(c.name, 4, -4);
+            ctx.restore();
+          }
+        }
+      }
+
+      // 2. Конусы камер
+      if (showCameras) {
+        const livePlacement = normalizePlacement(homography?.placement);
+        const byKey = new Map<string, CameraPlacement>();
+        for (const c of camerasOnMap) {
+          const pl = normalizePlacement(c.placement);
+          if (pl) byKey.set(c.key, pl);
+        }
+        const activeKey = activeCameraKey ?? homography?.camera_key ?? null;
+        if (livePlacement && activeKey) byKey.set(activeKey, livePlacement);
+
+        for (const [key, pl] of byKey) {
+          drawCameraPlacement(ctx, pl, `cam ${key}`, {
+            active: key === activeKey,
+            dimmed: activeKey != null && key !== activeKey,
+            mapW: mw,
+            cameraKey: key,
+            rotDeg,
+          });
+        }
+      }
+
+      // 3. Маркеры людей
+      const H = (homography?.H?.length === 9 ? (homography.H as Mat3) : null) ?? null;
+      const isDayMode = sourceMode === "day" || (sourceMode === undefined && markers !== undefined);
+
+      if (isDayMode) {
+        if (markers && markers.length > 0) {
+          const markerR = Math.max(12, mw / 60);
+          for (const mk of markers) {
+            const [u, v] = mk.map;
+            if (u < -mw * 0.2 || v < -mh * 0.2 || u > mw * 1.2 || v > mh * 1.2) continue;
+            const dimmed = mk.dimmed ?? !mk.live;
+            const lowConf = (mk.confidence ?? 1) < 0.65;
+            const color = dimmed ? "#8a9188" : colorForTrackId(mk.trackId);
+            const r = dimmed ? markerR * 0.75 : lowConf ? markerR * 0.85 : markerR;
+
+            ctx.globalAlpha = dimmed ? 0.5 : lowConf ? 0.82 : 1;
+            ctx.beginPath();
+            ctx.arc(u, v, r + 3, 0, Math.PI * 2);
+            ctx.fillStyle = "rgba(0,0,0,0.35)";
+            ctx.fill();
+            ctx.beginPath();
+            ctx.arc(u, v, r, 0, Math.PI * 2);
+            ctx.fillStyle = color;
+            ctx.fill();
+            ctx.strokeStyle = "#fff";
+            ctx.lineWidth = Math.max(2, mw / 450);
+            ctx.stroke();
+
+            if (lowConf && !dimmed) {
+              ctx.setLineDash([Math.max(3, mw / 200), Math.max(3, mw / 200)]);
+              ctx.beginPath();
+              ctx.arc(u, v, r + 5, 0, Math.PI * 2);
+              ctx.strokeStyle = "rgba(200, 120, 40, 0.85)";
+              ctx.lineWidth = Math.max(2, mw / 500);
+              ctx.stroke();
+              ctx.setLineDash([]);
+            }
+
+            const camId = mk.camera
+              .replace(/^Camera[_-]?0*(\d+).*$/i, "$1")
+              .replace(/^cam[_-]?0*(\d+)$/i, "$1")
+              .replace(/^0+(\d+)$/, "$1");
+            const label = `${camId} #${mk.trackId}`;
+            const fontPx = Math.max(11, mw / 52);
+            ctx.font = `700 ${fontPx}px "IBM Plex Mono", monospace`;
+            const tw = ctx.measureText(label).width;
+
+            ctx.save();
+            ctx.translate(u, v);
+            if (rotDeg) {
+              ctx.rotate((-rotDeg * Math.PI) / 180);
+            }
+            const lx = r + 4;
+            const ly = -r;
+            ctx.fillStyle = "rgba(0,0,0,0.72)";
+            ctx.fillRect(lx, ly - fontPx - 4, tw + 6, fontPx + 6);
+            ctx.fillStyle = "#fff";
+            ctx.fillText(label, lx + 3, ly - 5);
+            ctx.restore();
+            ctx.globalAlpha = 1;
+          }
+        }
+      } else if (H && tracking) {
+        const t =
+          tracking.fps > 0
+            ? currentFrameRef.current / tracking.fps
+            : (videoRefProp?.current?.currentTime ?? 0);
+        const frameFloat = frameAtTime(t, tracking.fps, tracking.frame_count);
+        const keyframes = buildTrackKeyframes(tracking);
+        const every = resolveDetectEveryN(tracking);
+        const dets = detectionsAtFrame(keyframes, frameFloat, every);
+        const focus = focusTrackIds != null ? new Set(focusTrackIds) : null;
+        const hasFocus = focus != null && focus.size > 0;
+
+        const ordered =
+          !hasFocus
+            ? dets
+            : [...dets.filter((d) => !focus.has(d.track_id)), ...dets.filter((d) => focus.has(d.track_id))];
+
+        const markerR = Math.max(14, mw / 55);
+        const trailW = Math.max(4, mw / 280);
+        const fontPx = Math.max(16, mw / 42);
+        ctx.font = `800 ${fontPx}px "IBM Plex Mono", monospace`;
+
+        let mergeMap: Map<number, { track_id: number; group_id?: number }> | null = null;
+        if (mergeTimeline && mergeTimeline.tracks.length) {
+          mergeMap = new Map();
+          for (const tr of mergeTimeline.tracks) {
+            if (t >= tr.t0 - 0.5 && t <= tr.t1 + 0.5) {
+              const entry = { track_id: tr.track_id, group_id: tr.group_id ?? undefined };
+              if (tr.global_id != null) mergeMap.set(tr.global_id, entry);
+              mergeMap.set(tr.track_id, entry);
+            }
+          }
+        }
+
+        for (const det of ordered) {
+          const camKey = activeCameraKey ?? homography?.camera_key ?? "";
+          const projected = resolveFeetOnMap(det, frameFloat, H, {
+            cameraKey: camKey,
+            homography,
+            trackingSize: tracking ? [tracking.width, tracking.height] : null,
+            feetDoc,
+            feetIndex,
+            detectEveryN: every,
+            personHeightM: feetDoc?.person_height_m ?? undefined,
+          });
+          if (!projected) continue;
+          const [u, v] = projected.map;
+          if (u < -mw * 0.2 || v < -mh * 0.2 || u > mw * 1.2 || v > mh * 1.2) continue;
+
+          let fragTrackId = det.track_id;
+          let gid = groupByTrack[det.track_id];
+          if (mergeMap) {
+            const match = mergeMap.get(det.track_id);
+            if (match) {
+              fragTrackId = match.track_id;
+              if (match.group_id != null) gid = match.group_id;
+            }
+          }
+
+          const dimmed = hasFocus && !focus.has(det.track_id) && !focus.has(fragTrackId);
+          const color = dimmed ? "#9aa0a6" : colorForTrackId(fragTrackId);
+          const r = dimmed ? markerR * 0.7 : markerR;
+
+          let hist = trailRef.current.get(det.track_id);
+          if (!hist) {
+            hist = [];
+            trailRef.current.set(det.track_id, hist);
+          }
+          const last = hist[hist.length - 1];
+          if (!last || Math.hypot(last[0] - u, last[1] - v) > 1.5) {
+            hist.push([u, v]);
+            if (hist.length > 50) hist.shift();
+          }
+
+          ctx.globalAlpha = dimmed ? 0.38 : 1;
+          if (showTrailsState && hist.length > 1) {
+            ctx.beginPath();
+            ctx.strokeStyle = "#fff";
+            ctx.lineWidth = trailW + 3;
+            ctx.lineJoin = "round";
+            ctx.lineCap = "round";
+            ctx.moveTo(hist[0]![0], hist[0]![1]);
+            for (let i = 1; i < hist.length; i++) ctx.lineTo(hist[i]![0], hist[i]![1]);
+            ctx.stroke();
+            ctx.beginPath();
+            ctx.strokeStyle = color;
+            ctx.lineWidth = trailW;
+            ctx.moveTo(hist[0]![0], hist[0]![1]);
+            for (let i = 1; i < hist.length; i++) ctx.lineTo(hist[i]![0], hist[i]![1]);
+            ctx.stroke();
+          }
+
+          ctx.beginPath();
+          ctx.arc(u, v, r + 4, 0, Math.PI * 2);
           ctx.fillStyle = "rgba(0,0,0,0.35)";
           ctx.fill();
+
           ctx.beginPath();
           ctx.arc(u, v, r, 0, Math.PI * 2);
           ctx.fillStyle = color;
           ctx.fill();
           ctx.strokeStyle = "#fff";
-          ctx.lineWidth = Math.max(2, mw / 450);
+          ctx.lineWidth = Math.max(3, mw / 400);
           ctx.stroke();
-          if (lowConf && !dimmed) {
-            ctx.setLineDash([Math.max(3, mw / 200), Math.max(3, mw / 200)]);
-            ctx.beginPath();
-            ctx.arc(u, v, r + 5, 0, Math.PI * 2);
-            ctx.strokeStyle = "rgba(200, 120, 40, 0.85)";
-            ctx.lineWidth = Math.max(2, mw / 500);
-            ctx.stroke();
-            ctx.setLineDash([]);
-          }
 
-          const camId = mk.camera
-            .replace(/^Camera[_-]?0*(\d+).*$/i, "$1")
-            .replace(/^cam[_-]?0*(\d+)$/i, "$1")
-            .replace(/^0+(\d+)$/, "$1");
-          const label = `${camId} #${mk.trackId}`;
-          const fontPx = Math.max(11, mw / 52);
-          ctx.font = `700 ${fontPx}px "IBM Plex Mono", monospace`;
-          const tw = ctx.measureText(label).width;
-          const lx = u + r + 4;
-          const ly = v - r;
-          ctx.fillStyle = "rgba(0,0,0,0.72)";
-          ctx.fillRect(lx, ly - fontPx - 4, tw + 6, fontPx + 6);
+          ctx.beginPath();
+          ctx.arc(u, v, Math.max(3, r * 0.28), 0, Math.PI * 2);
           ctx.fillStyle = "#fff";
-          ctx.fillText(label, lx + 3, ly - 5);
+          ctx.fill();
+
+          const label = typeof gid === "number" ? `t${fragTrackId} g${gid}` : `t${fragTrackId}`;
+          const tw = ctx.measureText(label).width;
+          const padX = 8;
+          const padY = 5;
+          const bw = tw + padX * 2;
+          const bh = fontPx + padY * 2;
+
+          ctx.save();
+          ctx.translate(u, v);
+          if (rotDeg) {
+            ctx.rotate((-rotDeg * Math.PI) / 180);
+          }
+          const lx = r + 6;
+          const ly = -r - 2;
+          ctx.fillStyle = "rgba(0,0,0,0.72)";
+          if (typeof ctx.roundRect === "function") {
+            ctx.beginPath();
+            ctx.roundRect(lx, ly - bh, bw, bh, 6);
+            ctx.fill();
+          } else {
+            ctx.fillRect(lx, ly - bh, bw, bh);
+          }
+          ctx.fillStyle = "#fff";
+          ctx.fillText(label, lx + padX, ly - padY - 2);
+          ctx.restore();
           ctx.globalAlpha = 1;
         }
-      } else if (!H || !tracking) {
-        return;
-      } else {
-      const t =
-        tracking.fps > 0
-          ? currentFrameRef.current / tracking.fps
-          : (videoRefProp?.current?.currentTime ?? 0);
-      const frameFloat = frameAtTime(t, tracking.fps, tracking.frame_count);
-      const keyframes = buildTrackKeyframes(tracking);
-      const every = resolveDetectEveryN(tracking);
-      const dets = detectionsAtFrame(keyframes, frameFloat, every);
-      const focus = focusTrackIds != null ? new Set(focusTrackIds) : null;
-      const hasFocus = focus != null && focus.size > 0;
 
-      const ordered =
-        !hasFocus
-          ? dets
-          : [...dets.filter((d) => !focus.has(d.track_id)), ...dets.filter((d) => focus.has(d.track_id))];
-
-      const markerR = Math.max(14, mw / 55);
-      const trailW = Math.max(4, mw / 280);
-      const fontPx = Math.max(16, mw / 42);
-      ctx.font = `800 ${fontPx}px "IBM Plex Mono", monospace`;
-
-      let mergeMap: Map<number, { track_id: number; group_id?: number }> | null = null;
-      if (mergeTimeline && mergeTimeline.tracks.length) {
-        mergeMap = new Map();
-        for (const tr of mergeTimeline.tracks) {
-          if (t >= tr.t0 - 0.5 && t <= tr.t1 + 0.5) {
-            const entry = { track_id: tr.track_id, group_id: tr.group_id ?? undefined };
-            if (tr.global_id != null) mergeMap.set(tr.global_id, entry);
-            mergeMap.set(tr.track_id, entry);
-          }
+        for (const id of [...trailRef.current.keys()]) {
+          if (!ordered.some((d) => d.track_id === id)) trailRef.current.delete(id);
         }
-      }
-
-      for (const det of ordered) {
-        const camKey = activeCameraKey ?? homography?.camera_key ?? "";
-        const projected = resolveFeetOnMap(det, frameFloat, H, {
-          cameraKey: camKey,
-          homography,
-          trackingSize: tracking ? [tracking.width, tracking.height] : null,
-          feetDoc,
-          feetIndex,
-          detectEveryN: every,
-          personHeightM: feetDoc?.person_height_m ?? undefined,
-        });
-        if (!projected) continue;
-        const [u, v] = projected.map;
-        if (u < -mw * 0.2 || v < -mh * 0.2 || u > mw * 1.2 || v > mh * 1.2) continue;
-
-        let fragTrackId = det.track_id;
-        let gid = groupByTrack[det.track_id];
-        if (mergeMap) {
-          const match = mergeMap.get(det.track_id);
-          if (match) {
-            fragTrackId = match.track_id;
-            if (match.group_id != null) gid = match.group_id;
-          }
-        }
-
-        const dimmed = hasFocus && !focus.has(det.track_id) && !focus.has(fragTrackId);
-        const color = dimmed ? "#9aa0a6" : colorForTrackId(fragTrackId);
-        const r = dimmed ? markerR * 0.7 : markerR;
-
-        let hist = trailRef.current.get(det.track_id);
-        if (!hist) {
-          hist = [];
-          trailRef.current.set(det.track_id, hist);
-        }
-        const last = hist[hist.length - 1];
-        if (!last || Math.hypot(last[0] - u, last[1] - v) > 1.5) {
-          hist.push([u, v]);
-          if (hist.length > 50) hist.shift();
-        }
-
-        ctx.globalAlpha = dimmed ? 0.38 : 1;
-        if (showTrails && hist.length > 1) {
-          ctx.beginPath();
-          ctx.strokeStyle = "#fff";
-          ctx.lineWidth = trailW + 3;
-          ctx.lineJoin = "round";
-          ctx.lineCap = "round";
-          ctx.moveTo(hist[0]![0], hist[0]![1]);
-          for (let i = 1; i < hist.length; i++) ctx.lineTo(hist[i]![0], hist[i]![1]);
-          ctx.stroke();
-          ctx.beginPath();
-          ctx.strokeStyle = color;
-          ctx.lineWidth = trailW;
-          ctx.moveTo(hist[0]![0], hist[0]![1]);
-          for (let i = 1; i < hist.length; i++) ctx.lineTo(hist[i]![0], hist[i]![1]);
-          ctx.stroke();
-        }
-
-        ctx.beginPath();
-        ctx.arc(u, v, r + 4, 0, Math.PI * 2);
-        ctx.fillStyle = "rgba(0,0,0,0.35)";
-        ctx.fill();
-
-        ctx.beginPath();
-        ctx.arc(u, v, r, 0, Math.PI * 2);
-        ctx.fillStyle = color;
-        ctx.fill();
-        ctx.strokeStyle = "#fff";
-        ctx.lineWidth = Math.max(3, mw / 400);
-        ctx.stroke();
-
-        ctx.beginPath();
-        ctx.arc(u, v, Math.max(3, r * 0.28), 0, Math.PI * 2);
-        ctx.fillStyle = "#fff";
-        ctx.fill();
-
-        const label = typeof gid === "number" ? `t${fragTrackId} g${gid}` : `t${fragTrackId}`;
-        const tw = ctx.measureText(label).width;
-        const padX = 8;
-        const padY = 5;
-        const lx = u + r + 6;
-        const ly = v - r - 2;
-        const bw = tw + padX * 2;
-        const bh = fontPx + padY * 2;
-        ctx.fillStyle = "rgba(0,0,0,0.72)";
-        if (typeof ctx.roundRect === "function") {
-          ctx.beginPath();
-          ctx.roundRect(lx, ly - bh, bw, bh, 6);
-          ctx.fill();
-        } else {
-          ctx.fillRect(lx, ly - bh, bw, bh);
-        }
-        ctx.fillStyle = "#fff";
-        ctx.fillText(label, lx + padX, ly - padY - 2);
-        ctx.globalAlpha = 1;
-      }
-
-      for (const id of [...trailRef.current.keys()]) {
-        if (!ordered.some((d) => d.track_id === id)) trailRef.current.delete(id);
-      }
       }
     };
 
@@ -406,17 +486,16 @@ export function MapFloorView({
     const ro = typeof ResizeObserver !== "undefined" ? new ResizeObserver(() => kick()) : null;
     if (stage) ro?.observe(stage);
 
-    img?.addEventListener("load", kick);
     window.addEventListener("resize", kick);
     const video = videoRefProp?.current;
     video?.addEventListener("play", kick);
     video?.addEventListener("pause", kick);
     video?.addEventListener("seeked", kick);
     kick();
+
     return () => {
       cancelAnimationFrame(raf);
       ro?.disconnect();
-      img?.removeEventListener("load", kick);
       window.removeEventListener("resize", kick);
       video?.removeEventListener("play", kick);
       video?.removeEventListener("pause", kick);
@@ -425,17 +504,19 @@ export function MapFloorView({
   }, [
     floorplanUrl,
     useGrid,
+    imgNatSize,
     homography,
     tracking,
     videoRefProp,
     videoActive,
-    showTrails,
+    showTrailsState,
+    showCameras,
+    showCounters,
     focusTrackIds,
     groupByTrack,
     camerasOnMap,
     activeCameraKey,
     counters,
-    rotDeg,
     markers,
     mergeTimeline,
     feetDoc,
@@ -448,27 +529,262 @@ export function MapFloorView({
     drawRef.current();
   }, [currentFrame, videoRefProp]);
 
+  // Расчет идеального масштабирования с учетом угла поворота (Bounding Box Fit)
+  const worldStyle = useMemo(() => {
+    const stageW = stageSize.width || 400;
+    const stageH = stageSize.height || 300;
+
+    const mw = useGrid ? MAP_W : (imgNatSize[0] || homography?.map_size?.[0] || MAP_W);
+    const mh = useGrid ? MAP_H : (imgNatSize[1] || homography?.map_size?.[1] || MAP_H);
+    if (stageW < 10 || stageH < 10 || mw < 10 || mh < 10) {
+      return { display: "none" as const };
+    }
+
+    const rad = (rotDeg * Math.PI) / 180;
+    const cos = Math.abs(Math.cos(rad));
+    const sin = Math.abs(Math.sin(rad));
+    const effW = mw * cos + mh * sin;
+    const effH = mw * sin + mh * cos;
+
+    const baseFit = Math.min((stageW - 16) / Math.max(1, effW), (stageH - 16) / Math.max(1, effH));
+    const s = Math.max(0.1, baseFit * view.scale);
+
+    return {
+      position: "absolute" as const,
+      left: "50%",
+      top: "50%",
+      width: Math.round(mw * s),
+      height: Math.round(mh * s),
+      transform: `translate(-50%, -50%) translate(${view.tx}px, ${view.ty}px) rotate(${rotDeg}deg)`,
+      transformOrigin: "50% 50%",
+      pointerEvents: "none" as const,
+    };
+  }, [stageSize, useGrid, imgNatSize, homography?.map_size, rotDeg, view]);
+
+  // Обработка Pan & Zoom
+  const onPointerDown = (e: ReactPointerEvent<HTMLDivElement>) => {
+    if (e.button !== 0) return;
+    if ((e.target as HTMLElement).closest(".map-floor-hud")) return;
+    panDragRef.current = {
+      startX: e.clientX,
+      startY: e.clientY,
+      startTx: view.tx,
+      startTy: view.ty,
+      moved: false,
+    };
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+  };
+
+  const onPointerMove = (e: ReactPointerEvent<HTMLDivElement>) => {
+    const drag = panDragRef.current;
+    if (!drag) return;
+    const dx = e.clientX - drag.startX;
+    const dy = e.clientY - drag.startY;
+    if (Math.abs(dx) + Math.abs(dy) > 3) drag.moved = true;
+    setView((v) => ({ ...v, tx: drag.startTx + dx, ty: drag.startTy + dy }));
+  };
+
+  const onPointerUp = (e: ReactPointerEvent<HTMLDivElement>) => {
+    if (panDragRef.current) {
+      try {
+        (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId);
+      } catch {
+        /* ignore */
+      }
+      panDragRef.current = null;
+    }
+  };
+
+  const onWheel = useCallback((e: React.WheelEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
+    setView((v) => ({
+      ...v,
+      scale: Math.max(0.4, Math.min(8, v.scale * factor)),
+    }));
+  }, []);
+
   const hasAnyCam =
     !!normalizePlacement(homography?.placement) ||
     camerasOnMap.some((c) => !!normalizePlacement(c.placement));
 
   return (
-    <div className={`map-floor${compact ? " is-compact" : ""}`} ref={stageRef}>
-      {useGrid ? (
-        <canvas ref={gridRef} className="map-floor-img map-floor-grid" />
-      ) : (
-        <img ref={imgRef} className="map-floor-img" src={floorplanUrl} alt="План помещения" draggable={false} />
-      )}
-      <canvas ref={canvasRef} className="map-floor-canvas" />
-      <div className="map-floor-rot">
-        <button type="button" title="Повернуть −45°" onClick={() => setRotDeg((r) => normRot(r - 45))}>
-          ↶ 45°
-        </button>
-        <span>{rotDeg}°</span>
-        <button type="button" title="Повернуть +45°" onClick={() => setRotDeg((r) => normRot(r + 45))}>
-          ↷ 45°
-        </button>
+    <div
+      className={`map-floor${compact ? " is-compact" : ""}`}
+      ref={stageRef}
+      onPointerDown={onPointerDown}
+      onPointerMove={onPointerMove}
+      onPointerUp={onPointerUp}
+      onPointerCancel={onPointerUp}
+      onWheel={onWheel}
+    >
+      <div className="map-floor-world" style={worldStyle}>
+        {useGrid ? (
+          <canvas ref={gridRef} className="map-floor-bg-layer" />
+        ) : (
+          <img
+            ref={imgRef}
+            className="map-floor-bg-layer"
+            src={floorplanUrl}
+            alt="План помещения"
+            draggable={false}
+          />
+        )}
+        <canvas ref={canvasRef} className="map-floor-canvas-layer" />
       </div>
+
+      {/* Плавающий профессиональный мини-HUD управления */}
+      <div
+        className="map-floor-hud"
+        onPointerDown={(e) => e.stopPropagation()}
+        onPointerMove={(e) => e.stopPropagation()}
+        onPointerUp={(e) => e.stopPropagation()}
+        onClick={(e) => e.stopPropagation()}
+        onWheel={(e) => e.stopPropagation()}
+      >
+        <div className="map-floor-hud-group">
+          <button
+            type="button"
+            className="map-floor-hud-btn"
+            title="Приблизить (+)"
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={(e) => {
+              e.stopPropagation();
+              setView((v) => ({ ...v, scale: Math.min(8, v.scale * 1.25) }));
+            }}
+          >
+            +
+          </button>
+          <button
+            type="button"
+            className="map-floor-hud-btn"
+            title="Отдалить (−)"
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={(e) => {
+              e.stopPropagation();
+              setView((v) => ({ ...v, scale: Math.max(0.4, v.scale / 1.25) }));
+            }}
+          >
+            −
+          </button>
+          <button
+            type="button"
+            className="map-floor-hud-btn"
+            title="Сбросить вид и центрировать"
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={(e) => {
+              e.stopPropagation();
+              setView(IDENTITY_VIEW);
+            }}
+          >
+            1:1
+          </button>
+        </div>
+
+        <div className="map-floor-hud-group">
+          <button
+            type="button"
+            className="map-floor-hud-btn"
+            title="Повернуть −45°"
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={(e) => {
+              e.stopPropagation();
+              setRotDeg((r) => normRot(r - 45));
+            }}
+          >
+            ↶ 45°
+          </button>
+          <span className="map-floor-hud-label">{rotDeg}°</span>
+          <button
+            type="button"
+            className="map-floor-hud-btn"
+            title="Повернуть +45°"
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={(e) => {
+              e.stopPropagation();
+              setRotDeg((r) => normRot(r + 45));
+            }}
+          >
+            ↷ 45°
+          </button>
+        </div>
+
+        <div className="map-floor-hud-group">
+          <button
+            type="button"
+            className={`map-floor-hud-btn is-toggle${showTrailsState ? " is-on" : ""}`}
+            title="Траектории перемещения"
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={(e) => {
+              e.stopPropagation();
+              setShowTrailsState((s) => !s);
+            }}
+          >
+            Трейлы
+          </button>
+          <button
+            type="button"
+            className={`map-floor-hud-btn is-toggle${showCameras ? " is-on" : ""}`}
+            title="Конусы обзора камер"
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={(e) => {
+              e.stopPropagation();
+              setShowCameras((s) => !s);
+            }}
+          >
+            Камеры
+          </button>
+          <button
+            type="button"
+            className={`map-floor-hud-btn is-toggle${showCounters ? " is-on" : ""}`}
+            title="Зоны прилавков"
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={(e) => {
+              e.stopPropagation();
+              setShowCounters((s) => !s);
+            }}
+          >
+            Зоны
+          </button>
+        </div>
+      </div>
+
+      {showCameras && (camerasOnMap.length > 0 || homography?.camera_key || markers.length > 0) && (
+        <div className="map-floor-cam-legend" onPointerDown={(e) => e.stopPropagation()}>
+          <span className="map-floor-cam-legend-title">Камеры:</span>
+          {Array.from(
+            new Set([
+              ...camerasOnMap.map((c) => c.key),
+              ...(homography?.camera_key ? [homography.camera_key] : []),
+              ...(activeCameraKey ? [activeCameraKey] : []),
+              ...markers.map((m) =>
+                m.camera
+                  .replace(/^Camera[_-]?0*(\d+).*$/i, "$1")
+                  .replace(/^cam[_-]?0*(\d+)$/i, "$1")
+                  .replace(/^0+(\d+)$/, "$1")
+                  .padStart(3, "0"),
+              ),
+            ]),
+          )
+            .filter(Boolean)
+            .sort()
+            .map((k) => {
+              const color = colorForCameraKey(k);
+              const isActive = k === activeCameraKey || k === homography?.camera_key;
+              return (
+                <span
+                  key={k}
+                  className={`map-floor-cam-legend-item${isActive ? " is-active" : ""}`}
+                  title={`Камера ${k}`}
+                >
+                  <span className="map-floor-cam-dot" style={{ background: color }} />
+                  <span>cam {k}</span>
+                </span>
+              );
+            })}
+        </div>
+      )}
+
       {!markers.length && !homography?.H && !hasAnyCam && (
         <p className="map-floor-hint">Нет гомографии — откройте вкладку «Карта» и задайте ≥4 точки на сетке</p>
       )}

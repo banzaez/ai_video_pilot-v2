@@ -809,15 +809,15 @@ export default function App() {
         >
           <MapFloorView
             floorplanUrl={floorplanUrl}
-            homography={homography}
-            tracking={tracking}
+            homography={tab === "day" ? null : homography}
+            tracking={tab === "day" ? null : tracking}
             videoRef={videoRef}
-            videoActive={videoMounted}
+            videoActive={tab !== "day" && videoMounted}
             currentFrame={currentFrame}
             showTrails
-            focusTrackIds={playerFocusTrackIds}
-            groupByTrack={groupByTrack}
-            mergeTimeline={mergeTimeline}
+            focusTrackIds={tab === "day" ? null : playerFocusTrackIds}
+            groupByTrack={tab === "day" ? undefined : groupByTrack}
+            mergeTimeline={tab === "day" ? null : mergeTimeline}
             camerasOnMap={mapCameras}
             allCalibPoints={allCalibPoints}
             activeCameraKey={tab === "day" ? null : cameraKey}
@@ -825,6 +825,7 @@ export default function App() {
             feetDoc={feetDoc}
             compact={false}
             markers={tab === "day" ? dayLiveMarkers : undefined}
+            sourceMode={tab === "day" ? "day" : "video"}
           />
         </FloatingVideoWindow>
       )}

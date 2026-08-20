@@ -99,12 +99,7 @@ const MODE_HINT: Record<Mode, string> = {
   draw: "Клики ≥3 · Enter — на план · тяните вершины",
 };
 
-const PLACE_GUIDE_STEPS = [
-  "«Пары H» — минимум 4 пары «кадр ↔ план»",
-  "Поставить камеру на плане: клик + направление или «Поставить из H»",
-  "«Подобрать 3D» — height, pitch, FOV (и камеру на плане) по парам",
-  "«Сохранить» — запись в cameras/*.json",
-] as const;
+
 
 const MOD_KEY =
   typeof navigator !== "undefined" && /Mac|iPhone|iPad|iPod/i.test(navigator.platform || navigator.userAgent)
@@ -352,10 +347,15 @@ export function MapCalibratePanel({
   onDirtyChange,
   onFeetReload,
 }: Props) {
-  const cameraKey = useMemo(
+  const initialCameraKey = useMemo(
     () => cameraKeyFromVideo(videoName, cameraIndex),
     [videoName, cameraIndex],
   );
+  const [activeCameraKey, setActiveCameraKey] = useState<string>(initialCameraKey);
+  useEffect(() => {
+    setActiveCameraKey(initialCameraKey);
+  }, [initialCameraKey]);
+  const cameraKey = activeCameraKey;
   const [cfg, setCfg] = useState<MapsConfig | null>(null);
   const [doc, setDoc] = useState<HomographyDoc | null>(null);
   const [floorplan, setFloorplan] = useState(GRID_FLOORPLAN);
@@ -655,6 +655,8 @@ export function MapCalibratePanel({
       onFloorRef.current?.(isGridFloorplan(fp) ? "grid" : `/maps/${encodeURIComponent(fp)}`);
       onHomoRef.current?.(normalized);
       setError(null);
+      lastHFpRef.current = normalized.H ? normalized.H.map((n) => n.toFixed(8)).join(",") : null;
+      hBaselineSkipRef.current = true;
       const pl = normalized.placement;
       setStatus(
         `Камера ${cameraKey} · ${normalized.pairs.length} пар${normalized.H ? " · H" : ""}${
@@ -765,16 +767,63 @@ export function MapCalibratePanel({
     return Math.hypot(testMapPt[0] - testRayMapPt[0], testMapPt[1] - testRayMapPt[1]);
   }, [testMapPt, testRayMapPt]);
 
-  const placeGuideDone = useMemo(() => {
-    const pairsCount = doc?.pairs.length ?? 0;
-    const hasPlacement = !!doc?.placement;
-    const has3d =
-      hasPlacement &&
-      Number.isFinite(doc!.placement!.height_m) &&
-      Number.isFinite(doc!.placement!.pitch_deg);
-    const saved = !dirty && !countersDirty && !!doc;
-    return [pairsCount >= 4, hasPlacement, has3d, saved];
-  }, [doc, dirty, countersDirty]);
+  const qualityStatus = useMemo(() => {
+    const n = doc?.pairs.length ?? 0;
+    if (n < 4) {
+      return {
+        cls: "is-bad",
+        badge: "Мало точек (<4)",
+        hint: "Задайте минимум 4 пары точек «кадр ↔ план» (рекомендуется 6–10 точек, распределенных по полу).",
+      };
+    }
+    const curRmsCm = rms != null ? (useGrid ? (rms / METER_PX) * 100 : rms) : 999;
+    const looCm = hLooRms != null ? (useGrid ? (hLooRms / METER_PX) * 100 : hLooRms) : null;
+
+    if (n < 6) {
+      if (curRmsCm <= 25) {
+        return {
+          cls: "is-good",
+          badge: "H построена (хорошо)",
+          hint: "Гомография стабильна. Можно переходить к Шагу 3 (3D-Камера) или добавить 1–2 точки для LOO.",
+        };
+      }
+      return {
+        cls: "is-warn",
+        badge: "Базовая H (нужно ≥6 точек)",
+        hint: `H построена. Добавьте еще ${6 - n} пар(ы) для честной проверки устойчивости калибровки (LOO).`,
+      };
+    }
+
+    // Для n >= 6 оцениваем LOO и RMS
+    if (looCm != null && (looCm <= 24 || (curRmsCm <= 14 && looCm <= 32))) {
+      return {
+        cls: "is-good",
+        badge: "Отличное",
+        hint: "Калибровка высокоточная и устойчивая. Переходите к Шагу 3 (3D-Камера).",
+      };
+    }
+    if (looCm != null && (looCm <= 48 || curRmsCm <= 28)) {
+      return {
+        cls: "is-good",
+        badge: "Хорошее (рабочее)",
+        hint: "Точность достаточна для стабильного трекинга и позиционирования людей на карте.",
+      };
+    }
+    if (looCm != null && (looCm <= 75 || curRmsCm <= 42)) {
+      return {
+        cls: "is-warn",
+        badge: "Приемлемое",
+        hint: "Погрешность в пределах нормы для дальних зон зала. Проверьте крайние точки при необходимости.",
+      };
+    }
+    return {
+      cls: "is-bad",
+      badge: "Проверьте пары",
+      hint: "Обнаружена высокая погрешность. Обратите внимание на точки с красной ошибкой в списке ниже.",
+    };
+  }, [doc?.pairs.length, hLooRms, rms, useGrid]);
+
+
 
   function formatErrPx(err: number): string {
     if (useGrid) {
@@ -1499,8 +1548,20 @@ export function MapCalibratePanel({
   }
 
   async function persistAll() {
-    if (countersDirtyRef.current) await persistCounters();
-    if (dirtyRef.current) await persist();
+    let savedAny = false;
+    if (countersDirtyRef.current || countersRef.current) {
+      await persistCounters();
+      savedAny = true;
+    }
+    if (dirtyRef.current || docRef.current) {
+      await persist();
+      savedAny = true;
+    }
+    if (savedAny) {
+      setDirty(false);
+      setCountersDirty(false);
+      onDirtyRef.current?.(false);
+    }
   }
 
   async function triggerFeetRecalc() {
@@ -1821,8 +1882,12 @@ export function MapCalibratePanel({
 
   function renderDots(side: "image" | "map", natW: number, natH: number) {
     if (natW < 1 || natH < 1) return null;
+    const rot = side === "map" ? mapView.rot || 0 : 0;
     const hud = markerHudScale(side === "image" ? imgView.scale : mapView.scale);
-    const hudStyle = { ["--dot-hud" as string]: String(hud) };
+    const hudStyle = {
+      ["--dot-hud" as string]: String(hud),
+      ["--dot-rot" as string]: `${-rot}deg`,
+    };
 
     if (side === "image") {
       if (!doc) return null;
@@ -1841,7 +1906,13 @@ export function MapCalibratePanel({
         };
         if (passive) {
           return (
-            <span key={common.key} style={common.anchor} title={common.title}>
+            <span
+              key={common.key}
+              style={{ ...common.anchor, pointerEvents: "auto" }}
+              title={common.title}
+              onMouseEnter={() => setHoverPair(i)}
+              onMouseLeave={() => setHoverPair(null)}
+            >
               <span
                 className={common.className}
                 style={{ ...hudStyle, background: colorForCameraKey(cameraKey) }}
@@ -1908,7 +1979,13 @@ export function MapCalibratePanel({
           : `cam ${cameraKey} · #${i + 1}`;
         if (mapPassive) {
           nodes.push(
-            <span key={`map-${cameraKey}-${i}`} style={ptPct(p.map, natW, natH, { interactive: false })} title={title}>
+            <span
+              key={`map-${cameraKey}-${i}`}
+              style={{ ...ptPct(p.map, natW, natH, { interactive: false }), pointerEvents: "auto" }}
+              title={title}
+              onMouseEnter={() => setHoverPair(i)}
+              onMouseLeave={() => setHoverPair(null)}
+            >
               <span
                 className={`map-calib-dot${hot ? " is-hot" : ""}${bad ? " is-bad" : ""}`}
                 style={{ ...hudStyle, background: color }}
@@ -1982,6 +2059,7 @@ export function MapCalibratePanel({
       }
     }
 
+    const rot = mapView.rot || 0;
     return pins.map(({ key, pl, active }, i) => {
       const color = colorForCameraKey(key);
       return (
@@ -2005,6 +2083,7 @@ export function MapCalibratePanel({
             style={{
               ["--cam-color" as string]: color,
               ["--label-dx" as string]: `${labelDx[i]!.toFixed(1)}px`,
+              ["--pin-rot" as string]: `${-rot}deg`,
             }}
           >
             cam {key}
@@ -2304,7 +2383,10 @@ export function MapCalibratePanel({
           <span key={c.key} style={ptPct(spread[i]!, natW, natH)} title={c.title}>
             <span
               className={c.className}
-              style={c.color ? { ["--measure-color" as string]: c.color } : undefined}
+              style={{
+                ...(c.color ? { ["--measure-color" as string]: c.color } : {}),
+                ["--measure-rot" as string]: `${-(mapView.rot || 0)}deg`,
+              }}
             >
               {c.main}
               <em>{c.sub}</em>
@@ -2315,442 +2397,94 @@ export function MapCalibratePanel({
     );
   }
 
+  const [mainTab, setMainTab] = useState<"calibrate" | "counters">("calibrate");
+  const [activeStep, setActiveStep] = useState<number>(2); // 1: Frame/Floor, 2: Pairs H, 3: 3D Camera, 4: Validation Test
+
   return (
-    <div className="map-calib">
-      <div className="map-calib-hero">
-        <div>
-          <h2 className="map-calib-title">Калибровка гомографии · cam {cameraKey}</h2>
-          <p className="merge-tl-hint">
-            Сетка <strong>0.5 м</strong>. Калибровка: <strong>1 · Пары H</strong> (≥4 чтобы посчитать H,
-            лучше <strong>8–12 разбросанных</strong>) → <strong>3 · Камера</strong> (план + 3D) →{" "}
-            <strong>Сохранить</strong>. При &lt;{H_LOO_MIN_PAIRS} парах H не проверена (RMS на своих
-            точках занижен).
-          </p>
-        </div>
-        <div className="map-calib-metrics">
-          <div>
-            <span>пары</span>
-            <strong
-              className={(doc?.pairs.length ?? 0) < H_LOO_MIN_PAIRS ? "bad" : "ok"}
-              title={
-                (doc?.pairs.length ?? 0) < H_LOO_MIN_PAIRS
-                  ? `H не проверена: нужно ≥${H_LOO_MIN_PAIRS} пар, лучше 8–12 разбросанных`
-                  : undefined
-              }
-            >
-              {doc?.pairs.length ?? 0}
-              {(doc?.pairs.length ?? 0) > 0 && (doc?.pairs.length ?? 0) < H_LOO_MIN_PAIRS
-                ? ` · +${H_LOO_MIN_PAIRS - (doc?.pairs.length ?? 0)}`
-                : ""}
-            </strong>
+    <div className="map-calib-v2">
+      {/* TOP HEADER */}
+      <header className="map-calib-topbar">
+        <div className="map-calib-topbar-left">
+          <div className="map-calib-cam-badge">
+            <span
+              className="map-calib-cam-dot"
+              style={{ background: colorForCameraKey(cameraKey) }}
+            />
+            <strong>Камера {cameraKey}</strong>
           </div>
-          <div>
-            <span>H</span>
-            <strong className={H ? "ok" : ""}>{H ? "OK" : "—"}</strong>
-          </div>
-          <div>
-            <span title="RMS ошибки репроекции image→план (гомография H) по своим же парам — при 4 парах всегда ~0">
-              RMS H
-            </span>
-            <strong
-              className={rms != null && rms < rmsOkPx ? "ok" : rms != null && rms > rmsBadPx ? "bad" : ""}
-              title={
-                rms != null && useGrid
-                  ? `${rms.toFixed(1)} px плана ≈ ${((rms / METER_PX) * 100).toFixed(0)} см`
-                  : undefined
-              }
-            >
-              {rms != null ? (useGrid ? formatErrPx(rms) : `${rms.toFixed(1)} px`) : "—"}
-            </strong>
-          </div>
-          <div>
-            <span title="Leave-one-out RMS гомографии: честная ошибка. При <6 парах H нечем проверить.">
-              LOO H
-            </span>
-            <strong
-              className={
-                hLooRms == null
-                  ? "bad"
-                  : hLooRms < rmsOkPx
-                    ? "ok"
-                    : hLooRms > rmsBadPx
-                      ? "bad"
-                      : ""
-              }
-              title={
-                hLooRms == null
-                  ? `H не проверена — добавьте пары (нужно ≥${H_LOO_MIN_PAIRS}, лучше 8–12)`
-                  : useGrid
-                    ? `${hLooRms.toFixed(1)} px плана ≈ ${((hLooRms / METER_PX) * 100).toFixed(0)} см`
-                    : undefined
-              }
-            >
-              {hLooRms != null
-                ? useGrid
-                  ? formatErrPx(hLooRms)
-                  : `${hLooRms.toFixed(1)} px`
-                : `нужно ≥${H_LOO_MIN_PAIRS}`}
-            </strong>
-          </div>
-          <div>
-            <span title="RMS 3D-луча по тем же парам (height, pitch, FOV)">RMS 3D</span>
-            <strong
-              className={
-                rayStats != null && rayStats.projected < rayStats.total
-                  ? "bad"
-                  : rayStats != null && rayStats.rmsPx < rmsOkPx
-                    ? "ok"
-                    : rayStats != null && rayStats.rmsPx > rmsBadPx
-                      ? "bad"
-                      : ""
-              }
-              title={
-                rayStats != null && useGrid
-                  ? `${rayStats.rmsPx.toFixed(1)} px плана ≈ ${((rayStats.rmsPx / METER_PX) * 100).toFixed(0)} см · ${rayStats.projected}/${rayStats.total} пар`
-                  : undefined
-              }
-            >
-              {rayStats != null
-                ? `${useGrid ? formatErrPx(rayStats.rmsPx) : `${rayStats.rmsPx.toFixed(1)} px`} (${rayStats.projected}/${rayStats.total})`
-                : "—"}
-            </strong>
-          </div>
-          <div>
-            <span>yaw</span>
-            <strong>{doc?.placement ? `${doc.placement.yaw_deg.toFixed(0)}°` : "—"}</strong>
-          </div>
-          <div>
-            <span>h/pitch</span>
-            <strong>
-              {doc?.placement
-                ? `${doc.placement.height_m != null ? `${doc.placement.height_m.toFixed(1)}m` : "—"} / ${doc.placement.pitch_deg != null ? `${doc.placement.pitch_deg.toFixed(0)}°` : "—"}`
-                : "—"}
-            </strong>
-          </div>
-          <div>
-            <span>файл</span>
-            <strong className={dirty ? "bad" : "ok"}>{dirty ? "dirty" : "ok"}</strong>
-          </div>
-        </div>
-      </div>
 
-      <div className="map-calib-toolbar">
-        <div className="map-calib-toolbar-row is-modes">
-          <span className="map-calib-bar-label">Режим</span>
-          <div className="map-calib-modes" role="tablist">
-            {(
-              [
-                ["pairs", "Пары H", "1"],
-                ["test", "Тест H", "2"],
-                ["place", "Камера", "3"],
-                ["count", "Плитки", "4"],
-                ["draw", "Прилавки", "5"],
-              ] as const
-            ).map(([id, label, hotkey]) => (
-              <button
-                key={id}
-                type="button"
-                className={mode === id ? "on" : ""}
-                title={`${label} · ${hotkey}`}
-                onClick={() => {
-                  setMode(id);
-                  setPendingImage(null);
-                  setStatus(MODE_HINT[id]);
-                }}
-              >
-                {label}
-                <Kbd>{hotkey}</Kbd>
-              </button>
-            ))}
-          </div>
-          <p className="map-calib-mode-hint">{MODE_HINT[mode]}</p>
-        </div>
-
-        <div className={`map-calib-toolbar-row is-actions${mode === "place" ? " is-place-mode" : ""}`}>
-          <span className="map-calib-bar-label">Действия</span>
-          <div className="map-calib-actions-slot">
-            <div className={`map-calib-actions-panel${mode === "pairs" ? " on" : ""}`}>
-              <button type="button" onClick={undo} disabled={!history.length} title={`${MOD_KEY}+Z`}>
-                Undo
-                <Kbd>{MOD_KEY}+Z</Kbd>
-              </button>
-              <button type="button" onClick={redo} disabled={!future.length} title={`${MOD_KEY}+⇧Z`}>
-                Redo
-                <Kbd>{MOD_KEY}+⇧Z</Kbd>
-              </button>
-              <button
-                type="button"
-                className="primary"
-                disabled={!doc || doc.pairs.length < 4}
-                title="Snap к сетке · убрать выбросы · пересчитать H · можно сразу поставить камеру (шаг 3)"
-                onClick={runAutoCalibrate}
-              >
-                Авто
-              </button>
-              <label className="toggle" title="Призраки: куда H кладёт точки кадра на план · P">
-                <input type="checkbox" checked={showReproj} onChange={(e) => setShowReproj(e.target.checked)} />
-                призраки H
-                <Kbd>P</Kbd>
-              </label>
-              <label className="toggle" title="Сетка кадра, перенесённая на план через H · G">
-                <input type="checkbox" checked={showGrid} onChange={(e) => setShowGrid(e.target.checked)} />
-                сетка H
-                <Kbd>G</Kbd>
-              </label>
-            </div>
-            <div className={`map-calib-actions-panel${mode === "test" ? " on" : ""}`}>
-              <span className="map-calib-actions-hint">Только проверка проекции, данные не меняются</span>
-            </div>
-            <div className={`map-calib-actions-panel is-place${mode === "place" ? " on" : ""}`}>
-              <div className="map-calib-action-group">
-                <span className="map-calib-action-group-label" title="Позиция и направление на схеме магазина">
-                  План 2D
-                </span>
-                <button
-                  type="button"
-                  className="primary"
-                  disabled={!H && !(doc?.pairs && doc.pairs.length >= 4)}
-                  title="По гомографии H: где стоит камера и куда смотрит (yaw) на плане"
-                  onClick={runAutoPlaceFromH}
-                >
-                  Поставить из H
-                </button>
-                <span className="map-calib-actions-hint">или клик на плане + направление</span>
-              </div>
-              <div className="map-calib-action-group">
-                <span className="map-calib-action-group-label" title="3D-луч: центр bbox → пол">
-                  3D-луч
-                </span>
-                <label className="map-calib-select" title="Высота камеры над полом, метры">
-                  высота, м
-                  <input
-                    type="number"
-                    min={0.5}
-                    max={8}
-                    step={0.1}
-                    value={doc?.placement?.height_m ?? 3}
-                    disabled={!doc?.placement}
-                    onChange={(e) => setHeightM(Number(e.target.value) || 3)}
-                  />
-                </label>
-                <label className="map-calib-select" title="Наклон камеры вниз от горизонта">
-                  наклон, °
-                  <input
-                    type="number"
-                    min={0}
-                    max={89}
-                    step={1}
-                    value={doc?.placement?.pitch_deg ?? 35}
-                    disabled={!doc?.placement}
-                    onChange={(e) => setPitchDeg(Number(e.target.value) || 35)}
-                  />
-                </label>
-                <button
-                  type="button"
-                  className="primary"
-                  disabled={!doc?.placement || !(doc?.pairs && doc.pairs.length >= 2)}
-                  title="Подобрать height, pitch, FOV и (опционально) yaw/позицию по парам"
-                  onClick={runEstimateRayPose}
-                >
-                  Подобрать 3D
-                </button>
-                <label
-                  className="toggle"
-                  title="Разрешить сдвиг позиции и yaw камеры на плане при подборе 3D"
-                >
-                  <input
-                    type="checkbox"
-                    checked={fitMoveCamera}
-                    onChange={(e) => setFitMoveCamera(e.target.checked)}
-                  />
-                  двигать камеру
-                </label>
-              </div>
-              <div className="map-calib-action-group">
-                <span className="map-calib-action-group-label">Обзор</span>
-                <label className="map-calib-select" title="Горизонтальный угол обзора конуса на плане">
-                  FOV°
-                  <input
-                    type="number"
-                    min={20}
-                    max={160}
-                    step={5}
-                    value={doc?.placement?.fov_deg ?? DEFAULT_FOV}
-                    disabled={!doc?.placement}
-                    onChange={(e) => setFov(Number(e.target.value) || DEFAULT_FOV)}
-                  />
-                </label>
-                <button type="button" onClick={clearPlacement} disabled={!doc?.placement}>
-                  Снять камеру
-                </button>
-              </div>
-            </div>
-            <div className={`map-calib-actions-panel${mode === "count" ? " on" : ""}`}>
-              <span className="map-calib-chip">
-                плиток <strong>{tileMarks.length}</strong>
-              </span>
-              <button
-                type="button"
-                title="Backspace"
-                onClick={() => {
-                  setTileMarks((m) => m.slice(0, -1));
-                  setStatus("Убрана последняя плитка");
-                }}
-                disabled={!tileMarks.length}
-              >
-                −1
-                <Kbd>⌫</Kbd>
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setTileMarks([]);
-                  setStatus("Счётчик плиток очищен");
-                }}
-                disabled={!tileMarks.length}
-              >
-                Сбросить
-              </button>
-            </div>
-            <div className={`map-calib-actions-panel${mode === "draw" ? " on" : ""}`}>
-              <span className="map-calib-chip">
-                прилавков <strong>{counters.counters.length}</strong>
-              </span>
-              <span className="map-calib-chip">
-                черновик <strong>{draftPts.length || "—"}</strong>
-              </span>
-              <button
-                type="button"
-                className="primary"
-                title="Enter"
-                onClick={finishCounterDraft}
-                disabled={draftPts.length < 3}
-              >
-                Замкнуть → план
-                <Kbd>Enter</Kbd>
-              </button>
-              <button type="button" onClick={undoDraftVertex} disabled={!draftPts.length} title="Backspace">
-                −вершина
-                <Kbd>⌫</Kbd>
-              </button>
-              <button type="button" onClick={deleteSelectedCounter} disabled={!selectedCounterId} title="Delete">
-                Удалить
-                <Kbd>Del</Kbd>
-              </button>
-              <button type="button" onClick={() => void persistCounters()} disabled={!countersDirty}>
-                Сохранить прилавки{countersDirty ? " *" : ""}
-              </button>
-            </div>
-          </div>
-        </div>
-
-        {mode === "place" && (
-          <div className="map-calib-guide">
-            <strong className="map-calib-guide-title">Камера: порядок калибровки</strong>
-            <ol className="map-calib-guide-steps">
-              {PLACE_GUIDE_STEPS.map((label, i) => (
-                <li key={label} className={placeGuideDone[i] ? "is-done" : ""}>
-                  {label}
-                </li>
-              ))}
-            </ol>
-            <p className="map-calib-guide-note">
-              <strong>План 2D</strong> — где камера на схеме (из H или вручную).{" "}
-              <strong>3D-луч</strong> — высота и наклон для проекции людей на пол. Переключение камеры — в шапке.
-            </p>
-          </div>
-        )}
-
-        <div className="map-calib-toolbar-row is-utils">
-          <div className="map-calib-bar-group">
-            <span className="map-calib-bar-label">Вид</span>
+          <div className="map-calib-main-tabs" role="tablist">
             <button
               type="button"
-              title="Сбросить зум, сдвиг и поворот · R"
+              className={mainTab === "calibrate" ? "is-active" : ""}
               onClick={() => {
-                setImgView(IDENTITY_VIEW);
-                setMapView(IDENTITY_VIEW);
+                setMainTab("calibrate");
+                setMode("pairs");
               }}
             >
-              Сброс вида
-              <Kbd>R</Kbd>
+              📐 Калибровка камеры
             </button>
-            <button type="button" onClick={refreshFrame} title="Взять начало видео · ⇧F">
-              1-й кадр
-              <Kbd>⇧F</Kbd>
+            <button
+              type="button"
+              className={mainTab === "counters" ? "is-active" : ""}
+              onClick={() => {
+                setMainTab("counters");
+                setMode("draw");
+              }}
+            >
+              🏪 Зоны и прилавки
+              {counters.counters.length ? ` (${counters.counters.length})` : ""}
             </button>
-            <button type="button" onClick={captureFromPlayer} title="Взять текущий кадр из плеера · F">
-              Из плеера
-              <Kbd>F</Kbd>
-            </button>
-            <button type="button" title="Повернуть план −45°" onClick={() => rotateMap(-45)}>
-              ↶ 45°
-              <Kbd>[</Kbd>
-            </button>
-            <button type="button" title="Повернуть план +45°" onClick={() => rotateMap(45)}>
-              ↷ 45°
-              <Kbd>]</Kbd>
-            </button>
-            <label className="map-calib-select">
-              План
-              <select
-                value={floorplan}
-                onChange={(e) => {
-                  const v = e.target.value;
-                  setFloorplan(v);
-                  if (isGridFloorplan(v)) {
-                    setMapNat(MAP_SIZE);
-                    onFloorRef.current?.("grid");
-                  } else {
-                    onFloorRef.current?.(`/maps/${encodeURIComponent(v)}`);
-                  }
-                  setDoc((prev) => {
-                    if (!prev) return prev;
-                    const next = {
-                      ...prev,
-                      floorplan: v,
-                      map_size: isGridFloorplan(v) ? MAP_SIZE : prev.map_size,
-                    };
-                    syncDirty(next);
-                    return next;
-                  });
-                  setMapView(IDENTITY_VIEW);
-                }}
-              >
-                <option value={GRID_FLOORPLAN}>Сетка 0.5 м</option>
-                {(cfg?.floorplans ?? []).filter((f) => !isGridFloorplan(f.name)).map((f) => (
-                  <option key={f.name} value={f.name}>
-                    {f.name}
-                  </option>
-                ))}
-              </select>
-            </label>
+          </div>
+        </div>
+
+        <div className="map-calib-topbar-right">
+          <div className="map-calib-save-status">
+            {dirty || countersDirty ? (
+              <span className="map-calib-dirty-pill" title="Есть несохранённые изменения">
+                ● Не сохранено
+              </span>
+            ) : (
+              <span className="map-calib-clean-pill">✓ Сохранено</span>
+            )}
           </div>
 
-          <div className="map-calib-bar-group">
-            <span className="map-calib-bar-label">Файл</span>
+          <button
+            type="button"
+            className="map-calib-btn-feet"
+            onClick={() => void triggerFeetRecalc()}
+            disabled={isRecalculatingFeet}
+            title="Пересчитать stage feet на бэкенде через API"
+          >
+            {isRecalculatingFeet ? "Пересчёт..." : "⚡ Feet API"}
+          </button>
+
+          <button
+            type="button"
+            className={`map-calib-btn-save primary${dirty || countersDirty ? " needs-save" : ""}`}
+            onClick={() => void persistAll()}
+            disabled={(!doc && !countersDirty) || isRecalculatingFeet}
+            title={`Сохранить (${MOD_KEY}+S)`}
+          >
+            {isRecalculatingFeet
+              ? "Сохранение..."
+              : dirty || countersDirty
+                ? "Сохранить *"
+                : "Сохранить"}
+            <Kbd>{MOD_KEY}+S</Kbd>
+          </button>
+
+          <div className="map-calib-more-actions">
             <button
               type="button"
-              className={`primary${dirty || countersDirty ? " needs-save" : ""}`}
-              title={`${MOD_KEY}+S`}
-              onClick={() => void persistAll()}
-              disabled={(!doc && !countersDirty) || isRecalculatingFeet}
+              className="map-calib-btn-sub"
+              onClick={exportJson}
+              disabled={!doc}
+              title="Экспорт калибровки в JSON"
             >
-              {isRecalculatingFeet ? "Сохранение..." : dirty || countersDirty ? "Сохранить *" : "Сохранить"}
-              <Kbd>{MOD_KEY}+S</Kbd>
-            </button>
-            <button
-              type="button"
-              onClick={() => void triggerFeetRecalc()}
-              disabled={isRecalculatingFeet}
-              title="Пересчитать stage feet на бэкенде через API"
-            >
-              {isRecalculatingFeet ? "Пересчёт..." : "⚡ Feet API"}
-            </button>
-            <button type="button" onClick={exportJson} disabled={!doc}>
               Export
             </button>
-            <label className="map-calib-file">
+            <label className="map-calib-file-btn" title="Импорт калибровки из JSON">
               Import
               <input
                 type="file"
@@ -2764,227 +2498,820 @@ export function MapCalibratePanel({
             </label>
           </div>
         </div>
-      </div>
+      </header>
 
-      {error && <p className="error map-calib-error">{error}</p>}
-      <p className="map-calib-status">{status || "\u00a0"}</p>
+      {/* ERROR BANNER */}
+      {error && <div className="map-calib-error-banner">{error}</div>}
 
-      <div className="map-calib-grid">
-        <div className="map-calib-pane">
-          <header>
-            Кадр{" "}
-            {mode === "count"
-              ? `· плитки ${tileMarks.length}`
-              : mode === "draw"
-                ? "· прилавки"
-                : mode === "pairs" && pendingImage
-                  ? "→ ждём план"
-                  : mode === "test"
-                    ? "· тест"
-                    : mode === "pairs"
-                      ? "· пары H"
-                      : ""}
-          </header>
-          <div
-            ref={imageWrapRef}
-            className={`map-calib-stage${mode === "pairs" && !pendingImage ? " is-armed" : ""}${mode === "test" ? " is-test" : ""}${mode === "count" ? " is-count" : ""}${mode === "draw" ? " is-draw" : ""}`}
-            onClick={onImageClick}
-            onPointerDown={(e) => onPanePointerDown("image", e)}
-            onPointerMove={onPanePointerMove}
-            onPointerUp={onPanePointerUp}
-            onPointerCancel={onPanePointerUp}
-          >
-            {frameUrl ? (
-              <div style={imageWorldStyle}>
-                <img src={frameUrl} alt="Кадр" draggable={false} onLoad={bumpLayout} />
-                {renderCounterLayer("image", iw, ih)}
-                {renderDots("image", iw, ih)}
-                {tileMarks.map((pt, i) => (
-                  <span key={`tile-${i}`} style={ptPct(pt, iw, ih, { interactive: false })} title={`плитка ${i + 1}`}>
-                    <span className="map-calib-tile-mark">{i + 1}</span>
-                  </span>
-                ))}
-                {pendingImage && (
-                  <span style={ptPct(pendingImage, iw, ih, { interactive: false })}>
+      {/* MAIN WORKSPACE: 2 COLUMNS */}
+      <div className="map-calib-workspace">
+        {/* LEFT: CANVASES (Кадр ↔ План) */}
+        <div className="map-calib-canvases">
+          {/* PANE 1: IMAGE (Кадр видео) */}
+          <div className="map-calib-pane">
+            <div className="map-calib-pane-header">
+              <div className="map-calib-pane-title">
+                <strong>Кадр видео</strong>
+                <span className="map-calib-pane-meta">
+                  {iw}×{ih}
+                  {mode === "pairs" && pendingImage ? " · ждём клик на плане" : ""}
+                  {mode === "count" ? ` · плитки (${tileMarks.length})` : ""}
+                  {mode === "draw" ? " · прилавки" : ""}
+                </span>
+              </div>
+              <div className="map-calib-pane-hud">
+                <button
+                  type="button"
+                  onClick={captureFromPlayer}
+                  title="Взять текущий кадр из видеоплеера · F"
+                >
+                  Из плеера <Kbd>F</Kbd>
+                </button>
+                <button
+                  type="button"
+                  onClick={refreshFrame}
+                  title="Загрузить 1-й кадр видео · ⇧F"
+                >
+                  1-й кадр <Kbd>⇧F</Kbd>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setImgView(IDENTITY_VIEW)}
+                  title="Сбросить зум и центрировать · R"
+                >
+                  1:1 <Kbd>R</Kbd>
+                </button>
+              </div>
+            </div>
+
+            <div
+              ref={imageWrapRef}
+              className={`map-calib-stage${mode === "pairs" && !pendingImage ? " is-armed" : ""}${mode === "test" ? " is-test" : ""}${mode === "count" ? " is-count" : ""}${mode === "draw" ? " is-draw" : ""}`}
+              onClick={onImageClick}
+              onPointerDown={(e) => onPanePointerDown("image", e)}
+              onPointerMove={onPanePointerMove}
+              onPointerUp={onPanePointerUp}
+              onPointerCancel={onPanePointerUp}
+            >
+              {frameUrl ? (
+                <div style={imageWorldStyle}>
+                  <img src={frameUrl} alt="Кадр" draggable={false} onLoad={bumpLayout} />
+                  {renderCounterLayer("image", iw, ih)}
+                  {renderDots("image", iw, ih)}
+                  {tileMarks.map((pt, i) => (
                     <span
-                      className="map-calib-dot pending"
-                      style={{ ["--dot-hud" as string]: String(markerHudScale(imgView.scale)) }}
+                      key={`tile-${i}`}
+                      style={ptPct(pt, iw, ih, { interactive: false })}
+                      title={`плитка ${i + 1}`}
                     >
-                      +
+                      <span className="map-calib-tile-mark">{i + 1}</span>
                     </span>
+                  ))}
+                  {pendingImage && (
+                    <span style={ptPct(pendingImage, iw, ih, { interactive: false })}>
+                      <span
+                        className="map-calib-dot pending"
+                        style={{
+                          ["--dot-hud" as string]: String(markerHudScale(imgView.scale)),
+                        }}
+                      >
+                        +
+                      </span>
+                    </span>
+                  )}
+                  {testImagePt && (
+                    <span style={ptPct(testImagePt, iw, ih, { interactive: false })}>
+                      <span className="map-calib-test-h" title="точка на кадре" />
+                    </span>
+                  )}
+                </div>
+              ) : (
+                <p className="merge-tl-empty">Загрузка кадра камеры…</p>
+              )}
+            </div>
+          </div>
+
+          {/* PANE 2: MAP (План магазина) */}
+          <div className="map-calib-pane">
+            <div className="map-calib-pane-header">
+              <div className="map-calib-pane-title">
+                <strong>План магазина</strong>
+                <span className="map-calib-pane-meta">
+                  {useGrid ? "Сетка 0.5 м" : floorplan}
+                  {mapView.rot ? ` · ${mapView.rot}°` : ""}
+                </span>
+              </div>
+              <div className="map-calib-pane-hud">
+                <button
+                  type="button"
+                  onClick={() => rotateMap(-45)}
+                  title="Повернуть план −45° · ["
+                >
+                  ↶ 45° <Kbd>[</Kbd>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => rotateMap(45)}
+                  title="Повернуть план +45° · ]"
+                >
+                  ↷ 45° <Kbd>]</Kbd>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setMapView(IDENTITY_VIEW)}
+                  title="Сбросить зум плана"
+                >
+                  1:1
+                </button>
+                <label
+                  className="map-calib-hud-toggle"
+                  title="Призраки H: куда точки кадра ложатся на план · P"
+                >
+                  <input
+                    type="checkbox"
+                    checked={showReproj}
+                    onChange={(e) => setShowReproj(e.target.checked)}
+                  />
+                  Призраки <Kbd>P</Kbd>
+                </label>
+                <label
+                  className="map-calib-hud-toggle"
+                  title="Сетка кадра, перенесённая на план через H · G"
+                >
+                  <input
+                    type="checkbox"
+                    checked={showGrid}
+                    onChange={(e) => setShowGrid(e.target.checked)}
+                  />
+                  Сетка H <Kbd>G</Kbd>
+                </label>
+              </div>
+            </div>
+
+            <div
+              ref={mapWrapRef}
+              className={`map-calib-stage${mode === "pairs" && pendingImage ? " is-armed" : ""}${mode === "test" ? " is-test" : ""}${mode === "place" ? " is-place" : ""}${mode === "draw" ? " is-draw" : ""}`}
+              onClick={onMapClick}
+              onPointerDown={onMapPointerDown}
+              onPointerMove={onPanePointerMove}
+              onPointerUp={onPanePointerUp}
+              onPointerCancel={onPanePointerUp}
+            >
+              <div style={mapWorldStyle}>
+                {useGrid ? (
+                  <canvas ref={mapGridCanvasRef} className="map-calib-floor-canvas" />
+                ) : (
+                  <img
+                    ref={mapImgRef}
+                    src={floorplanUrl}
+                    alt="План"
+                    draggable={false}
+                    onLoad={(e) => {
+                      const img = e.currentTarget;
+                      setMapNat([img.naturalWidth, img.naturalHeight]);
+                      bumpLayout();
+                    }}
+                  />
+                )}
+                <canvas ref={mapCamCanvasRef} className="map-calib-cam-canvas" />
+                {renderCounterLayer("map", mapNat[0], mapNat[1])}
+                {renderMeasureLinks(mapNat[0], mapNat[1])}
+                {renderWarpGrid(mapNat[0], mapNat[1])}
+                {renderGhosts(mapNat[0], mapNat[1])}
+                {renderDots("map", mapNat[0], mapNat[1])}
+                {renderCameraPins(mapNat[0], mapNat[1])}
+                {mode === "test" &&
+                  testMapPt &&
+                  testRayMapPt &&
+                  testHvsRayGap != null &&
+                  testHvsRayGap > 1 && (
+                    <svg
+                      className="map-calib-test-gap-svg"
+                      viewBox={`0 0 ${mapNat[0]} ${mapNat[1]}`}
+                      preserveAspectRatio="none"
+                    >
+                      <line
+                        x1={testMapPt[0]}
+                        y1={testMapPt[1]}
+                        x2={testRayMapPt[0]}
+                        y2={testRayMapPt[1]}
+                        stroke="rgba(196, 92, 38, 0.75)"
+                        strokeWidth={Math.max(2, mapNat[0] / 800)}
+                        strokeDasharray="10 8"
+                      />
+                    </svg>
+                  )}
+                {testMapPt && (
+                  <span
+                    style={ptPct(testMapPt, mapNat[0], mapNat[1], { interactive: false })}
+                  >
+                    <span className="map-calib-test-h" title="H (гомография)" />
                   </span>
                 )}
-                {testImagePt && (
-                  <span style={ptPct(testImagePt, iw, ih, { interactive: false })}>
-                    <span className="map-calib-test-h" title="точка на кадре" />
+                {mode === "test" && testRayMapPt && (
+                  <span
+                    style={ptPct(testRayMapPt, mapNat[0], mapNat[1], { interactive: false })}
+                  >
+                    <span className="map-calib-test-ray" title="3D-луч (ноги)" />
                   </span>
                 )}
               </div>
-            ) : (
-              <p className="merge-tl-empty">Загрузка первого кадра…</p>
-            )}
-          </div>
-        </div>
 
-        <div className="map-calib-pane">
-          <header className="map-calib-pane-head">
-            <span>
-              План{" "}
-              {mode === "place"
-                ? "· размещение камеры"
-                : mode === "draw"
-                  ? "· прилавки"
-                  : mode === "pairs" && pendingImage
-                    ? "· ждём точку"
-                    : mode === "test"
-                      ? "· тест"
-                      : mode === "pairs"
-                        ? "· пары H"
-                        : ""}
-              {mapView.rot ? ` · ${mapView.rot}°` : ""}
-            </span>
-            <span className="map-calib-rot">
-              <button type="button" title="Повернуть −45° · [" onClick={() => rotateMap(-45)}>
-                ↶ 45°
-                <Kbd>[</Kbd>
-              </button>
-              <button type="button" title="Повернуть +45° · ]" onClick={() => rotateMap(45)}>
-                ↷ 45°
-                <Kbd>]</Kbd>
-              </button>
-            </span>
-          </header>
-          <div
-            ref={mapWrapRef}
-            className={`map-calib-stage${mode === "pairs" && pendingImage ? " is-armed" : ""}${mode === "test" ? " is-test" : ""}${mode === "place" ? " is-place" : ""}${mode === "draw" ? " is-draw" : ""}`}
-            onClick={onMapClick}
-            onPointerDown={onMapPointerDown}
-            onPointerMove={onPanePointerMove}
-            onPointerUp={onPanePointerUp}
-            onPointerCancel={onPanePointerUp}
-          >
-            <div style={mapWorldStyle}>
-              {useGrid ? (
-                <canvas ref={mapGridCanvasRef} className="map-calib-floor-canvas" />
-              ) : (
-                <img
-                  ref={mapImgRef}
-                  src={floorplanUrl}
-                  alt="План"
-                  draggable={false}
-                  onLoad={(e) => {
-                    const img = e.currentTarget;
-                    setMapNat([img.naturalWidth, img.naturalHeight]);
-                    bumpLayout();
-                  }}
-                />
-              )}
-              <canvas ref={mapCamCanvasRef} className="map-calib-cam-canvas" />
-              {renderCounterLayer("map", mapNat[0], mapNat[1])}
-              {renderMeasureLinks(mapNat[0], mapNat[1])}
-              {renderWarpGrid(mapNat[0], mapNat[1])}
-              {renderGhosts(mapNat[0], mapNat[1])}
-              {renderDots("map", mapNat[0], mapNat[1])}
-              {renderCameraPins(mapNat[0], mapNat[1])}
-              {mode === "test" && testMapPt && testRayMapPt && testHvsRayGap != null && testHvsRayGap > 1 && (
-                <svg
-                  className="map-calib-test-gap-svg"
-                  viewBox={`0 0 ${mapNat[0]} ${mapNat[1]}`}
-                  preserveAspectRatio="none"
-                >
-                  <line
-                    x1={testMapPt[0]}
-                    y1={testMapPt[1]}
-                    x2={testRayMapPt[0]}
-                    y2={testRayMapPt[1]}
-                    stroke="rgba(196, 92, 38, 0.75)"
-                    strokeWidth={Math.max(2, mapNat[0] / 800)}
-                    strokeDasharray="10 8"
-                  />
-                </svg>
-              )}
-              {testMapPt && (
-                <span style={ptPct(testMapPt, mapNat[0], mapNat[1], { interactive: false })}>
-                  <span className="map-calib-test-h" title="H (гомография)" />
-                </span>
-              )}
-              {mode === "test" && testRayMapPt && (
-                <span style={ptPct(testRayMapPt, mapNat[0], mapNat[1], { interactive: false })}>
-                  <span className="map-calib-test-ray" title="3D-луч (ноги)" />
-                </span>
+              {cfg?.cameras && cfg.cameras.length > 0 && (
+                <div className="map-pane-cam-legend" title="Камеры проекта и их цвета на плане">
+                  <span className="map-pane-cam-legend-title">Камеры:</span>
+                  {cfg.cameras.map((c) => {
+                    const active = c.key === cameraKey;
+                    const color = colorForCameraKey(c.key);
+                    return (
+                      <span
+                        key={c.key}
+                        className={`map-pane-cam-legend-item${active ? " is-active" : ""}`}
+                      >
+                        <span className="map-floor-cam-dot" style={{ background: color }} />
+                        <span>cam {c.key}</span>
+                      </span>
+                    );
+                  })}
+                </div>
               )}
             </div>
           </div>
         </div>
+
+        {/* RIGHT: INSPECTOR SIDEBAR */}
+        <aside className="map-calib-sidebar">
+          {mainTab === "calibrate" ? (
+            <>
+              {/* QUALITY STATUS BANNER */}
+              <div className={`map-calib-quality-card ${qualityStatus.cls}`}>
+                <div className="map-calib-quality-head">
+                  <span className="map-calib-quality-title">Качество калибровки</span>
+                  <span className="map-calib-quality-badge">{qualityStatus.badge}</span>
+                </div>
+
+                <div className="map-calib-quality-metrics">
+                  <div className="map-calib-q-metric">
+                    <label>Пары H</label>
+                    <strong>
+                      {doc?.pairs.length ?? 0}
+                      {(doc?.pairs.length ?? 0) < H_LOO_MIN_PAIRS
+                        ? ` / ${H_LOO_MIN_PAIRS}`
+                        : ""}
+                    </strong>
+                  </div>
+                  <div className="map-calib-q-metric">
+                    <label>Ошибка RMS</label>
+                    <strong>
+                      {rms != null
+                        ? useGrid
+                        ? `${((rms / METER_PX) * 100).toFixed(0)} см`
+                        : `${rms.toFixed(1)} px`
+                        : "—"}
+                    </strong>
+                  </div>
+                  <div className="map-calib-q-metric">
+                    <label>Честная LOO</label>
+                    <strong>
+                      {hLooRms != null
+                        ? useGrid
+                        ? `${((hLooRms / METER_PX) * 100).toFixed(0)} см`
+                        : `${hLooRms.toFixed(1)} px`
+                        : (doc?.pairs.length ?? 0) < 6
+                        ? `≥6 пар`
+                        : "—"}
+                    </strong>
+                  </div>
+                  <div className="map-calib-q-metric">
+                    <label>3D-луч</label>
+                    <strong>
+                      {rayStats != null
+                        ? useGrid
+                        ? `${((rayStats.rmsPx / METER_PX) * 100).toFixed(0)} см`
+                        : `${rayStats.rmsPx.toFixed(1)} px`
+                        : "—"}
+                    </strong>
+                  </div>
+                </div>
+
+                <p className="map-calib-quality-hint">{qualityStatus.hint}</p>
+              </div>
+
+              {/* STEP 1: FRAME & FLOORPLAN */}
+              <div className={`map-calib-section${activeStep === 1 ? " is-open" : ""}`}>
+                <div
+                  className="map-calib-section-head"
+                  onClick={() => setActiveStep((s) => (s === 1 ? 0 : 1))}
+                >
+                  <div className="map-calib-step-num">1</div>
+                  <div className="map-calib-section-title">
+                    <strong>Кадр и подложка</strong>
+                    <small>{useGrid ? "Сетка 0.5 м" : floorplan}</small>
+                  </div>
+                  <span className="map-calib-step-arrow">{activeStep === 1 ? "▲" : "▼"}</span>
+                </div>
+
+                {activeStep === 1 && (
+                  <div className="map-calib-section-body">
+                    <div className="map-calib-control-row">
+                      <label className="map-calib-label">Подложка плана</label>
+                      <select
+                        className="map-calib-select-input"
+                        value={floorplan}
+                        onChange={(e) => {
+                          const v = e.target.value;
+                          setFloorplan(v);
+                          if (isGridFloorplan(v)) {
+                            setMapNat(MAP_SIZE);
+                            onFloorRef.current?.("grid");
+                          } else {
+                            onFloorRef.current?.(`/maps/${encodeURIComponent(v)}`);
+                          }
+                          setDoc((prev) => {
+                            if (!prev) return prev;
+                            const next = {
+                              ...prev,
+                              floorplan: v,
+                              map_size: isGridFloorplan(v) ? MAP_SIZE : prev.map_size,
+                            };
+                            syncDirty(next);
+                            return next;
+                          });
+                          setMapView(IDENTITY_VIEW);
+                        }}
+                      >
+                        <option value={GRID_FLOORPLAN}>Сетка 0.5 м (по умолчанию)</option>
+                        {(cfg?.floorplans ?? [])
+                          .filter((f) => !isGridFloorplan(f.name))
+                          .map((f) => (
+                            <option key={f.name} value={f.name}>
+                              {f.name}
+                            </option>
+                          ))}
+                      </select>
+                    </div>
+
+                    <div className="map-calib-btn-row">
+                      <button
+                        type="button"
+                        className="map-calib-btn"
+                        onClick={captureFromPlayer}
+                        title="Взять текущую секунду видео из плеера (F)"
+                      >
+                        Кадр из плеера <Kbd>F</Kbd>
+                      </button>
+                      <button
+                        type="button"
+                        className="map-calib-btn"
+                        onClick={refreshFrame}
+                        title="Перезагрузить первый кадр (⇧F)"
+                      >
+                        1-й кадр <Kbd>⇧F</Kbd>
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* STEP 2: HOMOGRAPHY PAIRS */}
+              <div className={`map-calib-section is-pairs${activeStep === 2 ? " is-open" : ""}`}>
+                <div
+                  className="map-calib-section-head"
+                  onClick={() => {
+                    setActiveStep((s) => (s === 2 ? 0 : 2));
+                    setMode("pairs");
+                  }}
+                >
+                  <div className="map-calib-step-num">2</div>
+                  <div className="map-calib-section-title">
+                    <strong>Пары точек H</strong>
+                    <small>
+                      {doc?.pairs.length ?? 0} пар · клик на кадре → клик на плане
+                    </small>
+                  </div>
+                  <span className="map-calib-step-arrow">{activeStep === 2 ? "▲" : "▼"}</span>
+                </div>
+
+                {activeStep === 2 && (
+                  <div className="map-calib-section-body">
+                    <div className="map-calib-btn-row">
+                      <button
+                        type="button"
+                        className={`map-calib-btn${mode === "pairs" ? " is-active" : ""}`}
+                        onClick={() => {
+                          setMode("pairs");
+                          setStatus(MODE_HINT.pairs);
+                        }}
+                      >
+                        Режим точек <Kbd>1</Kbd>
+                      </button>
+                      <button
+                        type="button"
+                        className="map-calib-btn primary"
+                        disabled={!doc || doc.pairs.length < 4}
+                        title="Snap к сетке + авто-коррекция выбросов"
+                        onClick={runAutoCalibrate}
+                      >
+                        Автокалибровка
+                      </button>
+                      <button
+                        type="button"
+                        className="map-calib-btn"
+                        onClick={undo}
+                        disabled={!history.length}
+                        title={`Отменить (${MOD_KEY}+Z)`}
+                      >
+                        Undo <Kbd>{MOD_KEY}+Z</Kbd>
+                      </button>
+                      <button
+                        type="button"
+                        className="map-calib-btn"
+                        onClick={redo}
+                        disabled={!future.length}
+                        title={`Повторить (${MOD_KEY}+⇧Z)`}
+                      >
+                        Redo
+                      </button>
+                    </div>
+
+                    {/* LIST OF PAIRS */}
+                    <div className="map-calib-pairs-list">
+                      {doc?.pairs.length ? (
+                        doc.pairs.map((p, i) => {
+                          const err = errors[i]?.errPx;
+                          const isBad = Number.isFinite(err) && err! > errBadPx;
+                          const isHot = selectedPair === i || hoverPair === i;
+
+                          return (
+                            <div
+                              key={i}
+                              className={`map-calib-pair-item${isHot ? " is-hot" : ""}${isBad ? " is-bad" : ""}`}
+                              onMouseEnter={() => setHoverPair(i)}
+                              onMouseLeave={() => setHoverPair(null)}
+                              onClick={() => setSelectedPair(i)}
+                            >
+                              <div className="map-calib-pair-index">#{i + 1}</div>
+                              <div className="map-calib-pair-coords">
+                                <span>
+                                  Кадр: {p.image[0].toFixed(0)}, {p.image[1].toFixed(0)}
+                                </span>
+                                <span>
+                                  План: {p.map[0].toFixed(0)}, {p.map[1].toFixed(0)}
+                                </span>
+                              </div>
+                              <div
+                                className={`map-calib-pair-err${isBad ? " is-bad" : " is-ok"}`}
+                                title={
+                                  Number.isFinite(err)
+                                    ? `Ошибка репроекции: ${formatErrPx(err!)}`
+                                    : "Требуется ≥4 пар"
+                                }
+                              >
+                                {Number.isFinite(err)
+                                  ? useGrid
+                                    ? `${((err! / METER_PX) * 100).toFixed(0)} см`
+                                    : `${err!.toFixed(1)} px`
+                                  : "—"}
+                              </div>
+                              <button
+                                type="button"
+                                className="map-calib-pair-del"
+                                title="Удалить пару (Del)"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  removePair(i);
+                                }}
+                              >
+                                ✕
+                              </button>
+                            </div>
+                          );
+                        })
+                      ) : (
+                        <div className="map-calib-empty-pairs">
+                          Кликните на объекте на <strong>кадре</strong>, затем на его
+                          положении на <strong>плане</strong>.
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* STEP 3: 3D CAMERA POSE */}
+              <div className={`map-calib-section${activeStep === 3 ? " is-open" : ""}`}>
+                <div
+                  className="map-calib-section-head"
+                  onClick={() => {
+                    setActiveStep((s) => (s === 3 ? 0 : 3));
+                    setMode("place");
+                  }}
+                >
+                  <div className="map-calib-step-num">3</div>
+                  <div className="map-calib-section-title">
+                    <strong>3D-Камера и лучи</strong>
+                    <small>
+                      {doc?.placement
+                        ? `${doc.placement.height_m?.toFixed(1) ?? "3.0"}м · ${doc.placement.pitch_deg?.toFixed(0) ?? "35"}° · yaw ${doc.placement.yaw_deg.toFixed(0)}°`
+                        : "Камера не установлена"}
+                    </small>
+                  </div>
+                  <span className="map-calib-step-arrow">{activeStep === 3 ? "▲" : "▼"}</span>
+                </div>
+
+                {activeStep === 3 && (
+                  <div className="map-calib-section-body">
+                    <div className="map-calib-btn-row">
+                      <button
+                        type="button"
+                        className="map-calib-btn primary"
+                        disabled={!H && !(doc?.pairs && doc.pairs.length >= 4)}
+                        title="Поставить камеру и повернуть по гомографии H"
+                        onClick={runAutoPlaceFromH}
+                      >
+                        Поставить из H
+                      </button>
+                      <button
+                        type="button"
+                        className="map-calib-btn primary"
+                        disabled={!doc?.placement || !(doc?.pairs && doc.pairs.length >= 2)}
+                        title="Оптимизировать высоту, наклон и FOV по парам"
+                        onClick={runEstimateRayPose}
+                      >
+                        Подобрать 3D
+                      </button>
+                    </div>
+
+                    <div className="map-calib-inputs-grid">
+                      <label className="map-calib-field">
+                        <span>Высота, м</span>
+                        <input
+                          type="number"
+                          min={0.5}
+                          max={8}
+                          step={0.1}
+                          value={doc?.placement?.height_m ?? 3}
+                          disabled={!doc?.placement}
+                          onChange={(e) => setHeightM(Number(e.target.value) || 3)}
+                        />
+                      </label>
+                      <label className="map-calib-field">
+                        <span>Наклон, °</span>
+                        <input
+                          type="number"
+                          min={0}
+                          max={89}
+                          step={1}
+                          value={doc?.placement?.pitch_deg ?? 35}
+                          disabled={!doc?.placement}
+                          onChange={(e) => setPitchDeg(Number(e.target.value) || 35)}
+                        />
+                      </label>
+                      <label className="map-calib-field">
+                        <span>Угол FOV, °</span>
+                        <input
+                          type="number"
+                          min={20}
+                          max={160}
+                          step={5}
+                          value={doc?.placement?.fov_deg ?? DEFAULT_FOV}
+                          disabled={!doc?.placement}
+                          onChange={(e) => setFov(Number(e.target.value) || DEFAULT_FOV)}
+                        />
+                      </label>
+                    </div>
+
+                    <div className="map-calib-checkbox-row">
+                      <label className="map-calib-checkbox-label">
+                        <input
+                          type="checkbox"
+                          checked={fitMoveCamera}
+                          onChange={(e) => setFitMoveCamera(e.target.checked)}
+                        />
+                        Разрешить сдвиг позиции камеры при 3D-подборе
+                      </label>
+                    </div>
+
+                    {doc?.placement && (
+                      <button
+                        type="button"
+                        className="map-calib-btn-danger"
+                        onClick={clearPlacement}
+                      >
+                        Снять камеру с плана
+                      </button>
+                    )}
+                  </div>
+                )}
+              </div>
+
+              {/* STEP 4: TEST & VALIDATION */}
+              <div className={`map-calib-section${activeStep === 4 ? " is-open" : ""}`}>
+                <div
+                  className="map-calib-section-head"
+                  onClick={() => {
+                    setActiveStep((s) => (s === 4 ? 0 : 4));
+                    setMode("test");
+                  }}
+                >
+                  <div className="map-calib-step-num">4</div>
+                  <div className="map-calib-section-title">
+                    <strong>Проверка и тест</strong>
+                    <small>
+                      {mode === "test"
+                        ? testHvsRayGap != null
+                          ? `Невязка: ${((testHvsRayGap / METER_PX) * 100).toFixed(0)} см`
+                          : "Кликните на кадре или плане"
+                        : "Интерактивный тест лучей"}
+                    </small>
+                  </div>
+                  <span className="map-calib-step-arrow">{activeStep === 4 ? "▲" : "▼"}</span>
+                </div>
+
+                {activeStep === 4 && (
+                  <div className="map-calib-section-body">
+                    <button
+                      type="button"
+                      className={`map-calib-btn is-full${mode === "test" ? " is-active" : ""}`}
+                      onClick={() => {
+                        setMode("test");
+                        setStatus(MODE_HINT.test);
+                      }}
+                    >
+                      {mode === "test" ? "● Режим теста включен" : "Включить клик-тест H vs 3D-луч"}
+                    </button>
+
+                    <p className="map-calib-text-muted">
+                      Кликните в любую точку пола на кадре: оранжевая метка — проекция H, синяя —
+                      3D-луч. Расстояние между ними показывает точность совпадения.
+                    </p>
+
+                    {testHvsRayGap != null && (
+                      <div className="map-calib-test-result">
+                        <span>Невязка H ↔ 3D:</span>
+                        <strong
+                          className={
+                            testHvsRayGap < rmsOkPx
+                              ? "is-ok"
+                              : testHvsRayGap > rmsBadPx
+                                ? "is-bad"
+                                : ""
+                          }
+                        >
+                          {useGrid
+                            ? `${((testHvsRayGap / METER_PX) * 100).toFixed(0)} см (${testHvsRayGap.toFixed(1)} px)`
+                            : `${testHvsRayGap.toFixed(1)} px`}
+                        </strong>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+
+              {/* UTILITY: TILE COUNTER */}
+              <div className="map-calib-section is-util">
+                <div
+                  className="map-calib-section-head"
+                  onClick={() => {
+                    setMode(mode === "count" ? "pairs" : "count");
+                  }}
+                >
+                  <div className="map-calib-step-num">📏</div>
+                  <div className="map-calib-section-title">
+                    <strong>Счётчик и линейка плиток</strong>
+                    <small>
+                      {tileMarks.length ? `Отмечено ${tileMarks.length} пл` : "Клик по кадру 1,2,3…"}
+                    </small>
+                  </div>
+                  <span className="map-calib-step-arrow">
+                    {mode === "count" ? "ВКЛ" : "ВЫКЛ"}
+                  </span>
+                </div>
+
+                {mode === "count" && (
+                  <div className="map-calib-section-body">
+                    <div className="map-calib-btn-row">
+                      <button
+                        type="button"
+                        className="map-calib-btn"
+                        onClick={() => setTileMarks((m) => m.slice(0, -1))}
+                        disabled={!tileMarks.length}
+                        title="Убрать последнюю плитку (⌫)"
+                      >
+                        −1 <Kbd>⌫</Kbd>
+                      </button>
+                      <button
+                        type="button"
+                        className="map-calib-btn"
+                        onClick={() => setTileMarks([])}
+                        disabled={!tileMarks.length}
+                      >
+                        Сбросить
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </>
+          ) : (
+            /* COUNTERS AND ZONES SUBTAB */
+            <div className="map-calib-counters-panel">
+              <div className="map-calib-counters-head">
+                <strong>Зоны и прилавки зала</strong>
+                <p className="map-calib-text-muted">
+                  Разметка торговых зон, касс и витрин. Кликните ≥3 точки по кадру или плану, затем
+                  нажмите <Kbd>Enter</Kbd> для замыкания полигона.
+                </p>
+              </div>
+
+              <div className="map-calib-btn-row">
+                <button
+                  type="button"
+                  className="map-calib-btn primary"
+                  disabled={draftPts.length < 3}
+                  onClick={finishCounterDraft}
+                  title="Замкнуть полигон прилавка (Enter)"
+                >
+                  Замкнуть → план <Kbd>Enter</Kbd>
+                </button>
+                <button
+                  type="button"
+                  className="map-calib-btn"
+                  disabled={!draftPts.length}
+                  onClick={undoDraftVertex}
+                  title="Удалить последнюю вершину черновика (⌫)"
+                >
+                  −вершина <Kbd>⌫</Kbd>
+                </button>
+                <button
+                  type="button"
+                  className="map-calib-btn-danger"
+                  disabled={!selectedCounterId}
+                  onClick={deleteSelectedCounter}
+                  title="Удалить выбранную зону (Del)"
+                >
+                  Удалить <Kbd>Del</Kbd>
+                </button>
+              </div>
+
+              <div className="map-calib-counters-list">
+                {counters.counters.length ? (
+                  counters.counters.map((c, i) => {
+                    const isSel = selectedCounterId === c.id;
+                    return (
+                      <div
+                        key={c.id}
+                        className={`map-calib-counter-card${isSel ? " is-selected" : ""}`}
+                        onClick={() => setSelectedCounterId(c.id)}
+                      >
+                        <div className="map-calib-counter-info">
+                          <strong>{c.name || `Прилавок #${i + 1}`}</strong>
+                          <small>Вершин: {c.map.length}</small>
+                        </div>
+                        <button
+                          type="button"
+                          className="map-calib-pair-del"
+                          title="Удалить прилавок"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setSelectedCounterId(c.id);
+                            deleteSelectedCounter();
+                          }}
+                        >
+                          ✕
+                        </button>
+                      </div>
+                    );
+                  })
+                ) : (
+                  <div className="map-calib-empty-pairs">
+                    Нет размеченных зон. Начните кликать по углам прилавка на кадре или плане.
+                  </div>
+                )}
+              </div>
+
+              <button
+                type="button"
+                className={`map-calib-btn-save primary is-full${countersDirty ? " needs-save" : ""}`}
+                onClick={() => void persistCounters()}
+                disabled={!countersDirty}
+              >
+                {countersDirty ? "Сохранить прилавки *" : "Прилавки сохранены"}
+              </button>
+            </div>
+          )}
+        </aside>
       </div>
 
-      {!!doc?.pairs.length && (
-        <div className="map-calib-table-wrap">
-          <table className="map-calib-table">
-            <thead>
-              <tr>
-                <th>#</th>
-                <th>image x,y</th>
-                <th>map u,v</th>
-                <th title="|H(image) − map| на плане (не пиксели кадра)">err план</th>
-                <th />
-              </tr>
-            </thead>
-            <tbody>
-              {doc.pairs.map((p, i) => {
-                const err = errors[i]?.errPx;
-                return (
-                  <tr
-                    key={i}
-                    className={selectedPair === i || hoverPair === i ? "is-hot" : ""}
-                    onMouseEnter={() => setHoverPair(i)}
-                    onMouseLeave={() => setHoverPair(null)}
-                    onClick={() => setSelectedPair(i)}
-                  >
-                    <td>{i + 1}</td>
-                    <td>
-                      {p.image[0].toFixed(1)}, {p.image[1].toFixed(1)}
-                    </td>
-                    <td>
-                      {p.map[0].toFixed(1)}, {p.map[1].toFixed(1)}
-                    </td>
-                    <td
-                      className={Number.isFinite(err) && err! > errBadPx ? "bad" : ""}
-                      title={
-                        Number.isFinite(err)
-                          ? `H(image)→план vs ваша точка · ${formatErrPx(err!)}`
-                          : "Нужна H (≥4 пар)"
-                      }
-                    >
-                      {Number.isFinite(err) ? formatErrPx(err!) : "—"}
-                    </td>
-                    <td>
-                      <button type="button" onClick={() => removePair(i)}>
-                        удалить
-                      </button>
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        </div>
-      )}
-
-      {(dirty || countersDirty) && (
-        <div className="map-calib-unsaved" role="status">
-          <strong>Не сохранено</strong>
-          <span>
-            {dirty ? `калибровка cam ${cameraKey}` : ""}
-            {dirty && countersDirty ? " · " : ""}
-            {countersDirty ? `прилавки (${counters.counters.length})` : ""}
-            {" — Ctrl/⌘+S"}
-          </span>
-          <button type="button" className="primary" onClick={() => void persistAll()}>
-            Сохранить
-          </button>
-        </div>
-      )}
+      {/* STATUS FOOTER BAR */}
+      <footer className="map-calib-footer">
+        <span className="map-calib-footer-status">{status || "Готов к работе"}</span>
+        <span className="map-calib-footer-hotkeys">
+          Горячие клавиши: <Kbd>1</Kbd> Точки · <Kbd>2</Kbd> Тест · <Kbd>3</Kbd> Камера ·{" "}
+          <Kbd>F</Kbd> Кадр из плеера · <Kbd>R</Kbd> Сброс зума · <Kbd>{MOD_KEY}+S</Kbd> Сохранить
+        </span>
+      </footer>
     </div>
   );
 }
+

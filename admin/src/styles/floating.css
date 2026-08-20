@@ -1,0 +1,299 @@
+/* =========================================================
+   FLOATING WINDOWS (FloatingVideoWindow)
+   ========================================================= */
+
+.float-video {
+  position: fixed;
+  z-index: 50;
+  display: flex;
+  flex-direction: column;
+  background: var(--stage);
+  border: 1px solid #2a3832;
+  border-radius: 12px;
+  box-shadow: 0 16px 48px rgba(13, 18, 16, 0.42);
+  overflow: hidden;
+  min-width: 280px;
+}
+
+.float-video.is-active {
+  user-select: none;
+}
+
+.float-video.is-active .float-video-body {
+  pointer-events: none;
+}
+
+.float-video-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 28px;
+  padding: 0 10px 0 8px;
+  background: #111814;
+  color: #d7e0d9;
+  cursor: grab;
+  flex-shrink: 0;
+  user-select: none;
+  touch-action: none;
+}
+
+.float-video.is-active .float-video-bar {
+  cursor: grabbing;
+}
+
+.float-video-grip {
+  font-size: 11px;
+  letter-spacing: -2px;
+  color: #6e7c74;
+  line-height: 1;
+}
+
+.float-video-bar strong {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.float-video-bar em {
+  min-width: 0;
+  flex: 1;
+  font-style: normal;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: #8a968c;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.float-win-actions {
+  margin-left: auto;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.float-win-btn {
+  flex-shrink: 0;
+  width: 26px;
+  height: 24px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: #d7e0d9;
+  display: grid;
+  place-items: center;
+  cursor: pointer;
+}
+
+.float-win-btn:hover {
+  background: rgba(255, 255, 255, 0.12);
+}
+
+.float-video.is-minimized {
+  min-width: 0;
+  min-height: 0;
+  cursor: grab;
+}
+
+.float-video.is-minimized.is-active {
+  cursor: grabbing;
+}
+
+.float-video.is-minimized .float-video-bar {
+  position: absolute;
+  inset: 0;
+  height: auto;
+  z-index: 4;
+  background: linear-gradient(180deg, rgba(13, 18, 16, 0.72), transparent 70%);
+  cursor: inherit;
+}
+
+.float-video.is-minimized .float-video-grip {
+  display: inline;
+  color: #c5d0c8;
+}
+
+.float-video.is-minimized .float-video-bar strong,
+.float-video.is-minimized .float-video-bar em {
+  display: none;
+}
+
+.float-video.is-minimized .float-video-body {
+  pointer-events: none;
+}
+
+.float-video.is-minimized .player {
+  grid-template-rows: minmax(0, 1fr);
+}
+
+.float-video-body {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: #000;
+}
+
+.float-video-body > .map-floor {
+  flex: 1 1 auto;
+  min-height: 0;
+  height: 100%;
+}
+
+.video-hidden-host {
+  position: fixed;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+  overflow: hidden;
+  left: -9999px;
+  top: 0;
+}
+
+.float-video .player {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+.float-video .player.empty {
+  min-height: 0;
+  height: 100%;
+  border: 0;
+  border-radius: 0;
+  background: #111814;
+}
+
+.float-video .stage {
+  max-height: none;
+  flex: 1 1 auto;
+  height: auto;
+  min-height: 0;
+  border-radius: 0;
+}
+
+.float-video .stage video {
+  width: 100%;
+  height: 100%;
+  max-height: none;
+  object-fit: contain;
+}
+
+.float-video .hud {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 0;
+  z-index: 2;
+  border-radius: 0;
+  padding: 4px 8px;
+  pointer-events: none;
+  background: linear-gradient(180deg, rgba(13, 18, 16, 0.72), transparent);
+}
+
+.float-video .session-scrub-stack {
+  position: relative;
+  flex: 0 0 auto;
+  z-index: 2;
+  border-radius: 0;
+  padding: 0;
+  background: #0d1512;
+  border-top: 1px solid #1c2822;
+  pointer-events: auto;
+}
+
+.float-video .session-parts-bar {
+  padding: 3px 6px;
+  background: rgba(10, 15, 13, 0.96);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.float-video .session-scrub {
+  position: relative;
+  left: auto;
+  right: auto;
+  bottom: auto;
+  z-index: auto;
+  border-radius: 0;
+  padding: 4px 8px 2px;
+  background: transparent;
+  pointer-events: auto;
+}
+
+.float-resize {
+  position: absolute;
+  z-index: 3;
+  touch-action: none;
+}
+
+.float-resize.n {
+  top: 0;
+  left: 22px;
+  right: 22px;
+  height: 8px;
+  cursor: ns-resize;
+}
+
+.float-resize.s {
+  bottom: 0;
+  left: 22px;
+  right: 22px;
+  height: 10px;
+  cursor: ns-resize;
+}
+
+.float-resize.e {
+  right: 0;
+  top: 22px;
+  bottom: 22px;
+  width: 10px;
+  cursor: ew-resize;
+}
+
+.float-resize.w {
+  left: 0;
+  top: 22px;
+  bottom: 22px;
+  width: 10px;
+  cursor: ew-resize;
+}
+
+.float-resize.ne,
+.float-resize.nw,
+.float-resize.se,
+.float-resize.sw {
+  width: 22px;
+  height: 22px;
+}
+
+.float-resize.ne {
+  top: 0;
+  right: 0;
+  cursor: nesw-resize;
+}
+
+.float-resize.nw {
+  top: 0;
+  left: 0;
+  cursor: nwse-resize;
+}
+
+.float-resize.se {
+  right: 0;
+  bottom: 0;
+  cursor: nwse-resize;
+}
+
+.float-resize.sw {
+  left: 0;
+  bottom: 0;
+  cursor: nesw-resize;
+}

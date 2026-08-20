@@ -602,7 +602,7 @@ export function MergeInspectPanel({
   const [selectedRowKey, setSelectedRowKey] = useState<string | null>(null);
   const [selectedFragmentId, setSelectedFragmentId] = useState<number | null>(null);
   const [atCurrentFrame, setAtCurrentFrame] = useState(false);
-  const selectedRowBtnRef = useRef<HTMLButtonElement>(null);
+  const selectedRowBtnRef = useRef<HTMLDivElement>(null);
 
   const timeBounds = useMemo(
     () => makeTimeBounds(0, Math.max(mergeTimeline?.duration_sec ?? 1, 0.001)),
@@ -1108,11 +1108,18 @@ export function MergeInspectPanel({
               );
               return (
                 <li key={key}>
-                  <button
-                    type="button"
+                  <div
+                    role="button"
+                    tabIndex={0}
                     className={`merge-inspect-row${isSelected ? " on" : ""}`}
                     ref={isSelected ? selectedRowBtnRef : undefined}
                     onClick={() => pickRow(row)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" || e.key === " ") {
+                        e.preventDefault();
+                        pickRow(row);
+                      }
+                    }}
                   >
                     <div className="merge-inspect-row-content">
                       {row.kind === "group" ? (
@@ -1155,7 +1162,7 @@ export function MergeInspectPanel({
                       )}
                     </div>
                     {listFaces?.length ? <GroupFaceThumb faces={listFaces} /> : null}
-                  </button>
+                  </div>
                 </li>
               );
             })}

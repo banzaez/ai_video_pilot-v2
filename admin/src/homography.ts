@@ -107,6 +107,8 @@ export function drawCameraPlacement(
     body?: boolean;
     /** Подпись (по умолчанию true; всегда читаемая даже при dimmed) */
     label?: boolean;
+    /** Угол поворота карты в градусах для контр-поворота подписи */
+    rotDeg?: number;
   },
 ): void {
   const [x, y] = placement.position;
@@ -120,6 +122,7 @@ export function drawCameraPlacement(
   const drawCone = opts?.cone !== false;
   const drawBody = opts?.body !== false;
   const drawLabel = opts?.label !== false;
+  const rotDeg = opts?.rotDeg ?? 0;
   const color =
     opts?.color ??
     (opts?.cameraKey ? colorForCameraKey(opts.cameraKey) : null) ??
@@ -177,16 +180,22 @@ export function drawCameraPlacement(
     const tw = ctx.measureText(label).width;
     const padX = Math.max(4, fontPx * 0.28);
     const padY = Math.max(3, fontPx * 0.2);
-    const lx = x + r + 6;
-    const ly = y - r - fontPx * 0.35;
+    const bw = tw + padX * 2;
+    const bh = fontPx + padY * 2;
+
+    ctx.translate(x, y);
+    if (rotDeg) {
+      ctx.rotate((-rotDeg * Math.PI) / 180);
+    }
+    const lx = r + 6;
+    const ly = -r - fontPx * 0.35;
+    const bx = lx - padX;
+    const by = ly - fontPx + padY * 0.2;
+
     ctx.fillStyle = "rgba(255, 255, 255, 0.94)";
     ctx.strokeStyle = hexToRgba(color, 0.55);
     ctx.lineWidth = Math.max(1.5, mw / 700);
     ctx.beginPath();
-    const bw = tw + padX * 2;
-    const bh = fontPx + padY * 2;
-    const bx = lx - padX;
-    const by = ly - fontPx + padY * 0.2;
     ctx.roundRect?.(bx, by, bw, bh, 4);
     if (!ctx.roundRect) {
       ctx.rect(bx, by, bw, bh);
