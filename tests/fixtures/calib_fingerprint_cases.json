@@ -1,0 +1,49 @@
+{
+  "cases": [
+    {
+      "name": "case_01",
+      "expect": "d9c67155",
+      "camera_key": "01",
+      "torso_height_m": 0.0,
+      "tracking_size": [
+        1920,
+        1080
+      ],
+      "camera_doc": {
+        "camera_key": "01",
+        "image_size": [
+          1920,
+          1080
+        ],
+        "map_size": [
+          4800,
+          3200
+        ],
+        "placement": {
+          "position": [
+            1200,
+            1600
+          ],
+          "yaw_deg": 45.0,
+          "fov_deg": 75.0,
+          "height_m": 3.2,
+          "pitch_deg": 35.0
+        },
+        "H": [
+          1,
+          0,
+          100,
+          0,
+          1,
+          200,
+          0,
+          0,
+          1
+        ]
+      },
+      "counters": {
+        "counters": []
+      }
+    }
+  ]
+}
