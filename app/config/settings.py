@@ -79,7 +79,8 @@ class Settings:
     tracklet_local_config: str | None = None
     tracklet_local_params: dict[str, Any] = field(default_factory=dict)
     tracklet_reid_top_k: int = 3
-    tracklet_reid_pick: str = "spread"
+    tracklet_reid_pick: str = "best"
+    tracklet_reid_pick_fraction: float = 0.35
     tracklet_reid_backend: str = "solider"
     tracklet_reid_model: str = "osnet_x1_0"
     tracklet_reid_weights: str = "data/models/reid/osnet_x1_0_msmt17.pth"

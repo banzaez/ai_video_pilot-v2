@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 from dataclasses import dataclass
 from typing import Any, Sequence
@@ -735,41 +736,107 @@ class TrackBestFramesPicker:
         self,
         scored: Sequence[ScoredTrackFrame],
         top_k: int = 10,
+        mode: str = "best",
+        fraction: float = 0.35,
     ) -> list[ScoredTrackFrame]:
         """
-        Выбирает лучшие top_k кадров из уже оцененных ScoredTrackFrame с равномерным spread.
+        Выбирает лучшие top_k кадров из уже оцененных ScoredTrackFrame по заданной стратегии mode:
+          - 'best' (по умолчанию): деление на top_k временных окон с выбором кадра с максимальным скором в каждом окне.
+          - 'spread' / 'uniform': строго равномерный шаг по временной шкале (равные интервалы).
+          - 'score' / 'pure_best': абсолютный топ-K по скору по всему треку.
+          - 'first': выбор top_k лучших кадров из начального сегмента (первые max(top_k, ceil(N * fraction)) кадров).
+          - 'last': выбор top_k лучших кадров из конечного сегмента (последние max(top_k, ceil(N * fraction)) кадров).
+          - 'middle' / 'center': выбор top_k лучших кадров из центрального сегмента шириной fraction вокруг середины трека.
+
+        Всегда гарантируется возврат >= 1 кадра (при непустом scored) и не более top_k кадров,
+        отсортированных хронологически по frame_index.
         """
         if not scored:
             return []
-        if len(scored) <= top_k:
+
+        n = len(scored)
+        k = max(1, int(top_k))
+        if n <= k:
             return sorted(scored, key=lambda x: x.frame_index)
 
-        k = max(1, int(top_k))
-        chunk_size = len(scored) / float(k)
-        picked: list[ScoredTrackFrame] = []
+        mode_clean = (mode or "best").strip().lower()
+        frac = max(0.01, min(1.0, float(fraction)))
 
-        for i in range(k):
-            start_idx = int(round(i * chunk_size))
-            end_idx = int(round((i + 1) * chunk_size)) if i < k - 1 else len(scored)
-            window = scored[start_idx:end_idx]
-            if window:
-                best_in_window = max(window, key=lambda x: x.score)
-                picked.append(best_in_window)
+        # 1. Выделение пула кандидатов по сегментам (first / last / middle)
+        pool = list(scored)
+        if mode_clean == "first":
+            win_len = max(k, int(math.ceil(n * frac)))
+            pool = list(scored[:win_len])
+        elif mode_clean == "last":
+            win_len = max(k, int(math.ceil(n * frac)))
+            pool = list(scored[max(0, n - win_len):])
+        elif mode_clean in ("middle", "center"):
+            win_len = max(k, int(math.ceil(n * frac)))
+            mid_idx = n // 2
+            half_win = win_len // 2
+            start_idx = max(0, mid_idx - half_win)
+            end_idx = min(n, start_idx + win_len)
+            if end_idx - start_idx < win_len:
+                start_idx = max(0, end_idx - win_len)
+            pool = list(scored[start_idx:end_idx])
 
-        return picked if picked else list(scored[:top_k])
+        if not pool:
+            pool = list(scored)
+
+        if len(pool) <= k:
+            return sorted(pool, key=lambda x: x.frame_index)
+
+        # 2. Отбор top_k кадров из пула в зависимости от стратегии
+        if mode_clean in ("score", "pure_best"):
+            best_by_score = sorted(pool, key=lambda x: x.score, reverse=True)[:k]
+            return sorted(best_by_score, key=lambda x: x.frame_index)
+
+        elif mode_clean in ("spread", "uniform"):
+            indices = np.linspace(0, len(pool) - 1, k, dtype=int)
+            seen_indices = set()
+            picked: list[ScoredTrackFrame] = []
+            for idx in indices:
+                if idx not in seen_indices:
+                    seen_indices.add(idx)
+                    picked.append(pool[idx])
+            # Если из-за округления получилось меньше k
+            if len(picked) < k:
+                for idx, s in enumerate(pool):
+                    if idx not in seen_indices:
+                        picked.append(s)
+                        seen_indices.add(idx)
+                        if len(picked) >= k:
+                            break
+            return sorted(picked, key=lambda x: x.frame_index)
+
+        else:
+            # Режим 'best' (а также для 'first', 'last', 'middle' внутри их пула)
+            chunk_size = len(pool) / float(k)
+            picked: list[ScoredTrackFrame] = []
+            for i in range(k):
+                start_idx = int(round(i * chunk_size))
+                end_idx = int(round((i + 1) * chunk_size)) if i < k - 1 else len(pool)
+                window = pool[start_idx:end_idx]
+                if window:
+                    best_in_window = max(window, key=lambda x: x.score)
+                    picked.append(best_in_window)
+
+            return sorted(picked, key=lambda x: x.frame_index) if picked else sorted(pool[:k], key=lambda x: x.frame_index)
 
     def pick_best_for_tracklet(
         self,
         candidates: Sequence[TrackFrameCandidate],
         top_k: int = 10,
         *,
+        mode: str = "best",
+        fraction: float = 0.35,
         batch_size: int = 16,
         extract_faces: bool = True,
         cache_path: str | None = None,
         filter_outliers: bool = True,
     ) -> list[ScoredTrackFrame]:
         """
-        Выбирает лучшие top_k кадров для одного треклета с равномерным распределением (spread).
+        Выбирает лучшие top_k кадров для одного треклета по заданной стратегии mode.
         """
         if not candidates:
             return []
@@ -782,13 +849,15 @@ class TrackBestFramesPicker:
             extract_faces=extract_faces,
             cache_path=cache_path,
         )
-        return self.pick_best_from_scored(scored, top_k=top_k)
+        return self.pick_best_from_scored(scored, top_k=top_k, mode=mode, fraction=fraction)
 
     def pick_best_for_group(
         self,
         candidates_by_tid: dict[int, list[TrackFrameCandidate]],
         top_k: int = 10,
         *,
+        mode: str = "best",
+        fraction: float = 0.35,
         batch_size: int = 16,
         extract_faces: bool = True,
         cache_path: str | None = None,
@@ -843,7 +912,9 @@ class TrackBestFramesPicker:
                 k_for_tid = min(remaining_k, k_for_tid)
 
             if k_for_tid > 0:
-                picked_tid = self.pick_best_from_scored(obs, top_k=k_for_tid)
+                picked_tid = self.pick_best_from_scored(
+                    obs, top_k=k_for_tid, mode=mode, fraction=fraction
+                )
                 picked.extend(picked_tid)
                 remaining_k -= len(picked_tid)
 

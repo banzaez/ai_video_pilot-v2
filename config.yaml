@@ -83,7 +83,7 @@ detection:
   # rtdetr_v2: Hugging Face RT-DETRv2 (PekingU/rtdetr_v2_*), pip install transformers
   backend: yolo
   # Порог уверенности детекции (0..1). Ниже — больше боксов, выше — чище, но можно пропустить людей
-  conf: 0.25
+  conf: 0.45
   # NMS IoU похожих боксов. Вложенные (торс в полном росте) — IoS; широкий бокс на двоих выкидывается
   iou: 0.5
   # Каждый N-й кадр (1 = все). Трекер получает только эти наблюдения; fps видео ему не нужен.
@@ -111,7 +111,7 @@ tracklet_pipeline:
     # bytetrack | botsort | ocsort | deepocsort | fasttrack | tracktrack
     type: tracktrack
     # Conf ≥ этого → первый матч. Детекции уже ≥0.35; 0.40 = типичный человек в high, слабые — во второй проход.
-    track_high_thresh: 0.30
+    track_high_thresh: 0.40
     # low < conf < high: только продлевают живой трек, новый ID не заводят.
     track_low_thresh: 0.25
     # Мин. conf нового ID + TAI-NMS. Выше 0.25 (OC-SORT) — меньше дублей вроде #1+#72; 0.70 дефолт TrackTrack режет слабых.
@@ -120,17 +120,17 @@ tracklet_pipeline:
     track_buffer: 30
     # COST, не IoU: матч если cost < порога. 0.85 от OC-SORT здесь НАОБОРОТ слабее (склеивает лишнее).
     # Дефолт TT 0.7; 0.55 строже — меньше ID-switch при пересечениях.
-    match_thresh: 0.45
+    match_thresh: 0.55
     # Ослабленный rebind lost. 0 = выкл. Иначе lost легко садится на соседнего человека.
     lost_match_thr: 0.0
     # --- Веса многофакторной матрицы стоимости (Cost Matrix) ---
     # cost = iou_weight·HMIoU + reid_weight·Cosine(ReID) + conf_weight·Δconf + angle_weight·Δangle
     # Вес пространственного расстояния (IoU / HMIoU). При активном ReID обычно 0.50
-    iou_weight: 0.40
+    iou_weight: 0.70
     # Вес расстояния по внешности (ReID). Влияние сходства эмбеддингов людей при матче (0.20-0.35)
-    reid_weight: 0.35
+    reid_weight: 0.00
     # Вес разницы в confidence детекций (0.05-0.15)
-    conf_weight: 0.10
+    conf_weight: 0.15
     # Вес расхождения направления движения (защита от склеивания встречных людей)
     angle_weight: 0.15
 
@@ -149,7 +149,7 @@ tracklet_pipeline:
 
     # --- ReID модуль трекера ---
     # with_reid: true считывает кадры видео и использует сходство внешности при сопоставлении боксов
-    with_reid: true
+    with_reid: false
     # Модель ReID для трекера (yolo26n-reid.onnx в data/models/reid/ или путь к весам)
     model: yolo26s-reid.onnx
 
@@ -168,8 +168,17 @@ tracklet_pipeline:
 
   # Stage 2b: эмбеддинги кропов треклетов (tracklet_reid.json + .npz)
   reid:
-    top_k: 5
-    pick: spread
+    top_k: 4
+    # Режим отбора кадров для ReID треклета:
+    #   best     - деление на top_k окон во времени + выбор лучшего по позе в каждом окне (по умолчанию)
+    #   spread   - строго равномерный шаг по времени (равные интервалы)
+    #   score    - абсолютный топ-K по скору позы/качества со всего трека
+    #   first    - отбор лучших кадров из начала трека (первые pick_fraction % длины)
+    #   last     - отбор лучших кадров из конца трека (последние pick_fraction % длины)
+    #   middle   - отбор лучших кадров из середины трека (центральные pick_fraction % длины)
+    pick: middle
+    # Доля длины трека (0.0..1.0) для режимов first / last / middle (на выходе гарантируется >= 1 кадра)
+    pick_fraction: 0.55
     batch_size: 8
     # JPG на диск не нужны для 2c (эмбеддинги в npz). true — только для отладки
     save_crops: false

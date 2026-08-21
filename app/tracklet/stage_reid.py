@@ -303,7 +303,12 @@ def run_tracklet_reid(settings: Settings) -> None:
         if not cands_scored:
             continue
 
-        best_frames = picker.pick_best_from_scored(cands_scored, top_k=top_k)
+        best_frames = picker.pick_best_from_scored(
+            cands_scored,
+            top_k=top_k,
+            mode=settings.tracklet_reid_pick,
+            fraction=settings.tracklet_reid_pick_fraction,
+        )
         for ki, scored_f in enumerate(best_frames):
             fi = scored_f.frame_index
             crop_path = os.path.join(crops_out, f"tl_{tid:04d}_k{ki}_f{fi + 1}.jpg")

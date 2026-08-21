@@ -477,7 +477,10 @@ def settings_from_sources(args: argparse.Namespace | None = None) -> Settings:
         tracklet_local_config=None,
         tracklet_local_params=tracklet_local_params,
         tracklet_reid_top_k=max(1, int(tracklet_reid_cfg.get("top_k", 3))),
-        tracklet_reid_pick=str(tracklet_reid_cfg.get("pick") or "spread").lower(),
+        tracklet_reid_pick=str(tracklet_reid_cfg.get("pick") or "best").lower(),
+        tracklet_reid_pick_fraction=float(
+            tracklet_reid_cfg.get("pick_fraction", tracklet_reid_cfg.get("fraction", 0.35))
+        ),
         tracklet_reid_backend=tracklet_reid["backend"],
         tracklet_reid_model="osnet_x1_0",
         tracklet_reid_weights=join_models_path(reid_models_dir, "osnet_x1_0_msmt17.pth"),

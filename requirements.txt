@@ -10,8 +10,8 @@ torch>=2.13.0,<3
 torchreid>=0.2.5,<1
 # Job API (admin pipeline tab)
 fastapi>=0.141.1,<1
-uvicorn>=0.52.3,<1
+uvicorn>=0.52.4,<1
 pydantic>=2.13.0,<3  # 2.14 пока нет в PyPI (макс. 2.13.x)
 
 # RT-DETRv2 (detection.backend: rtdetr_v2), Hugging Face:
-transformers>=5.15.0,<6
+transformers>=5.15.1,<6
