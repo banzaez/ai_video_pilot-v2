@@ -100,8 +100,13 @@ def list_video_files(directory: str) -> list[str]:
     return videos
 
 
-def find_local_videos(input_arg: str, day_arg: str | None) -> list[str]:
-    """Поиск локальных видеофайлов по аргументам."""
+def find_local_videos(
+    input_arg: str,
+    day_arg: str | None = None,
+    session_arg: str | None = None,
+    cameras_arg: str | None = None,
+) -> list[str]:
+    """Поиск локальных видеофайлов по аргументам с поддержкой фильтров дня, сессий и камер."""
     # Если передан конкретный файл
     if os.path.isfile(input_arg):
         return [os.path.abspath(input_arg)]
@@ -134,6 +139,40 @@ def find_local_videos(input_arg: str, day_arg: str | None) -> list[str]:
     unique_videos = sorted(list(set(videos)))
     if day_clean:
         unique_videos = [v for v in unique_videos if day_clean in os.path.basename(v)]
+
+    # Фильтр по сессиям
+    target_sessions = set()
+    if session_arg:
+        target_sessions.update(s.strip() for s in session_arg.split(",") if s.strip())
+    elif input_arg.startswith("session:"):
+        target_sessions.update(s.strip() for s in input_arg.replace("session:", "").split(",") if s.strip())
+
+    if target_sessions:
+        unique_videos = [
+            v for v in unique_videos
+            if any(ts in os.path.basename(v) for ts in target_sessions)
+        ]
+
+    # Фильтр по камерам
+    if cameras_arg:
+        target_cams = set()
+        for c in cameras_arg.split(","):
+            c_clean = c.strip()
+            if c_clean:
+                target_cams.add(c_clean.zfill(3))
+                target_cams.add(str(int(c_clean)) if c_clean.isdigit() else c_clean)
+
+        filtered = []
+        for v in unique_videos:
+            cam_match = re.search(r"Camera_?(\d+)", os.path.basename(v), re.IGNORECASE)
+            if cam_match:
+                cam_idx = cam_match.group(1).zfill(3)
+                if cam_idx in target_cams or str(int(cam_idx)) in target_cams:
+                    filtered.append(v)
+            else:
+                if any(f"_{tc}_" in os.path.basename(v) or f"_{tc}" in os.path.basename(v) for tc in target_cams):
+                    filtered.append(v)
+        unique_videos = filtered
 
     return unique_videos
 
@@ -213,7 +252,26 @@ def main() -> None:
     parser.add_argument(
         "--session",
         type=str,
-        help="Сессия (например, 024_20260817)",
+        help="Сессия или список сессий через запятую (например, 024_20260817 или 024_20260817,026_20260817)",
+    )
+    parser.add_argument(
+        "--cameras",
+        type=str,
+        help="Список камер через запятую (например: 024,026,029 или 24,26,29)",
+    )
+    parser.add_argument(
+        "--ignore-existing",
+        action="store_true",
+        default=True,
+        help="Пропускать загрузку видео, если файл уже существует на сервере (по умолчанию: True)",
+    )
+    parser.add_argument(
+        "--force-upload",
+        "--overwrite-video",
+        action="store_true",
+        dest="force_upload",
+        default=False,
+        help="Принудительно перезалить видеофайлы на сервер (отключает --ignore-existing)",
     )
     parser.add_argument(
         "--host",
@@ -311,7 +369,12 @@ def main() -> None:
 
     # 1. Определение списка видео
     input_target = args.session or args.input
-    videos = find_local_videos(input_target, args.day)
+    videos = find_local_videos(
+        input_target,
+        day_arg=args.day,
+        session_arg=args.session,
+        cameras_arg=args.cameras,
+    )
 
     if not videos and not args.skip_upload:
         logger.error("Не найдено локальных видеофайлов для отправки.")
@@ -327,6 +390,10 @@ def main() -> None:
     logger.info("Модель / Веса:        %s", args.weights)
     logger.info("Параметры инференса:  batch=%d, imgsz=%d, conf=%.2f, iou=%.2f, device=%s",
                 args.batch_size, args.imgsz, args.conf, args.iou, args.device)
+    if args.cameras:
+        logger.info("Фильтр камер:         %s", args.cameras)
+    if args.session:
+        logger.info("Фильтр сессий:        %s", args.session)
     logger.info("Найдено видеофайлов:  %d (%s)", len(videos), human_size(total_size))
     for idx, v in enumerate(videos, 1):
         logger.info("  [%d] %s (%s)", idx, os.path.basename(v), human_size(os.path.getsize(v)))
@@ -384,9 +451,9 @@ def main() -> None:
                 run_streaming_cmd(rsync_w_cmd, desc=f"Синхронизация весов модели ({os.path.basename(args.weights)})")
                 break
 
-    # 4. Отправка видеофайлов с прогресс-баром (без повторной загрузки)
+    # 4. Отправка видеофайлов с прогресс-баром (без повторной загрузки одинаковых файлов)
     if not args.skip_upload and videos:
-        logger.info("\n--- ШАГ: Отправка видеофайлов на сервер (rsync --progress --ignore-existing) ---")
+        logger.info("\n--- ШАГ: Отправка видеофайлов на сервер (rsync --progress) ---")
         
         # Определяем подпапку на сервере (например, data/video/20260817 или data/video)
         day_sub = None
@@ -407,8 +474,11 @@ def main() -> None:
             "rsync",
             "-avz",
             "--progress",
-            "--ignore-existing",
-        ] + videos + [f"{args.host}:{remote_video_dest}/"]
+        ]
+        if not args.force_upload:
+            rsync_video_cmd.append("--ignore-existing")
+
+        rsync_video_cmd.extend(videos + [f"{args.host}:{remote_video_dest}/"])
 
         t0_up = time.time()
         ret = run_streaming_cmd(rsync_video_cmd, desc=f"Загрузка {len(videos)} видеофайлов на {args.host}:{remote_video_dest}")
@@ -429,12 +499,16 @@ def main() -> None:
             if match:
                 day_param = f"--day {match.group(1)}"
 
+        cameras_param = f"--cameras {args.cameras}" if args.cameras else ""
+        session_param = f"--session {args.session}" if args.session else ""
         overwrite_param = "--overwrite" if args.overwrite else ""
         remote_cmd = (
             f"cd {args.remote_dir} && "
             f"{args.remote_python} -u tools/remote_detector/worker.py "
             f"--input-dir data/video "
             f"{day_param} "
+            f"{cameras_param} "
+            f"{session_param} "
             f"--weights {args.weights} "
             f"--output-dir data/results "
             f"--batch-size {args.batch_size} "

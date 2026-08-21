@@ -440,6 +440,8 @@ def main() -> None:
     parser.add_argument("--iou", type=float, help="NMS IoU порог")
     parser.add_argument("--detect-every-n", type=int, help="Шаг прореживания кадров (1 = все кадры)")
     parser.add_argument("--classes", type=str, help="Классы COCO через запятую (0 = person)")
+    parser.add_argument("--cameras", type=str, help="Список номеров камер через запятую (например: 024,026,029 или 24,26,29)")
+    parser.add_argument("--session", type=str, help="Ключ сессии или список сессий через запятую (например: 024_20260817)")
     parser.add_argument("--device", type=str, help="Устройство инференса (0, cuda:0, cpu, mps)")
     parser.add_argument("--fp16", action="store_true", default=None, help="Использовать FP16 точность")
     parser.add_argument("--overwrite", action="store_true", default=True, help="Перезаписывать существующие detections.json (по умолчанию: всегда True)")
@@ -504,6 +506,32 @@ def main() -> None:
             video_files = [f for f in set(video_files) if day_clean in os.path.basename(f)]
         else:
             video_files = list(set(video_files))
+
+    # Дополнительная фильтрация по камерам
+    if args.cameras:
+        target_cams = set()
+        for c in args.cameras.split(","):
+            c_clean = c.strip()
+            if c_clean:
+                target_cams.add(c_clean.zfill(3))
+                target_cams.add(str(int(c_clean)) if c_clean.isdigit() else c_clean)
+
+        filtered = []
+        for f in video_files:
+            s_key = extract_session_key(f)
+            cam_match = re.search(r"Camera_?(\d+)", os.path.basename(f), re.IGNORECASE)
+            cam_idx = cam_match.group(1).zfill(3) if cam_match else s_key.split("_")[0]
+            if cam_idx in target_cams or str(int(cam_idx) if cam_idx.isdigit() else cam_idx) in target_cams:
+                filtered.append(f)
+        video_files = filtered
+
+    # Дополнительная фильтрация по сессиям
+    if args.session:
+        target_sessions = {s.strip() for s in args.session.split(",") if s.strip()}
+        video_files = [
+            f for f in video_files
+            if extract_session_key(f) in target_sessions or any(ts in os.path.basename(f) for ts in target_sessions)
+        ]
 
     video_files.sort()
 

@@ -5,6 +5,10 @@
 
 # ./venv/bin/python3 scripts/remote_detect.py --session 024_20260817
 
+# ./venv/bin/python3 scripts/remote_detect.py --day 20260817 --cameras 024,026,029
+
+# флаг принудительной перезаливки видео - --force-upload (или --overwrite-video):
+
 # local
 # ./venv/bin/python3 -m app.main --day 20260817 --from tracklets --to track
 
@@ -12,9 +16,9 @@
 
 detection:
   # Веса модели (поиск: текущая папка, data/models/detect/, data/models/)
-  # model: "rtdetr-l.pt"
+  model: "rtdetr-l.pt"
   # model: "rtdetr-x.pt"
-  model: "yolo26x.pt"
+  #model: "yolo26x.pt"
 
   # Порог уверенности детекции (0.0..1.0)
   conf: 0.45
